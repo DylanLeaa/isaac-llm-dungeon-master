@@ -15,3 +15,6 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Per-run DM receipts (backend/receipts/)
+backend/receipts/

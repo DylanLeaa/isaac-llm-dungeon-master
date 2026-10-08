@@ -38,6 +38,22 @@ def _usage(data: dict) -> dict:
             "out": int(u.get("completion_tokens") or 0), "cost": float(u.get("cost") or 0.0)}
 
 
+def call_record(model: str, system: list[str], data: dict) -> dict:
+    """What the receipt keeps of one completion: who answered, the raw message, finish reason, usage."""
+    choice = (data.get("choices") or [{}])[0]
+    return {"model": data.get("model") or model, "provider": data.get("provider"), "id": data.get("id"),
+            "system": system, "finish": choice.get("finish_reason"), "response": choice.get("message"),
+            "usage": _usage(data), "error": data.get("error")}
+
+
+class LLMCallError(RuntimeError):
+    """A completion came back unusable. `call` keeps what it did return, for the receipt."""
+
+    def __init__(self, message: str, call: dict | None = None) -> None:
+        super().__init__(message)
+        self.call = call
+
+
 class OpenRouterDM:
     """Same Haiku DM, called through OpenRouter's OpenAI-compatible chat endpoint."""
 
@@ -85,16 +101,45 @@ class OpenRouterDM:
         })
         resp.raise_for_status()
         data = resp.json()
+        record = call_record(self.model, [b["text"] for b in self.system["content"]], data)
         if "error" in data:
-            raise RuntimeError(f"openrouter: {data['error']}")
+            raise LLMCallError(f"openrouter: {data['error']}", record)
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
-            raise RuntimeError(f"hit max_tokens={self.max_tokens} before finishing the tool call")
+            raise LLMCallError(f"hit max_tokens={self.max_tokens} before finishing the tool call", record)
         msg = choice["message"]
         for call in msg.get("tool_calls") or []:
             if call["function"]["name"] == tool["name"]:
-                return {**json.loads(call["function"]["arguments"]), "_usage": _usage(data)}
-        raise RuntimeError(f"no tool call in response (finish_reason={choice.get('finish_reason')})")
+                try:
+                    args = json.loads(call["function"]["arguments"])
+                except json.JSONDecodeError as e:
+                    raise LLMCallError(f"tool arguments are not JSON ({e})", record) from e
+                return {**args, "_usage": record["usage"], "_call": record}
+        raise LLMCallError(f"no tool call in response (finish_reason={choice.get('finish_reason')})", record)
+
+    async def epitaph(self, prompt: str) -> tuple[str, dict]:
+        """Free text in the DM's voice (the after-death screen). Same tools and system prompt as a
+        decision, with tool_choice none, so the cached persona and campaign still hit."""
+        resp = await self.client.post(OPENROUTER_URL, json={
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": [self.system, {"role": "user", "content": prompt}],
+            "tools": _OPENAI_TOOLS,
+            "tool_choice": "none",
+            "usage": {"include": True},
+        })
+        resp.raise_for_status()
+        data = resp.json()
+        record = call_record(self.model, [b["text"] for b in self.system["content"]], data)
+        if "error" in data:
+            raise LLMCallError(f"openrouter: {data['error']}", record)
+        choice = data["choices"][0]
+        if choice.get("finish_reason") == "length":
+            raise LLMCallError(f"hit max_tokens={self.max_tokens} before finishing the epitaph", record)
+        text = (choice["message"].get("content") or "").strip()
+        if not text:
+            raise LLMCallError("empty epitaph", record)
+        return text, record
 
 
 class MockDM:
@@ -114,6 +159,13 @@ class MockDM:
 
     async def decide(self, kind: str, state: dict, ctx: dict, memory: dict) -> dict[str, Any]:
         await asyncio.sleep(self.rng.uniform(*self.latency))
+        return {**self._answer(kind, state, ctx), "_call": {"model": "mock", "finish": "tool_calls"}}
+
+    async def epitaph(self, prompt: str) -> tuple[str, dict]:
+        await asyncio.sleep(self.rng.uniform(*self.latency))
+        return "Here lies a hero who trusted the dice. The dice were mine.", {"model": "mock", "finish": "stop"}
+
+    def _answer(self, kind: str, state: dict, ctx: dict) -> dict[str, Any]:
         r = self.rng
         res = (state.get("player") or {}).get("resources") or {}
         if kind == "room_layout":

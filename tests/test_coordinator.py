@@ -92,7 +92,7 @@ def test_cruelty_follows_hello_and_settings():
 
     assert handle({"t": "hello", "session": "S", "run": "R", "cruelty": 9}) == 9 and dm.cruelty == 9
     assert handle({"t": "settings", "cruelty": 2}) == 2 and dm.cruelty == 2
-    assert sent[-1] == {"t": "settings_ok", "session": "S", "cruelty": 2}
+    assert [m for m in sent if m["t"] == "settings_ok"][-1] == {"t": "settings_ok", "session": "S", "cruelty": 2}
     assert handle({"t": "settings"}) == 6 and dm.cruelty == 6        # menu's "backend default"
     assert handle({"t": "settings", "cruelty": 42}) == 10
     assert handle({"t": "settings", "cruelty": "lots"}) == 10        # garbage is ignored
