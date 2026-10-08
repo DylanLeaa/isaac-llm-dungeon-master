@@ -44,6 +44,12 @@ return {
   -- consumables requests per floor (floor start + re-asks for new pill colours / empty queues)
   MAX_CONSUMABLE_SENDS = 4,
 
+  -- Characters per line in Mod Config Menu > DM Settings > Receipt. Lower it if lines get cut off.
+  RECEIPT_WIDTH = 32,
+
   SHOW_TAUNTS = true,
+  -- After-death stats (yours and the DM's, plus its epitaph) over the game-over screen; the map
+  -- button hides it. Always kept under Mod Config Menu > DM Settings > Last run.
+  SHOW_DEATH_SCREEN = true,
   SHOW_DEBUG_HUD = true,   -- small latency / connection readout in the corner
 }
