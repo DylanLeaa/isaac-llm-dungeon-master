@@ -16,6 +16,7 @@ return {
   CONTROL_ROOM_CLEAR  = true,
   CONTROL_ITEMS       = true,
   CONTROL_FLOOR       = true,
+  CONTROL_CONSUMABLES = true,   -- which cards/trinkets drop, what each pill colour does
 
   -- Re-roll the floor (console `reseed`) until the treasure room distance matches the
   -- DM's preference. Uses a console command, which disables achievements for the run.
@@ -38,6 +39,9 @@ return {
   -- How long after entering a room a late room_layout decision may still be applied.
   LATE_LAYOUT_GRACE_FRAMES = 20,
   ITEM_CANDIDATES = 6,
+  TRINKET_CANDIDATES = 8,
+  -- consumables requests per floor (floor start + re-asks for new pill colours / empty queues)
+  MAX_CONSUMABLE_SENDS = 4,
 
   SHOW_TAUNTS = true,
   SHOW_DEBUG_HUD = true,   -- small latency / connection readout in the corner

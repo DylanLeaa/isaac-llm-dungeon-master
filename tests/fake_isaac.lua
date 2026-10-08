@@ -17,6 +17,7 @@ ItemPoolType = enum({ "POOL_TREASURE", "POOL_SHOP", "POOL_BOSS", "POOL_DEVIL", "
   "POOL_LIBRARY", "POOL_SHELL_GAME", "POOL_GOLDEN_CHEST", "POOL_RED_CHEST", "POOL_BEGGAR", "POOL_DEMON_BEGGAR",
   "POOL_CURSE" })
 ItemPoolType.POOL_PLANETARIUM = 26
+ItemPoolType.POOL_ULTRA_SECRET = 24
 GridEntityType = { GRID_ROCK = 2, GRID_ROCKT = 4 }
 EntityType = { ENTITY_PLAYER = 1, ENTITY_BOMB = 4, ENTITY_PICKUP = 5, ENTITY_GAPER = 10, ENTITY_BOOMFLY = 25,
   ENTITY_HOST = 27, ENTITY_ATTACKFLY = 18, ENTITY_KNIGHT = 41, ENTITY_DIP = 217 }
@@ -24,7 +25,7 @@ setmetatable(EntityType, { __index = function(_, k) if tostring(k):match("^ENTIT
 EntityFlag = { FLAG_FRIENDLY = 1 << 29 }
 ActiveSlot = { SLOT_PRIMARY = 0 }
 ItemType = { ITEM_PASSIVE = 1, ITEM_ACTIVE = 3 }
-PickupVariant = { PICKUP_HEART = 10, PICKUP_COIN = 20, PICKUP_KEY = 30, PICKUP_BOMB = 40, PICKUP_CHEST = 50,
+PickupVariant = { PICKUP_OLDCHEST = 55, PICKUP_WOODENCHEST = 56, PICKUP_MOMSCHEST = 390, PICKUP_HEART = 10, PICKUP_COIN = 20, PICKUP_KEY = 30, PICKUP_BOMB = 40, PICKUP_CHEST = 50,
   PICKUP_SPIKEDCHEST = 52, PICKUP_MIMICCHEST = 54, PICKUP_LOCKEDCHEST = 60, PICKUP_GRAB_BAG = 69,
   PICKUP_PILL = 70, PICKUP_LIL_BATTERY = 90, PICKUP_COLLECTIBLE = 100, PICKUP_TAROTCARD = 300,
   PICKUP_TRINKET = 350, PICKUP_REDCHEST = 360 }
@@ -38,9 +39,30 @@ BatterySubType = { BATTERY_NORMAL = 1 }
 BombVariant = { BOMB_NORMAL = 0, BOMB_TROLL = 3 }
 LevelCurse = { CURSE_NONE = 0, CURSE_OF_DARKNESS = 1, CURSE_OF_LABYRINTH = 2, CURSE_OF_THE_LOST = 4,
   CURSE_OF_THE_UNKNOWN = 8, CURSE_OF_MAZE = 32, CURSE_OF_BLIND = 64 }
-ModCallbacks = { MC_POST_UPDATE = 1, MC_POST_RENDER = 2, MC_ENTITY_TAKE_DMG = 11, MC_POST_CURSE_EVAL = 12,
-  MC_POST_GAME_STARTED = 15, MC_POST_GAME_END = 16, MC_POST_NEW_LEVEL = 18, MC_POST_NEW_ROOM = 19,
-  MC_PRE_GET_COLLECTIBLE = 62, MC_PRE_SPAWN_CLEAN_AWARD = 70 }
+ModCallbacks = { MC_POST_UPDATE = 1, MC_POST_RENDER = 2, MC_USE_PILL = 10, MC_ENTITY_TAKE_DMG = 11,
+  MC_POST_CURSE_EVAL = 12, MC_POST_GAME_STARTED = 15, MC_POST_GAME_END = 16, MC_POST_NEW_LEVEL = 18,
+  MC_POST_NEW_ROOM = 19, MC_GET_CARD = 20, MC_GET_TRINKET = 47, MC_PRE_GET_COLLECTIBLE = 62,
+  MC_GET_PILL_EFFECT = 65, MC_PRE_SPAWN_CLEAN_AWARD = 70 }
+PillColor = enum({ "PILL_NULL", "PILL_BLUE_BLUE", "PILL_WHITE_BLUE", "PILL_ORANGE_ORANGE", "PILL_WHITE_WHITE",
+  "PILL_REDDOTS_RED", "PILL_PINK_RED", "PILL_BLUE_CADETBLUE", "PILL_YELLOW_ORANGE", "PILL_ORANGEDOTS_WHITE",
+  "PILL_WHITE_AZURE", "PILL_BLACK_YELLOW", "PILL_WHITE_BLACK", "PILL_WHITE_YELLOW", "PILL_GOLD" })
+PillEffect = enum({ "PILLEFFECT_BAD_GAS", "PILLEFFECT_BAD_TRIP", "PILLEFFECT_BALLS_OF_STEEL",
+  "PILLEFFECT_BOMBS_ARE_KEYS", "PILLEFFECT_EXPLOSIVE_DIARRHEA", "PILLEFFECT_FULL_HEALTH", "PILLEFFECT_HEALTH_DOWN",
+  "PILLEFFECT_HEALTH_UP", "PILLEFFECT_I_FOUND_PILLS", "PILLEFFECT_PUBERTY", "PILLEFFECT_PRETTY_FLY",
+  "PILLEFFECT_RANGE_DOWN", "PILLEFFECT_RANGE_UP", "PILLEFFECT_SPEED_DOWN", "PILLEFFECT_SPEED_UP",
+  "PILLEFFECT_TEARS_DOWN", "PILLEFFECT_TEARS_UP", "PILLEFFECT_LUCK_DOWN", "PILLEFFECT_LUCK_UP",
+  "PILLEFFECT_TELEPILLS", "PILLEFFECT_48HOUR_ENERGY", "PILLEFFECT_HEMATEMESIS", "PILLEFFECT_PARALYSIS",
+  "PILLEFFECT_SEE_FOREVER", "PILLEFFECT_PHEROMONES", "PILLEFFECT_AMNESIA", "PILLEFFECT_LEMON_PARTY",
+  "PILLEFFECT_WIZARD", "PILLEFFECT_PERCS", "PILLEFFECT_ADDICTED", "PILLEFFECT_RELAX", "PILLEFFECT_QUESTIONMARK",
+  "PILLEFFECT_LARGER", "PILLEFFECT_SMALLER", "PILLEFFECT_INFESTED_EXCLAMATION", "PILLEFFECT_INFESTED_QUESTION",
+  "PILLEFFECT_POWER", "PILLEFFECT_RETRO_VISION", "PILLEFFECT_FRIENDS_TILL_THE_END", "PILLEFFECT_X_LAX",
+  "PILLEFFECT_SOMETHINGS_WRONG", "PILLEFFECT_IM_DROWSY", "PILLEFFECT_IM_EXCITED", "PILLEFFECT_GULP",
+  "PILLEFFECT_HORF", "PILLEFFECT_SUNSHINE", "PILLEFFECT_VURP", "PILLEFFECT_SHOT_SPEED_DOWN",
+  "PILLEFFECT_SHOT_SPEED_UP", "PILLEFFECT_EXPERIMENTAL" })
+-- Every card/rune name resolves; a few have their real ids so tests can tell them apart.
+Card = setmetatable({ CARD_TOWER = 17, RUNE_HAGALAZ = 32 }, { __index = function(_, k)
+  if tostring(k):match("^CARD_") or tostring(k):match("^RUNE_") then return 50 end end })
+ChampionColor = { CHAMPION_RED = 0, CHAMPION_DARK_RED = 12, CHAMPION_TINY = 18 }
 
 -- ---------------------------------------------------------------- vectors
 local VMT = {}
@@ -94,6 +116,8 @@ function player:HasGoldenKey() return false end
 function player:HasGoldenBomb() return false end
 function player:GetActiveItem() return 0 end
 function player:GetTrinket() return 0 end
+function player:HasTrinket() return false end
+function player:GetPill(slot) return slot == 0 and (W.heldPill or 0) or 0 end
 function player:GetName() return "Isaac" end
 function player:GetCollectibleCount() return 0 end
 function player:HasCollectible() return false end
@@ -111,6 +135,14 @@ local function makeEnemy(hp)
   return e
 end
 W.makeEnemy = makeEnemy
+
+-- Pickups (and slots) sit in W.pickups and show up in GetRoomEntities / FindByType.
+function W.makePickup(t, v, s)
+  local e = { Type = t, Variant = v, SubType = s }
+  function e:IsActiveEnemy() return false end
+  function e:ToNPC() return nil end
+  return e
+end
 
 local room = {}
 function room:GetDoor(slot)
@@ -164,6 +196,7 @@ function itemPool:GetCollectible(pool, decrease, seed)
   return POOL_ITEMS[(seed % #POOL_ITEMS) + 1]
 end
 function itemPool:RemoveCollectible(id) W.removedItem = id end
+function itemPool:RemoveTrinket(id) W.removedTrinket = id end
 
 local seeds = { GetStageSeed = function() return 777 end, GetStartSeed = function() return 4242 end,
                 GetStartSeedString = function() return "TEST 1234" end }
@@ -178,16 +211,31 @@ function Game() return game end
 
 local ITEMS = {}
 for id = 1, 8 do ITEMS[id] = { Name = "#ITEM_" .. id .. "_NAME", Quality = id % 5, Type = ItemType.ITEM_PASSIVE } end
+local TRINKETS = {}
+for id = 1, 20 do TRINKETS[id] = { Name = "#TRINKET_" .. id .. "_NAME", IsAvailable = function() return id ~= 7 end } end
 local itemConfig = { GetCollectible = function(_, id) return ITEMS[id] end,
-                     GetCollectibles = function() return { Size = 9 } end }
+                     GetCollectibles = function() return { Size = 9 } end,
+                     GetTrinket = function(_, id) return TRINKETS[id] end,
+                     GetTrinkets = function() return { Size = 21 } end }
 
 Isaac = {
   GetTime = function() return W.now end,
   DebugString = function(s) print("   [isaac] " .. s) end,
   GetPlayer = function() return player end,
-  GetRoomEntities = function() return W.enemies end,
+  GetRoomEntities = function()
+    local out = {}
+    for _, e in ipairs(W.enemies) do out[#out + 1] = e end
+    for _, e in ipairs(W.pickups or {}) do out[#out + 1] = e end
+    return out
+  end,
   GetItemConfig = function() return itemConfig end,
-  FindByType = function() return {} end,
+  FindByType = function(t, v)
+    local out = {}
+    for _, e in ipairs(W.pickups or {}) do
+      if e.Type == t and (v == nil or v < 0 or e.Variant == v) then out[#out + 1] = e end
+    end
+    return out
+  end,
   Spawn = function(t, v, s, pos) W.spawned[#W.spawned + 1] = { t = t, v = v, s = s }; return {} end,
   GridSpawn = function(t, v, pos) W.gridSpawned[#W.gridSpawned + 1] = t end,
   ExecuteCommand = function(c) W.lastCommand = c end,
@@ -199,6 +247,9 @@ Isaac = {
 
 function RegisterMod(name)
   local m = { Name = name }
+  function m:SaveData(s) W.saved = s end
+  function m:HasData() return W.saved ~= nil end
+  function m:LoadData() return W.saved end
   function m:AddCallback(id, fn) W.callbacks[id] = W.callbacks[id] or {}; table.insert(W.callbacks[id], fn) end
   return m
 end

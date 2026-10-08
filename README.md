@@ -1,8 +1,9 @@
 # LLM Dungeon Master for The Binding of Isaac: Repentance
 
-The RNG has been unplugged. Room-clear drops, which item sits on the pedestal, how a room is
-dressed (extra enemies, champions, tinted "secret" rocks, layout pickups) and what curses the
-next floor carries are all decided by **Claude Haiku 5.5**, playing a gleeful, trolling tabletop
+The RNG has been unplugged. Room-clear drops, which item sits on the pedestal (or comes out of
+a chest or a beggar), how a room is dressed (extra enemies, champion colours, tinted "secret"
+rocks, layout pickups), which card or trinket turns up, what each pill colour does and what
+curses the next floor carries are all decided by **Claude Haiku 5.5**, playing a gleeful, trolling tabletop
 DM. It sees your hearts, keys, bombs, coins, luck, build and what the floor still demands of
 you — and gives you twelve coins on a floor with no shop.
 
@@ -25,8 +26,9 @@ decides that one event.
 | Decision | Asked when | Refreshed when | Used at |
 |---|---|---|---|
 | `room_layout` (enemies, champions, rocks, pickups) | you enter a room bordering an unvisited normal room | your HP / K-B-C / items change while you linger | `MC_POST_NEW_ROOM` of that room (or ≤20 frames later if the answer is late) |
-| `room_clear` (the drop) | **estimated time-to-clear** (remaining enemy HP ÷ your recent DPS) < `1.4 × p90 latency + 400ms`, or the room is nearly dead | you get hit or pick something up and there's still time for a new answer | `MC_PRE_SPAWN_CLEAN_AWARD` |
-| `item_choice` (ranked real candidates from the pool) | floor start, and again when you stand next to a treasure/shop/boss/devil/… room | — | `MC_PRE_GET_COLLECTIBLE` (also catches D6 rerolls) |
+| `room_clear` (the drop; normal, miniboss and curse rooms. In boss rooms it is a bonus on top of the game's own award) | **estimated time-to-clear** (remaining enemy HP ÷ your recent DPS) < `1.4 × p90 latency + 400ms`, or the room is nearly dead | you get hit or pick something up and there's still time for a new answer | `MC_PRE_SPAWN_CLEAN_AWARD` |
+| `item_choice` (ranked real candidates from the pool) | floor start, and again when you stand next to a treasure/shop/boss/devil/ultra secret/… room; chest and beggar pools when one shows up in your room | — | `MC_PRE_GET_COLLECTIBLE` (also catches D6 rerolls) |
+| `consumables` (next cards/runes, next trinkets, an effect per pill colour in play) | floor start | a pill colour the plan doesn't cover appears (held or on the floor), or the card/trinket queues run dry | `MC_GET_CARD`, `MC_GET_TRINKET`, `MC_GET_PILL_EFFECT` |
 | `floor_plan` (curses, treasure distance) | you enter the boss room | boss dies | `MC_POST_CURSE_EVAL` of the next floor |
 
 Requests for the same key supersede each other: the backend cancels the stale Haiku call and
@@ -42,7 +44,11 @@ Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the
 - **Mercy**: at ≤1 heart, no troll bombs, ≤1 extra enemy, no Curse of the Unknown, and a half
   heart sneaks into the drop after a long heart drought.
 - **Drought breaker**: 0 keys + locked doors seen + 7 key-less clears → a key is added (same for bombs).
-- Item picks must come from the real pool candidates; unknown enemies/rewards are dropped.
+- Item and trinket picks must come from the real candidates; unknown enemies/rewards/cards are dropped.
+- **Pills**: a colour's effect is locked the first time it's swallowed (saved with the run, so
+  continues keep it). Bad pills are capped per run (40% of colours at cruelty 0, all at 10);
+  PHD / Virgo / Lucky Foot and False PHD still flip them, and Bad Trip at ≤1 heart becomes Full Health.
+  Suicide King isn't on the card menu. Boss-room bonuses are capped at 2 pickups.
 - Taunts are trimmed to 70 ASCII chars (Isaac's font).
 
 ## Setup
@@ -85,7 +91,8 @@ console commands disable achievements for that run.
   the file bridge, plus the TCP server: superseding, timeouts, acks.
 - `tests/test_mod_headless.py` — the **whole mod** (`main.lua` + `dm/*`) on a fake Isaac API
   against the mock backend: prefetch → room dressed on entry → clear decision requested mid-fight
-  and ready at the last kill → DM-picked treasure item → boss-room floor plan → curse mask.
+  and ready at the last kill → DM-picked treasure item → card/rune/trinket draws and a locked pill
+  colour → golden-chest pool ranked on sight → boss-room floor plan and bonus clear → curse mask.
 
 These run without the game. The Isaac API calls follow the official docs, but the mod has not
 been run inside Isaac yet, so expect a first-session shakedown; errors are caught per callback,
@@ -97,12 +104,15 @@ printed once to the console/`log.txt`, and that event falls back to vanilla.
   (optionally) rerolling the floor. With REPENTOGON's level-generation callbacks this could become
   true room placement — `floor_plan` is the place to add it.
 - Room dressing only touches normal rooms (not shops, bosses, challenge rooms). Player 1 only.
-  Greed mode is left vanilla.
+  Greed mode is left vanilla. Golden pills stay random.
+- Beggars and machines: the DM picks *which item* they pay out, not *whether* they pay.
+- Chest contents other than items (the pickups inside) are still vanilla.
 - Enemy IDs are referenced by `EntityType` enum name, so anything missing on your version is skipped.
 
 ## Extending
 
 Add a decision kind in four places: a tool schema + clamp branch (`schemas.py`), a mock answer
-(`dm_agent.py`), a request trigger (`scheduler.lua`) and an applier (`apply.lua`). Good next
-ones: chest contents, slot/beggar payouts, pill effects (`MC_GET_PILL_EFFECT`), card draws
-(`MC_GET_CARD`), trinkets (`MC_GET_TRINKET`).
+(`dm_agent.py`), a request trigger (`scheduler.lua`, or its own module like `consumables.lua`)
+and an applier (`apply.lua`). Good next ones: devil vs angel room (`Level:InitializeDevilAngelRoom`),
+random pickup variants everywhere (`MC_POST_PICKUP_SELECTION`), swapping layout enemies
+(`MC_PRE_ROOM_ENTITY_SPAWN`), chest pickup contents and beggar payouts.

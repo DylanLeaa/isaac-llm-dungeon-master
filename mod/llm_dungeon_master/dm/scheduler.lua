@@ -12,12 +12,14 @@
 --   item_choice  asked per item pool on floor entry, and again when the player stands next
 --                to a treasure/shop/boss/... room, so the ranking reflects their newest build.
 --   floor_plan   asked on entering the boss room; re-asked once the boss dies.
+--   item_choice  also asked for chest/beggar pools the moment one of those shows up in a room.
+--   consumables  see consumables.lua (floor start, then when a new pill colour is in play).
 --
 -- If an answer isn't there when the game needs it, vanilla RNG decides (and nobody waits).
 local Sched = {}
 
 local game = Game()
-local cfg, Bridge, State, Apply, Taunt
+local cfg, Bridge, State, Apply, Taunt, Cons
 
 local floorNo = 0
 local levelSig
@@ -33,7 +35,11 @@ Sched.peeking = false
 
 local POOL_FOR_ROOM -- RoomType -> ItemPoolType (filled in init)
 local CONTROLLED_POOL = {}
-local KEY_ROOMS = {}
+local PICKUP_POOLS = {}  -- chest PickupVariant -> {pool, label}
+local SLOT_POOLS = {}    -- beggar/machine variant -> {pool, label}
+-- Rooms whose clear award the DM decides. "replace": the DM's drop is the drop.
+-- "bonus": the game keeps its own award (the boss item lives there) and the DM adds to it.
+local CLEAR_MODE = {}
 
 -- ----------------------------------------------------------------- utilities
 local function fkey(prefix, rest) return prefix .. ":" .. floorNo .. ":" .. tostring(rest) end
@@ -69,7 +75,7 @@ local function wantLayout(key, hash)
   if s.n >= cfg.MAX_LAYOUT_SENDS then return false end
   return not (s.hash == hash and (Bridge.isPending(key) or Bridge.peek(key)))
 end
-local function eligibleClearRoom(t) return t == RoomType.ROOM_DEFAULT end
+local function eligibleClearRoom(t) return CLEAR_MODE[t] ~= nil end
 
 -- ------------------------------------------------------------------ requests
 local function requestLayout(desc, reason)
@@ -93,7 +99,7 @@ local function requestClear(reason, etaMs)
   local key = fkey("clear", room.idx)
   local hp, n = alive()
   Bridge.request("room_clear", key, State.snapshot(), {
-    reason = reason, room_type = State.roomTypeName(room.type),
+    reason = reason, room_type = State.roomTypeName(room.type), mode = CLEAR_MODE[room.type],
     enemies_left = n, enemy_hp_left = math.floor(hp),
     est_ms_until_clear = math.floor(math.min(etaMs or 0, 60000)),
     seconds_in_room = math.floor((Isaac.GetTime() - room.enteredAt) / 100) / 10,
@@ -135,6 +141,21 @@ local function requestItems(pool, roomTypeName, reason)
   Bridge.request("item_choice", key, State.snapshot(), {
     reason = reason, pool = pool, room_type = roomTypeName, candidates = cands,
   }, 10000)
+end
+
+-- Chests and beggars draw from their own item pools. Ask about a pool once per room visit,
+-- as soon as its source is in the room (well before the player opens or pays it).
+local function requestSourcePools()
+  if not cfg.CONTROL_ITEMS then return end
+  for _, e in ipairs(Isaac.GetRoomEntities()) do
+    local src
+    if e.Type == EntityType.ENTITY_PICKUP and e.SubType ~= 0 then src = PICKUP_POOLS[e.Variant]   -- 0 = opened
+    elseif e.Type == EntityType.ENTITY_SLOT then src = SLOT_POOLS[e.Variant] end
+    if src and not room.poolsAsked[src[1]] then
+      room.poolsAsked[src[1]] = true
+      requestItems(src[1], src[2], "a " .. src[2]:gsub("_", " ") .. " is in the player's room")
+    end
+  end
 end
 
 local function requestFloorPlan(reason)
@@ -190,6 +211,7 @@ local function checkLevelChange()
   Bridge.forget("layout:" .. (floorNo - 1))
   Bridge.forget("clear:" .. (floorNo - 1))
   Bridge.forget("items:" .. (floorNo - 1))
+  Cons.onNewFloor(floorNo)
   State.onNewFloor()
   return true
 end
@@ -204,7 +226,7 @@ function Sched.onNewRoom()
     enteredFrame = game:GetFrameCount(), firstVisit = r:IsFirstVisit(),
     layoutApplied = false, layoutKeys = {}, wasClear = r:IsClear(),
     hpSamples = {}, dps = 0, startHp = nil, clearSends = 0, clearReqAt = nil,
-    lastProbe = 0, lastNeighbourRefresh = Isaac.GetTime(),
+    lastProbe = 0, lastNeighbourRefresh = Isaac.GetTime(), poolsAsked = {}, lastSourceScan = 0,
   }
 
   -- 1. Dress this room if the DM already decided how.
@@ -293,6 +315,14 @@ function Sched.update()
     end
   end
 
+  Cons.update()
+
+  -- Chests dropped mid-room and beggars spawned by cards count too, so keep looking.
+  if Bridge.ready() and t - room.lastSourceScan >= 1000 then
+    room.lastSourceScan = t
+    requestSourcePools()
+  end
+
   -- Lingering: refresh neighbour layouts if the player's situation changed.
   if t - room.lastNeighbourRefresh > cfg.REFRESH_MIN_MS * 2 then
     room.lastNeighbourRefresh = t
@@ -359,6 +389,7 @@ function Sched.onCleanAward(rng, pos)
     return nil
   end
   Apply.roomClear(res.decision, pos)
+  if CLEAR_MODE[room.type] == "bonus" then return nil end   -- the game still spawns its own award
   -- Documented API bug: returning true stops the award seed advancing.
   local level = game:GetLevel()
   local desc = level:GetRoomDesc(level:GetCurrentRoomIndex())
@@ -415,10 +446,11 @@ function Sched.resetRun()
   floorNo, levelSig, room, itemQueues, floorPlanUsed, reseeds = 0, nil, nil, {}, nil, 0
   itemSigs, layoutSends, fallbackSent, floorPlanAsked = {}, {}, {}, false
   floorItemsRequestedFor = -1
+  Cons.resetRun()
 end
 
-function Sched.init(config, bridge, state, apply, taunt)
-  cfg, Bridge, State, Apply, Taunt = config, bridge, state, apply, taunt
+function Sched.init(config, bridge, state, apply, taunt, cons)
+  cfg, Bridge, State, Apply, Taunt, Cons = config, bridge, state, apply, taunt, cons
   POOL_FOR_ROOM = {}
   CONTROLLED_POOL = {}
   local function map(rt, pool)
@@ -433,6 +465,32 @@ function Sched.init(config, bridge, state, apply, taunt)
   map(RoomType.ROOM_LIBRARY, ItemPoolType.POOL_LIBRARY)
   map(RoomType.ROOM_CURSE, ItemPoolType.POOL_CURSE)
   map(RoomType.ROOM_PLANETARIUM, ItemPoolType.POOL_PLANETARIUM)
+  map(RoomType.ROOM_ULTRASECRET, ItemPoolType.POOL_ULTRA_SECRET)
+
+  local function source(tbl, variant, poolName, label)
+    local pool = ItemPoolType[poolName]
+    if variant and pool then tbl[variant], CONTROLLED_POOL[pool] = { pool, label }, true end
+  end
+  source(PICKUP_POOLS, PickupVariant.PICKUP_LOCKEDCHEST, "POOL_GOLDEN_CHEST", "golden_chest")
+  source(PICKUP_POOLS, PickupVariant.PICKUP_REDCHEST, "POOL_RED_CHEST", "red_chest")
+  source(PICKUP_POOLS, PickupVariant.PICKUP_WOODENCHEST, "POOL_WOODEN_CHEST", "wooden_chest")
+  source(PICKUP_POOLS, PickupVariant.PICKUP_OLDCHEST, "POOL_OLD_CHEST", "old_chest")
+  source(PICKUP_POOLS, PickupVariant.PICKUP_MOMSCHEST, "POOL_MOMS_CHEST", "moms_chest")
+  -- Slot variants have no enum in the vanilla API; these are the game's own numbers.
+  source(SLOT_POOLS, 4, "POOL_BEGGAR", "beggar")
+  source(SLOT_POOLS, 5, "POOL_DEMON_BEGGAR", "demon_beggar")
+  source(SLOT_POOLS, 6, "POOL_SHELL_GAME", "shell_game")
+  source(SLOT_POOLS, 7, "POOL_KEY_MASTER", "key_master")
+  source(SLOT_POOLS, 9, "POOL_BOMB_BUM", "bomb_bum")
+  source(SLOT_POOLS, 13, "POOL_BATTERY_BUM", "battery_bum")
+  source(SLOT_POOLS, 16, "POOL_CRANE_GAME", "crane_game")
+  source(SLOT_POOLS, 18, "POOL_ROTTEN_BEGGAR", "rotten_beggar")
+
+  CLEAR_MODE = {}
+  for name, mode in pairs({ ROOM_DEFAULT = "replace", ROOM_MINIBOSS = "replace", ROOM_CURSE = "replace",
+                            ROOM_BOSS = "bonus" }) do
+    if RoomType[name] then CLEAR_MODE[RoomType[name]] = mode end
+  end
 end
 
 function Sched.debugCounts()

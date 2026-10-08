@@ -9,10 +9,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from catalog import (BOMBS, COINS, CURSES, ENEMIES, HEARTS, KEYS,
-                     LAYOUT_PICKUP_MODES, REWARDS, TRAPS, TREASURE_DISTANCE)
+from catalog import (BOMBS, CARDS, CHAMPION_COLORS, COINS, CURSES, ENEMIES, HEARTS, KEYS,
+                     LAYOUT_PICKUP_MODES, PILLS, REWARDS, TRAPS, TREASURE_DISTANCE)
 
-KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan")
+KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "consumables")
 
 _TAUNT = {"type": "string", "maxLength": 60,
           "description": "Shown on screen. <=60 chars, plain ASCII, empty string for silence."}
@@ -31,6 +31,8 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "intent": _INTENT,
                 "champion_chance": {"type": "number", "minimum": 0, "maximum": 0.6,
                                     "description": "Chance each normal enemy becomes a champion."},
+                "champion_color": {"type": "string", "enum": ["random", *CHAMPION_COLORS],
+                                   "description": "What every champion in this room becomes."},
                 "extra_enemies": {
                     "type": "array", "maxItems": 3,
                     "items": {"type": "object", "properties": {
@@ -54,7 +56,9 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "room_clear": {
         "name": "decide_room_clear",
-        "description": "Decide the room-clear reward that drops when the last enemy dies.",
+        "description": "Decide the room-clear reward that drops when the last enemy dies. "
+                       "When context.mode is 'bonus' (boss rooms) the game still drops its own reward "
+                       "and the boss item; yours is extra.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -105,6 +109,33 @@ TOOLS: dict[str, dict[str, Any]] = {
             "required": ["intent", "add_curses", "treasure_distance", "taunt"],
         },
     },
+    "consumables": {
+        "name": "decide_consumables",
+        "description": "Plan the random consumables for this floor: the next cards/runes and trinkets the "
+                       "game hands out (from any source: your drops, chests, layouts, machines), and the "
+                       "effect of each pill colour in context.pill_colors_to_assign. A pill colour keeps "
+                       "its effect for the rest of the run once it is swallowed. The taunt appears the "
+                       "first time anything from this plan is used.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intent": _INTENT,
+                "cards": {"type": "array", "maxItems": 5, "items": {"type": "string", "enum": list(CARDS)},
+                          "description": "Handed out in this order. Draws that only allow runes (or "
+                                         "forbid them) take the first card that fits."},
+                "trinkets": {"type": "array", "maxItems": 4, "items": {"type": "integer"},
+                             "description": "Ids from context.trinket_candidates, in hand-out order."},
+                "pills": {"type": "array", "maxItems": 13,
+                          "items": {"type": "object", "properties": {
+                              "color": {"type": "integer"},
+                              "effect": {"type": "string", "enum": list(PILLS)}},
+                              "required": ["color", "effect"]},
+                          "description": "One entry per colour in context.pill_colors_to_assign."},
+                "taunt": _TAUNT, "scheme": _SCHEME,
+            },
+            "required": ["intent", "cards", "trinkets", "pills", "taunt"],
+        },
+    },
 }
 
 
@@ -150,6 +181,10 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         if mercy:
             cap = min(cap, 0.10)
         out["champion_chance"] = round(max(0.0, min(cap, float(raw.get("champion_chance") or 0))), 3)
+        color = raw.get("champion_color")
+        out["champion_color"] = color if color in CHAMPION_COLORS else "random"
+        if color in CHAMPION_COLORS:
+            out["champion_enum"] = CHAMPION_COLORS[color][0]
 
         budget = round(cruelty / 3.3)                       # 0..3 extra enemies
         if mercy:
@@ -192,6 +227,7 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         out["bonus_pickups"] = bonus
 
     elif kind == "room_clear":
+        cap = 2 if ctx.get("mode") == "bonus" else 4             # boss rooms keep their own reward too
         rewards, total = [], 0
         for r in (raw.get("rewards") or [])[:3]:
             name = r.get("reward")
@@ -206,7 +242,7 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
                     continue
             if name in ("golden_key", "golden_bomb", "eternal_heart"):
                 n = 1
-            n = min(n, 4 - total)
+            n = min(n, cap - total)
             if n <= 0:
                 break
             total += n
@@ -257,12 +293,67 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         td = raw.get("treasure_distance")
         out["treasure_distance"] = td if td in TREASURE_DISTANCE else "any"
 
+    elif kind == "consumables":
+        out["cards"] = [{"key": c, "enum": CARDS[c][0], "cat": CARDS[c][1]}
+                        for c in (raw.get("cards") or [])[:5] if c in CARDS]
+        cands = {int(c["id"]) for c in ctx.get("trinket_candidates", []) if "id" in c}
+        trinkets: list[int] = []
+        for i in raw.get("trinkets") or []:
+            try:
+                i = int(i)
+            except (TypeError, ValueError):
+                continue
+            if i in cands and i not in trinkets and len(trinkets) < 4:
+                trinkets.append(i)
+        out["trinkets"] = trinkets
+        out["pills"] = _clamp_pills(raw.get("pills") or [], ctx, cruelty, notes)
+
     else:
         raise ValueError(f"unknown decision kind {kind!r}")
 
     if notes:
         out["guardrails"] = notes
     return out
+
+
+def _clamp_pills(raw: list, ctx: dict, cruelty: int, notes: list[str]) -> list[dict]:
+    """Pill colours the DM may still assign, with a cruelty-scaled cap on how many are bad.
+
+    The cap counts the whole run (colours already swallowed included), since a colour's
+    effect is permanent. Over-cap bad pills become their good counterpart.
+    """
+    open_colors = {int(c["color"]) for c in ctx.get("pill_colors_to_assign", []) if "color" in c}
+    locked = ctx.get("pills_locked") or []
+    bad = sum(1 for p in locked if PILLS.get(p.get("effect"), ("",))[0] == "bad")
+    max_bad = round((len(locked) + len(open_colors)) * min(1.0, 0.4 + 0.06 * cruelty))
+    out, seen = [], set()
+    for p in raw:
+        try:
+            color = int(p.get("color"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        effect = p.get("effect")
+        if color not in open_colors or color in seen or effect not in PILLS:
+            continue
+        if PILLS[effect][0] == "bad":
+            if bad >= max_bad:
+                notes.append(f"pill {color}: {effect}->{PILLS[effect][2]} (bad-pill cap)")
+                effect = PILLS[effect][2]
+            else:
+                bad += 1
+        seen.add(color)
+        kind, _, counter = PILLS[effect]
+        entry = {"color": color, "effect": effect, "enum": _pill_enum(effect)}
+        if counter and kind == "bad":
+            entry["phd"] = _pill_enum(counter)            # what PHD turns it into when swallowed
+        elif counter and kind == "good":
+            entry["false_phd"] = _pill_enum(counter)
+        out.append(entry)
+    return out
+
+
+def _pill_enum(effect: str) -> str:
+    return "PILLEFFECT_" + effect.upper()
 
 
 def summarize_categories(rewards: list[dict]) -> dict[str, int]:

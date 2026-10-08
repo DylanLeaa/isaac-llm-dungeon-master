@@ -186,10 +186,11 @@ local function enemies(decision, rng)
   if alive == 0 or room:IsClear() then return end   -- never close doors on an empty room
 
   local chance = tonumber(decision.champion_chance) or 0
+  local color = decision.champion_enum and E("ChampionColor", decision.champion_enum) or -1
   if chance > 0 then
     for _, npc in ipairs(npcs) do
       if not npc:IsBoss() and not npc:IsChampion() and rng:RandomFloat() < chance then
-        pcall(function() npc:MakeChampion(rng:Next(), -1, false) end)
+        pcall(function() npc:MakeChampion(rng:Next(), color, false) end)
       end
     end
   end

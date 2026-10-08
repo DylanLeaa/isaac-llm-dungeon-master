@@ -35,6 +35,10 @@ CASES = [
         {"id": 1, "name": "The Sad Onion", "quality": 3}, {"id": 37, "name": "Mr. Boom", "quality": 0},
         {"id": 114, "name": "Mom's Knife", "quality": 4}, {"id": 46, "name": "Lucky Foot", "quality": 1}]}),
     ("floor_plan", {"current_stage": 2}),
+    ("consumables", {"reason": "floor start", "pills_locked": [{"color": 2, "look": "white_blue", "effect": "health_up"}],
+                     "pill_colors_to_assign": [{"color": 5, "look": "reddots_red"}, {"color": 9, "look": "orangedots_white"}],
+                     "trinket_candidates": [{"id": 1, "name": "Swallowed Penny"}, {"id": 19, "name": "Paper Clip"},
+                                            {"id": 24, "name": "Butt Penny"}, {"id": 61, "name": "Left Hand"}]}),
 ]
 
 

@@ -9,10 +9,13 @@ local State  = include("dm.state")
 local Taunt  = include("dm.taunt")
 local Apply  = include("dm.apply")
 local Sched  = include("dm.scheduler")
+local Cons   = include("dm.consumables")
+local json   = require("json")
 
 Taunt.enabled = cfg.SHOW_TAUNTS
 Apply.init(Taunt)
-Sched.init(cfg, Bridge, State, Apply, Taunt)
+Cons.init(cfg, Bridge, State, Taunt)
+Sched.init(cfg, Bridge, State, Apply, Taunt, Cons)
 
 local game = Game()
 
@@ -41,6 +44,16 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function
   Bridge.setRun(seed, not continued)
   State.resetRun()
   Sched.resetRun()
+  -- Pill colours the DM fixed earlier in this run must stay fixed after a continue.
+  Cons.onLock = function(locked)
+    local pills = {}                       -- string keys: colours are a sparse int table
+    for c, e in pairs(locked) do pills[tostring(c)] = e end
+    mod:SaveData(json.encode({ seed = seed, pills = pills }))
+  end
+  if continued and mod:HasData() then
+    local ok, saved = pcall(json.decode, mod:LoadData())
+    if ok and type(saved) == "table" and saved.seed == seed then Cons.restore(saved.pills) end
+  end
   -- POST_NEW_ROOM / POST_NEW_LEVEL already fired for the first room; replay them.
   Sched.onNewRoom()
   Sched.onNewLevel()
@@ -79,6 +92,22 @@ end))
 
 mod:AddCallback(ModCallbacks.MC_PRE_GET_COLLECTIBLE, safe("get_collectible", function(_, pool, decrease, seed)
   return Sched.onGetCollectible(pool, decrease, seed)
+end))
+
+mod:AddCallback(ModCallbacks.MC_GET_CARD, safe("get_card", function(_, rng, card, playing, runes, onlyRunes)
+  return Cons.onGetCard(rng, card, playing, runes, onlyRunes)
+end))
+
+mod:AddCallback(ModCallbacks.MC_GET_TRINKET, safe("get_trinket", function(_, trinket, rng)
+  return Cons.onGetTrinket(trinket, rng)
+end))
+
+mod:AddCallback(ModCallbacks.MC_GET_PILL_EFFECT, safe("get_pill_effect", function(_, effect, color)
+  return Cons.onGetPillEffect(effect, color)
+end))
+
+mod:AddCallback(ModCallbacks.MC_USE_PILL, safe("use_pill", function(_, effect)
+  Cons.onUsePill(effect)
 end))
 
 mod:AddCallback(ModCallbacks.MC_POST_CURSE_EVAL, safe("curse_eval", function(_, curses)
