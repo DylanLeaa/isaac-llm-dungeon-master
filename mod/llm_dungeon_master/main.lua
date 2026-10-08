@@ -10,7 +10,9 @@ local Taunt  = include("dm.taunt")
 local Apply  = include("dm.apply")
 local Sched  = include("dm.scheduler")
 local Settings = include("dm.settings")
+local Receipt = include("dm.receipt")
 local Cons   = include("dm.consumables")
+local Death  = include("dm.deathscreen")
 
 Taunt.enabled = cfg.SHOW_TAUNTS
 Apply.init(Taunt)
@@ -35,19 +37,25 @@ local function safe(name, fn)
   end
 end
 
--- Saved DM Settings (cruelty) go out with the first hello.
-Settings.init(mod, cfg, Bridge)
+-- Saved DM Settings (cruelty) go out with the first hello; the backend's receipt fills the menu.
+Settings.init(mod, cfg, Bridge, Receipt, Death)
+Bridge.setReceiptHandler(Receipt.handle)
+Death.init(cfg, Bridge, State, Cons, Settings, Receipt.wrap)
+Bridge.setSummaryHandler(Death.handle)
 
 -- Connect as soon as the mod loads so the DM is warm by the time a run starts.
 Bridge.init(cfg, "menu")
 
+local runSeed
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function(_, continued)
   Settings.registerMenu()   -- in case Mod Config Menu loaded after this mod
   local seed = game:GetSeeds():GetStartSeedString()
+  runSeed = seed
   Bridge.init(cfg, seed)
   Bridge.setRun(seed, not continued)
   State.resetRun()
   Sched.resetRun()
+  Death.startRun(seed)
   -- Pill colours the DM fixed earlier in this run must stay fixed after a continue.
   Cons.onLock = function(locked)
     local pills = {}                       -- string keys: colours are a sparse int table
@@ -57,6 +65,8 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function
   if continued then
     local saved = Settings.load()
     if saved.seed == seed then Cons.restore(saved.pills) end
+    local stats = saved.run_stats            -- so the stats screen counts the whole run
+    if type(stats) == "table" and stats.seed == seed then State.restoreRun(stats) end
   end
   -- POST_NEW_ROOM / POST_NEW_LEVEL already fired for the first room; replay them.
   Sched.onNewRoom()
@@ -84,6 +94,7 @@ end))
 mod:AddCallback(ModCallbacks.MC_POST_RENDER, safe("render", function()
   Bridge.update()           -- pumped from render so it keeps flowing while paused
   Taunt.render()
+  Death.render()
   if cfg.SHOW_DEBUG_HUD then
     Taunt.renderDebug(Bridge.status(), math.floor(Bridge.latencyAvg()), math.floor(Bridge.latencyP90()),
       Sched.debugCounts())
@@ -112,6 +123,7 @@ end))
 
 mod:AddCallback(ModCallbacks.MC_USE_PILL, safe("use_pill", function(_, effect)
   Cons.onUsePill(effect)
+  State.onPillUsed()
 end))
 
 mod:AddCallback(ModCallbacks.MC_POST_CURSE_EVAL, safe("curse_eval", function(_, curses)
@@ -121,8 +133,8 @@ end))
 mod:AddCallback(ModCallbacks.MC_ENTITY_TAKE_DMG, safe("take_dmg", function(_, ent, amount, flags, source)
   local p = ent:ToPlayer()
   if not p then return nil end
-  State.onPlayerHit(amount)
   local src = source and source.Entity
+  State.onPlayerHit(amount, State.hitSourceName(src))
   Bridge.event("damage", {
     amount = amount, room = game:GetLevel():GetCurrentRoomDesc().SafeGridIndex,
     source = src and (src.Type .. "." .. src.Variant) or "environment",
@@ -131,5 +143,13 @@ mod:AddCallback(ModCallbacks.MC_ENTITY_TAKE_DMG, safe("take_dmg", function(_, en
 end), EntityType.ENTITY_PLAYER)
 
 mod:AddCallback(ModCallbacks.MC_POST_GAME_END, safe("game_end", function(_, gameOver)
-  Bridge.event(gameOver and "death" or "victory", {})
+  Death.onGameEnd(gameOver)    -- tells the backend too, which answers with the DM's side
+end))
+
+-- Quitting to the menu mid-run: keep the run's totals so a continue picks them up.
+mod:AddCallback(ModCallbacks.MC_PRE_GAME_EXIT, safe("game_exit", function(_, shouldSave)
+  if not (shouldSave and runSeed) then return end
+  local stats = State.saveRun()
+  stats.seed = runSeed
+  Settings.save({ run_stats = stats })
 end))

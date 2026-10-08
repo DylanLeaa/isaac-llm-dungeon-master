@@ -107,6 +107,45 @@ refresh limits, taunts and the debug HUD. `ALLOW_LAYOUT_RESEED` lets the DM's tr
 distance wish reroll the floor via the `reseed` console command — off by default because
 console commands disable achievements for that run.
 
+## The receipt (what the engine did, and what it cost)
+
+Every engine action is written to a per-run receipt: each decision with its request (snapshot,
+context, memory digest), the model's raw tool call, the clamped result and the guardrails that
+fired. It also gets the planners' narrative and briefs, fallbacks to vanilla, timeouts, errors,
+superseded calls and cruelty changes. Each LLM call keeps its model, provider, generation id,
+finish reason, raw response message, tokens and cost.
+
+- **On disk**: `backend/receipts/<started>_run-<seed>.jsonl`, one JSON object per line
+  (`--receipts DIR` moves it, `--no-receipts` keeps it in memory only). System prompts are
+  stored once per file and referenced by hash. Later outcomes (`applied`, or `replaced` when a
+  re-ask made an answer unused) are appended as `update` lines. Continuing a run resumes its
+  file, even after a backend restart.
+- **In game**: Mod Config Menu → **DM Settings → Receipt** shows run totals (actions, LLM calls,
+  cost, tokens, cache hit rate, applied/replaced/vanilla/timeouts/errors), an entry browser
+  (left/right steps back through the last 40 actions: model, latency, tokens, cost, intent,
+  result, taunt, guardrails, errors) and the latest ten at a glance. The cruelty slider is on
+  the **General** tab. If lines get cut off, lower `RECEIPT_WIDTH` in `dm/config.lua`.
+
+## The after-death stats screen
+
+When a run ends in death, the game-over screen gets a stats column down each side of the death note
+(the note is drawn after every mod callback, so nothing can sit on top of it; if the columns still
+run under the note, raise `PAPER_W` at the top of `dm/deathscreen.lua`):
+
+- **You**: floor reached, run time, rooms cleared, damage taken, items, pills eaten and
+  what hit you last. These come from the mod, so they appear at once, even with the backend offline.
+- **The DM**: rooms it dressed, extra enemies, keys/bombs/coins/hearts it dropped, troll bombs,
+  curses, bad pills, events left to vanilla and the LLM bill. Only decisions the game actually
+  used count. They are tallied from the receipt, so a continued run still counts in full.
+- The run's title from the Opus narrative, the DM's last taunt, the long con it was running
+  (its private `scheme`, revealed at last) and an **epitaph** Haiku writes for the run. The
+  epitaph arrives a second or two after the rest (`--no-epitaph` turns it off).
+
+The map button hides and shows the screen; `SHOW_DEATH_SCREEN = false` in `dm/config.lua` turns
+the overlay off. The last finished run, including a victory, is kept in the save file under
+Mod Config Menu → **DM Settings → Last run**. The backend also logs it and adds `run_summary` and
+`epitaph` entries to the receipt.
+
 ## What's tested, and what isn't
 
 - `tests/test_clamp.py` — guardrails.
@@ -115,7 +154,13 @@ console commands disable achievements for that run.
 - `tests/test_mod_headless.py` — the **whole mod** (`main.lua` + `dm/*`) on a fake Isaac API
   against the mock backend: prefetch → room dressed on entry → clear decision requested mid-fight
   and ready at the last kill → DM-picked treasure item → card/rune/trinket draws and a locked pill
-  colour → golden-chest pool ranked on sight → boss-room floor plan and bonus clear → curse mask.
+  colour → golden-chest pool ranked on sight → boss-room floor plan and bonus clear → curse mask
+  → the DM Settings → Receipt menu filled from the backend, and the receipt file on disk → death:
+  the stats screen, the DM's side and its epitaph in DM Settings → Last run.
+- `tests/test_receipt.py` — the receipt: call records, applied/replaced updates, errors, planners,
+  resuming a continued run.
+- `tests/test_epilogue.py` — the after-death stats: only applied decisions count, the epitaph
+  follows the stats and a failed one never leaves the screen waiting.
 
 These run without the game. The Isaac API calls follow the official docs, but the mod has not
 been run inside Isaac yet, so expect a first-session shakedown; errors are caught per callback,

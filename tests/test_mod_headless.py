@@ -20,7 +20,7 @@ MOD = ROOT / "mod" / "llm_dungeon_master"
 def main():
     tmp = tempfile.mkdtemp()
     srv = subprocess.Popen([sys.executable, "server.py", "--mock", "--bridge", "file", "--bridge-dir", tmp,
-                            "--mock-latency", "0.3", "0.9"],
+                            "--mock-latency", "0.3", "0.9", "--receipts", str(Path(tmp) / "receipts")],
                            cwd=ROOT / "backend", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     time.sleep(1.0)
     try:
@@ -74,8 +74,8 @@ def run(bridge_dir):
     g.include = include
     # Minimal Mod Config Menu: records what the mod registers.
     mcm = lua.execute("""
-        local M = { OptionType = { NUMBER = 3 }, settings = {} }
-        function M.AddSetting(cat, sub, s) M.settings[#M.settings + 1] = { cat = cat, s = s } end
+        local M = { OptionType = { TEXT = 1, SPACE = 2, NUMBER = 3, TITLE = 9 }, settings = {} }
+        function M.AddSetting(cat, sub, s) M.settings[#M.settings + 1] = { cat = cat, sub = sub, s = s } end
         return M""")
     g.ModConfigMenu = mcm
     lua.execute(open(MOD / "main.lua").read())
@@ -107,8 +107,10 @@ def run(bridge_dir):
     print("1. connected:", Bridge.status())
 
     # --- DM Settings menu: cruelty slider, applied live and saved -----------------
-    assert len(mcm.settings) == 1, "DM Settings registered once (again on game start is a no-op)"
-    entry = mcm.settings[1]
+    menu = [mcm.settings[i] for i in range(1, len(mcm.settings) + 1)]
+    general = [e for e in menu if e.sub == "General"]
+    assert len(general) == 1, "DM Settings registered once (again on game start is a no-op)"
+    entry = general[0]
     assert entry.cat == "DM Settings" and entry.s.CurrentSetting() == -1
     assert entry.s.Display() == "Cruelty: backend default"
     entry.s.OnChange(3)
@@ -222,6 +224,50 @@ def run(bridge_dir):
     mask = W.fire(MC.MC_POST_CURSE_EVAL, 0)
     print(f"11. curse mask for floor 2 = {mask}")
     assert mask == 1
+
+    # --- DM Settings > Receipt: what the engine did, browsable in the menu --------
+    receipt = [e.s for e in menu if e.sub == "Receipt"]
+    picker = next(s for s in receipt if s.Type == 3)
+
+    def screen():
+        return [s.Display() if callable(s.Display) else (s.Display or "") for s in receipt]
+
+    wait(lambda: any("room_clear applied" in line for line in screen()), 5, "receipt entries in the menu")
+    lines = screen()
+    print("12. DM Settings > Receipt:\n      " + "\n      ".join(l for l in lines if l))
+    assert any(" actions, " in l for l in lines), "totals shown"
+    assert any(l.startswith("saved as ") for l in lines), "the receipt file is named"
+    newest = picker.Display()
+    picker.OnChange(2)
+    assert picker.Display() != newest and picker.CurrentSetting() == 2, "the picker browses older entries"
+    files = list((Path(bridge_dir) / "receipts").glob("*.jsonl"))
+    assert len(files) == 1, files
+    recs = [json.loads(l) for l in files[0].read_text().splitlines()]
+    calls = [r for r in recs if r["type"] == "entry" and (r.get("llm") or {}).get("model") == "mock"]
+    assert calls and all("request" in r for r in calls if r["what"] not in ("narrative", "floor_brief"))
+    assert any(r["type"] == "update" and r["status"] == "applied" for r in recs)
+    assert any(r.get("what") == "cruelty" and r.get("result") == "6 -> 3" for r in recs)
+    print(f"    receipt file {files[0].name}: {len(recs)} records, {len(calls)} LLM calls")
+
+    # --- death: the player's stats at once, then the DM's side and its epitaph ------
+    gaper = lua.table_from({"Entity": lua.table_from({"Type": g.EntityType.ENTITY_GAPER, "Variant": 0})})
+    W.fire(MC.MC_ENTITY_TAKE_DMG, g.Isaac.GetPlayer(0), 2, 0, gaper)
+    W.fire(MC.MC_POST_GAME_END, True)
+    last_run = [e.s for e in menu if e.sub == "Last run"]
+
+    def last():
+        return " | ".join(l for l in (s.Display() for s in last_run) if l)
+
+    text = last()
+    assert text.startswith("HERE LIES ISAAC") and "Reached: Basement I" in text and "Last hit by: gaper" in text
+    assert "Rooms cleared: 2" in text and "Pills eaten: 2" in text and "tallying" in text, text
+    death = [json.loads(l) for l in open(Path(bridge_dir) / "to_dm.jsonl") if '"death"' in l]
+    assert death and death[0]["data"]["run"] == "TEST 1234" and death[0]["data"]["rows"][0] == ["Reached", "Basement I"]
+    wait(lambda: "Extra enemies" in last(), 5, "the DM's side of the stats")
+    wait(lambda: "The dice were mine" in last(), 5, "the DM's epitaph")
+    tick(3)                                   # the overlay draws without errors
+    assert "The dice were mine" in json.loads(W.saved)["last_run"]["epitaph"], "kept for the next session"
+    print("13. death -> DM Settings > Last run:\n      " + last().replace(" | ", "\n      "))
 
     errors = [p for p in printed if "error" in p.lower()]
     assert not errors, errors
