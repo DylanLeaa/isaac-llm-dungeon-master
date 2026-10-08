@@ -93,6 +93,8 @@ class Coordinator:
             # Changed from the in-game DM Settings menu; takes effect for the next decision.
             self._set_cruelty(msg.get("cruelty"))
             await send({"t": "settings_ok", "session": self.session, "cruelty": self.cruelty})
+        elif t == "prepare":
+            self._prepare(msg, send)
         elif t == "req":
             self._start(msg, send)
         elif t == "applied":
@@ -191,6 +193,24 @@ class Coordinator:
             log.info('epitaph     %5dms  "%s"', _ms(t0), summary["epitaph"])
         summary["epitaph_pending"] = False
         await self._send_quietly(send, _summary_msg(session, summary))
+
+    # ------------------------------------------------------------------ loading
+    def _prepare(self, msg: dict, send: Send) -> None:
+        """The game is on its loading screen: start the planners now and say when the narrative is in.
+        Safe to repeat (the game re-sends after a reconnect): the narrative is only ever written once."""
+        self.campaign.observe(msg.get("state") or {}, self.memory.digest(), self.cruelty)
+        session = self.session
+        task = asyncio.create_task(self._announce_ready(session, send, self.campaign.narrative_waiter()))
+        self.bg.add(task)
+        task.add_done_callback(self.bg.discard)
+
+    async def _announce_ready(self, session: str | None, send: Send, waiter) -> None:
+        t0 = time.perf_counter()
+        status = await waiter
+        if status == "cancelled":
+            return                                # a new run said hello; its own prepare will answer
+        log.info("narrative %s after %dms -> run starts", status, _ms(t0))
+        await self._send_quietly(send, {"t": "ready", "session": session, "status": status})
 
     # ----------------------------------------------------------------- requests
     def _start(self, msg: dict, send: Send) -> None:

@@ -13,6 +13,7 @@ local Settings = include("dm.settings")
 local Receipt = include("dm.receipt")
 local Cons   = include("dm.consumables")
 local Death  = include("dm.deathscreen")
+local Loading = include("dm.loading")
 
 Taunt.enabled = cfg.SHOW_TAUNTS
 Apply.init(Taunt)
@@ -42,6 +43,8 @@ Settings.init(mod, cfg, Bridge, Receipt, Death)
 Bridge.setReceiptHandler(Receipt.handle)
 Death.init(cfg, Bridge, State, Cons, Settings, Receipt.wrap)
 Bridge.setSummaryHandler(Death.handle)
+Loading.init(cfg, Bridge, State, Taunt)
+Bridge.setReadyHandler(Loading.handle)
 
 -- Connect as soon as the mod loads so the DM is warm by the time a run starts.
 Bridge.init(cfg, "menu")
@@ -56,6 +59,7 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function
   State.resetRun()
   Sched.resetRun()
   Death.startRun(seed)
+  Loading.start()
   -- Pill colours the DM fixed earlier in this run must stay fixed after a continue.
   Cons.onLock = function(locked)
     local pills = {}                       -- string keys: colours are a sparse int table
@@ -93,6 +97,8 @@ end))
 
 mod:AddCallback(ModCallbacks.MC_POST_RENDER, safe("render", function()
   Bridge.update()           -- pumped from render so it keeps flowing while paused
+  Loading.update()
+  Loading.render()
   Taunt.render()
   Death.render()
   if cfg.SHOW_DEBUG_HUD then
@@ -100,6 +106,8 @@ mod:AddCallback(ModCallbacks.MC_POST_RENDER, safe("render", function()
       Sched.debugCounts())
   end
 end))
+
+mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, Loading.blockInput)
 
 mod:AddCallback(ModCallbacks.MC_PRE_SPAWN_CLEAN_AWARD, safe("clean_award", function(_, rng, pos)
   return Sched.onCleanAward(rng, pos)

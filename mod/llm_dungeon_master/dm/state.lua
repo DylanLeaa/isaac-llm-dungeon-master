@@ -60,9 +60,12 @@ local T = {}
 function State.resetRun()
   T = { floorHits = 0, runHits = 0, itemsTaken = {}, floorClears = 0, clearSecs = {},
         lockedDoors = {}, tintedSeen = {}, roomHits = 0, roomEnteredAt = 0,
-        itemCount = -1, owned = {}, runClears = 0, pills = 0, lastHitBy = nil }
+        itemCount = -1, owned = {}, runClears = 0, pills = 0, lastHitBy = nil, pausedFrames = 0 }
 end
 State.resetRun()
+
+--- Frames spent on the loading screen: the game's clock ran, the run's didn't.
+function State.addPausedFrames(n) T.pausedFrames = (T.pausedFrames or 0) + math.max(0, n) end
 
 function State.onNewFloor()
   T.floorHits, T.floorClears, T.clearSecs, T.lockedDoors, T.tintedSeen = 0, 0, {}, {}, {}
@@ -126,7 +129,7 @@ function State.hitSourceName(ent)
 end
 
 -- The run totals a continued run picks up again (saved on exit, see main.lua).
-local CARRIED = { "runHits", "runClears", "pills", "lastHitBy" }
+local CARRIED = { "runHits", "runClears", "pills", "lastHitBy", "pausedFrames" }
 function State.saveRun()
   local out = { items = T.itemsTaken }
   for _, k in ipairs(CARRIED) do out[k] = T[k] end
@@ -149,7 +152,7 @@ end
 
 --- The player's column of the after-death stats screen: {label, value} rows.
 function State.runRows()
-  local frames = game.TimeCounter or game:GetFrameCount()
+  local frames = math.max(0, (game.TimeCounter or game:GetFrameCount()) - (T.pausedFrames or 0))
   return {
     { "Reached", game:GetLevel():GetName() },
     { "Time", clock(frames) },
