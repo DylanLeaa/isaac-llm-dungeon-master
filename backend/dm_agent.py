@@ -52,13 +52,25 @@ class OpenRouterDM:
         })
         self.model = model
         self.max_tokens = max_tokens
+        self.campaign = ""
         self.set_cruelty(cruelty)
 
     def set_cruelty(self, cruelty: int) -> None:
         self.cruelty = cruelty
+        self._build_system()
+
+    def set_campaign(self, text: str) -> None:
+        """The planners' narrative + floor brief, shown after the persona."""
+        self.campaign = text
+        self._build_system()
+
+    def _build_system(self) -> None:
         # Persona + catalogs are identical across calls -> cache them (OpenRouter passes cache_control on).
-        self.system = {"role": "system", "content": [
-            {"type": "text", "text": system_prompt(cruelty), "cache_control": {"type": "ephemeral"}}]}
+        # The campaign changes about once a floor, so it gets its own breakpoint after them.
+        content = [{"type": "text", "text": system_prompt(self.cruelty), "cache_control": {"type": "ephemeral"}}]
+        if self.campaign:
+            content.append({"type": "text", "text": self.campaign, "cache_control": {"type": "ephemeral"}})
+        self.system = {"role": "system", "content": content}
 
     async def decide(self, kind: str, state: dict, ctx: dict, memory: dict) -> dict[str, Any]:
         tool = TOOLS[kind]
@@ -92,9 +104,13 @@ class MockDM:
         self.cruelty = cruelty
         self.latency = latency
         self.rng = random.Random(seed)
+        self.campaign = ""
 
     def set_cruelty(self, cruelty: int) -> None:
         self.cruelty = cruelty
+
+    def set_campaign(self, text: str) -> None:
+        self.campaign = text
 
     async def decide(self, kind: str, state: dict, ctx: dict, memory: dict) -> dict[str, Any]:
         await asyncio.sleep(self.rng.uniform(*self.latency))

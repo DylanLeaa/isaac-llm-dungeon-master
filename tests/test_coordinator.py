@@ -103,3 +103,133 @@ def test_clean_text_cuts_on_word_boundary():
     assert _clean_text("Two bombs, one key, and a shop you have not found. Good luck in the dark", 70) \
         == "Two bombs, one key, and a shop you have not found. Good luck in the"
     assert _clean_text("x" * 100, 70) == "x" * 70
+
+
+class ScriptedPlanner:
+    """Records planner calls; each call blocks until its gate is opened (or answers at once)."""
+
+    narrative_model = floor_model = "scripted"
+
+    def __init__(self, fail_brief=False, gated=False):
+        self.narratives, self.briefs = [], []
+        self.fail_brief, self.gated = fail_brief, gated
+        self.gate = asyncio.Event() if gated else None
+
+    async def narrative(self, state, cruelty):
+        self.narratives.append(state)
+        if self.gate:
+            await self.gate.wait()
+        return f"NARRATIVE for {state['player']['character']}", {"in": 50, "cached": 0, "out": 30, "cost": 0.01}
+
+    async def floor_brief(self, state, narrative, digest, prev_brief, cruelty):
+        self.briefs.append({"stage": state["level"]["stage"], "narrative": narrative, "prev": prev_brief})
+        if self.fail_brief:
+            raise RuntimeError("boom")
+        return f"BRIEF for {state['level']['name']}", {}
+
+
+class CampaignDM(ScriptedDM):
+    def __init__(self, n):
+        super().__init__([{"intent": "x", "rewards": [], "taunt": ""}] * n)
+        self.campaigns = []
+
+    def set_campaign(self, text):
+        self.campaigns.append(text)
+
+
+def floor_req(rid, stage, name, stage_type=0):
+    msg = clear_req(rid)
+    msg["key"] = f"clear:{stage}:{rid}"
+    msg["state"] = {**msg["state"], "player": {**msg["state"]["player"], "character": "Isaac"},
+                    "level": {"stage": stage, "stage_type": stage_type, "name": name}}
+    return msg
+
+
+def _run_coord(coord, msgs, settle=0.05):
+    async def send(msg):
+        pass
+
+    async def go():
+        for m in msgs:
+            await coord.handle(m, send)
+            await asyncio.sleep(settle)
+
+    asyncio.run(go())
+
+
+def test_narrative_once_per_run_and_brief_once_per_floor():
+    dm, planner = CampaignDM(5), ScriptedPlanner()
+    coord = Coordinator(dm, cruelty=6, planner=planner)
+    _run_coord(coord, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+                       floor_req(1, 1, "Basement I"), floor_req(2, 1, "Basement I"),
+                       floor_req(3, 2, "Caves I"), floor_req(4, 2, "Caves I"),
+                       floor_req(5, 2, "Caves I")])
+    assert len(planner.narratives) == 1
+    assert [b["stage"] for b in planner.briefs] == [1, 2]
+    # The brief sees the narrative and the previous floor's brief.
+    assert planner.briefs[1] == {"stage": 2, "narrative": "NARRATIVE for Isaac", "prev": "BRIEF for Basement I"}
+    final = dm.campaigns[-1]
+    assert "NARRATIVE for Isaac" in final and "BRIEF for Caves I" in final
+    assert "Basement I\n" not in final
+    assert coord.stats["narrative"]["ok"] == 1 and coord.stats["floor_brief"]["ok"] == 2
+    assert coord.usage["cost"] >= 0.01
+
+
+def test_floor_change_clears_old_brief_at_once():
+    dm, planner = CampaignDM(2), ScriptedPlanner()
+    coord = Coordinator(dm, cruelty=6, planner=planner)
+
+    async def send(msg):
+        pass
+
+    async def go():
+        await coord.handle(floor_req(1, 1, "Basement I"), send)
+        await asyncio.sleep(0.05)
+        assert "BRIEF for Basement I" in dm.campaigns[-1]
+        await coord.handle(floor_req(2, 2, "Caves I"), send)
+        # Pushed synchronously, before the new brief is written.
+        assert "BRIEF for Basement I" not in dm.campaigns[-1]
+        assert "FLOOR BRIEF for Caves I: still being prepared" in dm.campaigns[-1]
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    assert "BRIEF for Caves I" in dm.campaigns[-1]
+
+
+def test_new_run_discards_late_narrative_from_old_run():
+    dm, planner = CampaignDM(2), ScriptedPlanner(gated=True)
+    coord = Coordinator(dm, cruelty=6, planner=planner)
+
+    async def send(msg):
+        pass
+
+    async def go():
+        await coord.handle({"t": "hello", "session": "S", "run": "R1", "new_run": True}, send)
+        await coord.handle(floor_req(1, 1, "Basement I"), send)
+        await asyncio.sleep(0.02)
+        await coord.handle({"t": "hello", "session": "S", "run": "R2", "new_run": True}, send)
+        planner.gate.set()                       # the old run's narrative "arrives" now
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    assert coord.campaign.narrative is None
+    assert all("NARRATIVE for" not in c for c in dm.campaigns)
+    assert coord.stats["narrative"]["ok"] == 0
+
+
+def test_planner_failure_never_breaks_decisions():
+    dm, planner = CampaignDM(1), ScriptedPlanner(fail_brief=True)
+    coord = Coordinator(dm, cruelty=6, planner=planner)
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle(floor_req(1, 1, "Basement I"), send)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    assert sent and sent[-1]["ok"] is True
+    assert coord.stats["floor_brief"]["error"] == 1
+    assert "NARRATIVE for Isaac" in dm.campaigns[-1] and "still being prepared" in dm.campaigns[-1]

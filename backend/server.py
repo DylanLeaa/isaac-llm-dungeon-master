@@ -4,7 +4,8 @@ Speaks newline-delimited JSON with the Isaac mod over either
   * TCP on 127.0.0.1:7337 (mod uses LuaSocket; needs --luadebug), or
   * two append-only files in a shared folder (mod uses io; also needs --luadebug).
 
-Run:  python server.py                 # Haiku 5.5, TCP
+Run:  python server.py                 # Haiku 5.5 DM + Opus narrative + Sonnet floor briefs, TCP
+      python server.py --no-planners  # Haiku alone
       python server.py --mock          # no API key needed
       python server.py --bridge file --bridge-dir "C:/.../The Binding of Isaac Rebirth/llmdm_bridge"
 """
@@ -22,6 +23,7 @@ from typing import Awaitable, Callable
 
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from memory import RunMemory
+from planners import FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, Campaign, MockPlanner, OpenRouterPlanner
 from schemas import KINDS, clamp
 
 log = logging.getLogger("llmdm")
@@ -34,7 +36,7 @@ MIN_DEADLINE_S = 0.4
 class Coordinator:
     """Routes requests to the DM, enforces latest-wins per key, applies guardrails."""
 
-    def __init__(self, dm, cruelty: int, max_concurrency: int = 6) -> None:
+    def __init__(self, dm, cruelty: int, planner=None, max_concurrency: int = 6) -> None:
         self.dm = dm
         self.cruelty = self.default_cruelty = cruelty
         self.memory = RunMemory()
@@ -44,6 +46,8 @@ class Coordinator:
         # Per decision kind: req, ok, superseded, timeout, error, replaced, applied, fallback.
         self.stats: dict[str, Counter] = defaultdict(Counter)
         self.usage = Counter()                    # in / cached / out tokens, cost, calls
+        # Opus narrative once per run + Sonnet brief once per floor, fed to the DM's system prompt.
+        self.campaign = Campaign(planner, getattr(dm, "set_campaign", lambda _text: None), self.stats, self.usage)
 
     def summary(self) -> None:
         """Log how many answers were requested, paid for, and actually used, per kind."""
@@ -65,6 +69,7 @@ class Coordinator:
             self.session = str(msg.get("session"))
             if msg.get("run") != self.memory.run_id or msg.get("new_run"):
                 self.memory.reset(msg.get("run"))
+                self.campaign.reset()
             self._set_cruelty(msg.get("cruelty"))
             log.info("game connected  session=%s run=%s cruelty=%s", self.session, msg.get("run"), self.cruelty)
             await send({"t": "welcome", "session": self.session, "cruelty": self.cruelty})
@@ -109,6 +114,7 @@ class Coordinator:
             log.warning("unknown kind %r", kind)
             return
         self.stats[kind]["req"] += 1
+        self.campaign.observe(msg.get("state") or {}, self.memory.digest(), self.cruelty)
         old = self.inflight.get(key)
         if old and old[0] < rid and not old[1].done():
             old[1].cancel()                      # latest-wins: newer context supersedes
@@ -259,6 +265,11 @@ def main() -> None:
     ap.add_argument("--bridge-dir", type=Path, default=Path("llmdm_bridge"))
     ap.add_argument("--model", default=os.environ.get("LLMDM_MODEL", OPENROUTER_DEFAULT_MODEL),
                     help="OpenRouter model slug")
+    ap.add_argument("--narrative-model", default=os.environ.get("LLMDM_NARRATIVE_MODEL", NARRATIVE_DEFAULT_MODEL),
+                    help="OpenRouter model that writes the run narrative (once per run)")
+    ap.add_argument("--floor-model", default=os.environ.get("LLMDM_FLOOR_MODEL", FLOOR_DEFAULT_MODEL),
+                    help="OpenRouter model that writes the floor brief (once per floor)")
+    ap.add_argument("--no-planners", action="store_true", help="no narrative / floor brief: the DM plays solo")
     ap.add_argument("--cruelty", type=int, default=6, help="0 (generous) .. 10 (merciless)")
     ap.add_argument("--mock", action="store_true", help="use the offline rule-based DM")
     ap.add_argument("--mock-latency", type=float, nargs=2, default=(0.25, 1.2), metavar=("MIN", "MAX"),
@@ -271,14 +282,18 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     if args.mock:
         dm = MockDM(args.cruelty, latency=tuple(args.mock_latency))
+        planner = None if args.no_planners else MockPlanner()
         log.info("Dungeon Master: MOCK (offline)")
     else:
         if not os.environ.get("OPENROUTER_API_KEY"):
             raise SystemExit("Set OPENROUTER_API_KEY (or run with --mock).")
         dm = OpenRouterDM(args.cruelty, model=args.model)
+        planner = None if args.no_planners else OpenRouterPlanner(args.narrative_model, args.floor_model)
         log.info("Dungeon Master: %s via OpenRouter  cruelty=%d", args.model, args.cruelty)
+    if planner:
+        log.info("Planners: narrative=%s  floor brief=%s", planner.narrative_model, planner.floor_model)
 
-    coord = Coordinator(dm, args.cruelty)
+    coord = Coordinator(dm, args.cruelty, planner)
 
     async def run() -> None:
         if args.bridge == "tcp":

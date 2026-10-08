@@ -1,6 +1,9 @@
 """One real call per decision kind to Claude Haiku 5.5 via OpenRouter (needs OPENROUTER_API_KEY).
 
-    python tests/live_smoke.py [--cruelty 8]
+    python tests/live_smoke.py [--cruelty 8] [--planners]
+
+--planners first writes a real run narrative (Opus 5.5) and floor brief (Sonnet 5.5) and
+gives them to the DM, so the decisions show whether Haiku follows the campaign.
 
 Prints each clamped decision and its latency so you can sanity-check the DM's voice
 and see whether your latency fits the prefetch lead times before launching the game.
@@ -15,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from dm_agent import OpenRouterDM  # noqa: E402
 from memory import RunMemory  # noqa: E402
+from planners import OpenRouterPlanner, campaign_text  # noqa: E402
 from schemas import clamp  # noqa: E402
 
 STATE = {
@@ -42,18 +46,37 @@ CASES = [
 ]
 
 
-async def main(cruelty: int) -> None:
+async def plan(dm: OpenRouterDM, cruelty: int, digest: dict) -> None:
+    planner = OpenRouterPlanner()
+    t0 = time.perf_counter()
+    narrative, u = await planner.narrative(STATE, cruelty)
+    print(f"\n== narrative [{planner.narrative_model}]  ({time.perf_counter() - t0:.1f} s, "
+          f"{u['in']}/{u['out']} tok, ${u['cost']:.4f})\n{narrative}")
+    t0 = time.perf_counter()
+    brief, u = await planner.floor_brief(STATE, narrative, digest, None, cruelty)
+    print(f"\n== floor brief [{planner.floor_model}]  ({time.perf_counter() - t0:.1f} s, "
+          f"{u['in']}/{u['out']} tok, ${u['cost']:.4f})\n{brief}")
+    dm.set_campaign(campaign_text(narrative, brief, STATE["level"]["name"]))
+
+
+async def main(cruelty: int, planners: bool) -> None:
     dm, mem = OpenRouterDM(cruelty), RunMemory()
     mem.events.extend(["cleared room 84 in 9s, took 1 hits", "clear reward: 1x penny"])
+    if planners:
+        await plan(dm, cruelty, mem.digest())
     for kind, ctx in CASES:
         t0 = time.perf_counter()
         raw = await dm.decide(kind, STATE, ctx, mem.digest())
         ms = (time.perf_counter() - t0) * 1000
+        u = raw.get("_usage") or {}
         out = clamp(kind, raw, STATE, ctx, cruelty, mem.counters)
-        print(f"\n== {kind}  ({ms:.0f} ms)\n{json.dumps(out, indent=2)}")
+        print(f"\n== {kind}  ({ms:.0f} ms, {u.get('in', 0)} in / {u.get('cached', 0)} cached)\n"
+              f"{json.dumps(out, indent=2)}")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--cruelty", type=int, default=7)
-    asyncio.run(main(ap.parse_args().cruelty))
+    ap.add_argument("--planners", action="store_true", help="also run the Opus narrative + Sonnet floor brief")
+    args = ap.parse_args()
+    asyncio.run(main(args.cruelty, args.planners))
