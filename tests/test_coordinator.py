@@ -74,6 +74,31 @@ def test_fallback_event_is_counted_not_remembered():
     assert not coord.memory.events
 
 
+def test_cruelty_follows_hello_and_settings():
+    class DM(ScriptedDM):
+        def set_cruelty(self, cruelty):
+            self.cruelty = cruelty
+
+    dm = DM([])
+    coord = Coordinator(dm, cruelty=6)
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    def handle(msg):
+        asyncio.run(coord.handle(msg, send))
+        return coord.cruelty
+
+    assert handle({"t": "hello", "session": "S", "run": "R", "cruelty": 9}) == 9 and dm.cruelty == 9
+    assert handle({"t": "settings", "cruelty": 2}) == 2 and dm.cruelty == 2
+    assert sent[-1] == {"t": "settings_ok", "session": "S", "cruelty": 2}
+    assert handle({"t": "settings"}) == 6 and dm.cruelty == 6        # menu's "backend default"
+    assert handle({"t": "settings", "cruelty": 42}) == 10
+    assert handle({"t": "settings", "cruelty": "lots"}) == 10        # garbage is ignored
+    assert handle({"t": "hello", "session": "S2", "run": "R"}) == 6  # reconnect without override
+
+
 def test_clean_text_cuts_on_word_boundary():
     assert _clean_text("Two bombs, one key, and a shop you have not found. Good luck in the dark", 70) \
         == "Two bombs, one key, and a shop you have not found. Good luck in the"

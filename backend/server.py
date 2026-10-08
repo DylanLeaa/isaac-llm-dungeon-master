@@ -36,7 +36,7 @@ class Coordinator:
 
     def __init__(self, dm, cruelty: int, max_concurrency: int = 6) -> None:
         self.dm = dm
-        self.cruelty = cruelty
+        self.cruelty = self.default_cruelty = cruelty
         self.memory = RunMemory()
         self.session: str | None = None
         self.inflight: dict[str, tuple[int, asyncio.Task]] = {}
@@ -65,11 +65,13 @@ class Coordinator:
             self.session = str(msg.get("session"))
             if msg.get("run") != self.memory.run_id or msg.get("new_run"):
                 self.memory.reset(msg.get("run"))
-            if msg.get("cruelty") is not None:
-                self.cruelty = int(msg["cruelty"])
-                self.dm.set_cruelty(self.cruelty)
+            self._set_cruelty(msg.get("cruelty"))
             log.info("game connected  session=%s run=%s cruelty=%s", self.session, msg.get("run"), self.cruelty)
             await send({"t": "welcome", "session": self.session, "cruelty": self.cruelty})
+        elif t == "settings":
+            # Changed from the in-game DM Settings menu; takes effect for the next decision.
+            self._set_cruelty(msg.get("cruelty"))
+            await send({"t": "settings_ok", "session": self.session, "cruelty": self.cruelty})
         elif t == "req":
             self._start(msg, send)
         elif t == "applied":
@@ -87,6 +89,18 @@ class Coordinator:
             self.memory.on_game_event(str(msg.get("name")), msg.get("data") or {})
         elif t == "ping":
             await send({"t": "pong", "session": self.session, "id": msg.get("id")})
+
+    def _set_cruelty(self, value) -> None:
+        """None (the game's 'backend default') means the --cruelty this server was started with."""
+        try:
+            cruelty = self.default_cruelty if value is None else max(0, min(10, int(value)))
+        except (TypeError, ValueError):
+            log.warning("ignoring bad cruelty %r", value)
+            return
+        if cruelty != self.cruelty:
+            log.info("cruelty %d -> %d", self.cruelty, cruelty)
+            self.cruelty = cruelty
+            self.dm.set_cruelty(cruelty)
 
     # ----------------------------------------------------------------- requests
     def _start(self, msg: dict, send: Send) -> None:

@@ -134,7 +134,9 @@ def test_tcp_server():
             f.flush()
 
         send({"t": "hello", "session": "S", "run": "R", "new_run": True, "cruelty": 9})
-        assert json.loads(f.readline())["t"] == "welcome"
+        assert json.loads(f.readline())["cruelty"] == 9
+        send({"t": "settings", "cruelty": 3})
+        assert json.loads(f.readline()) == {"t": "settings_ok", "session": "S", "cruelty": 3}
         send({"t": "req", "id": 1, "key": "k", "kind": "room_layout", "deadline_ms": 5000, "state": STATE, "ctx": {}})
         send({"t": "req", "id": 2, "key": "k", "kind": "room_layout", "deadline_ms": 5000, "state": STATE, "ctx": {}})
         send({"t": "req", "id": 3, "key": "t", "kind": "room_clear", "deadline_ms": 10, "state": STATE, "ctx": {}})

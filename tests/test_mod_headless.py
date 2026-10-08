@@ -72,6 +72,12 @@ def run(bridge_dir):
         return modules[name]
 
     g.include = include
+    # Minimal Mod Config Menu: records what the mod registers.
+    mcm = lua.execute("""
+        local M = { OptionType = { NUMBER = 3 }, settings = {} }
+        function M.AddSetting(cat, sub, s) M.settings[#M.settings + 1] = { cat = cat, s = s } end
+        return M""")
+    g.ModConfigMenu = mcm
     lua.execute(open(MOD / "main.lua").read())
     Bridge, Sched = modules["dm.bridge"], modules["dm.scheduler"]
     MC = g.ModCallbacks
@@ -99,6 +105,18 @@ def run(bridge_dir):
     W.fire(MC.MC_POST_GAME_STARTED, False)
     wait(Bridge.ready, 5, "backend welcome")
     print("1. connected:", Bridge.status())
+
+    # --- DM Settings menu: cruelty slider, applied live and saved -----------------
+    assert len(mcm.settings) == 1, "DM Settings registered once (again on game start is a no-op)"
+    entry = mcm.settings[1]
+    assert entry.cat == "DM Settings" and entry.s.CurrentSetting() == -1
+    assert entry.s.Display() == "Cruelty: backend default"
+    entry.s.OnChange(3)
+    tick(3)
+    to_dm = [json.loads(l) for l in open(Path(bridge_dir) / "to_dm.jsonl") if l.strip()]
+    assert {"t": "settings", "cruelty": 3} in to_dm, "cruelty change should reach the backend"
+    assert entry.s.Display() == "Cruelty: 3/10 (mischievous)" and json.loads(W.saved)["cruelty"] == 3
+    print("   DM Settings -> cruelty 3 sent to backend and saved")
     wait(lambda: Bridge.peek("layout:1:85") and Bridge.peek("items:1:0"), 6, "neighbour prefetch")
     print("2. prefetched before the player moved: layout for room 85, treasure pool ranking")
 
@@ -178,6 +196,7 @@ def run(bridge_dir):
     print(f"8. pill colour 5 -> {pill5['effect']} (effect {effect}), horse pill -> {horse}; saved: {W.saved}")
     assert effect == g.PillEffect[pill5["enum"]] and horse == effect
     assert '"5"' in W.saved
+    assert json.loads(W.saved)["cruelty"] == 3, "pill save must not wipe the DM Settings"
     assert W.fire(MC.MC_GET_PILL_EFFECT, 3, 9) is None             # no plan for colour 9: vanilla
     W.fire(MC.MC_USE_PILL, 3)
     assert W.fire(MC.MC_GET_PILL_EFFECT, 3, 9) is None             # ...and it stays vanilla's

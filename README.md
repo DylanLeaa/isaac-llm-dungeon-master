@@ -40,7 +40,9 @@ so the lead time adapts to your connection.
 Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the referee:
 
 - `--cruelty 0..10` scales extra-enemy budget (0–3/room), champion chance cap, curse count (0–2)
-  and troll-bomb budget per floor. Max one live troll bomb per room.
+  and troll-bomb budget per floor. Max one live troll bomb per room. With
+  Mod Config Menu (Pure) installed,
+  **DM Settings → Cruelty** changes it in-game (even mid-run), overrides `--cruelty` and is saved.
 - **Mercy**: at ≤1 heart, no troll bombs, ≤1 extra enemy, no Curse of the Unknown, and a half
   heart sneaks into the drop after a long heart drought.
 - **Drought breaker**: 0 keys + locked doors seen + 7 key-less clears → a key is added (same for bombs).
