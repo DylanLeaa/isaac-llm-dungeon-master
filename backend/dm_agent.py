@@ -41,7 +41,9 @@ def _usage(data: dict) -> dict:
 class OpenRouterDM:
     """Same Haiku DM, called through OpenRouter's OpenAI-compatible chat endpoint."""
 
-    def __init__(self, cruelty: int, model: str = OPENROUTER_DEFAULT_MODEL, max_tokens: int = 400,
+    # Output includes Haiku's reasoning, not just the tool JSON: real calls run ~140-390 tokens,
+    # so leave plenty of headroom. A cut-off answer is a lost decision.
+    def __init__(self, cruelty: int, model: str = OPENROUTER_DEFAULT_MODEL, max_tokens: int = 1024,
                  api_key: str | None = None) -> None:
         import httpx                                    # imported lazily so --mock needs no HTTP client
         self.client = httpx.AsyncClient(timeout=30.0, headers={
@@ -73,11 +75,14 @@ class OpenRouterDM:
         data = resp.json()
         if "error" in data:
             raise RuntimeError(f"openrouter: {data['error']}")
-        msg = data["choices"][0]["message"]
+        choice = data["choices"][0]
+        if choice.get("finish_reason") == "length":
+            raise RuntimeError(f"hit max_tokens={self.max_tokens} before finishing the tool call")
+        msg = choice["message"]
         for call in msg.get("tool_calls") or []:
             if call["function"]["name"] == tool["name"]:
                 return {**json.loads(call["function"]["arguments"]), "_usage": _usage(data)}
-        raise RuntimeError(f"no tool call in response (finish_reason={data['choices'][0].get('finish_reason')})")
+        raise RuntimeError(f"no tool call in response (finish_reason={choice.get('finish_reason')})")
 
 
 class MockDM:
