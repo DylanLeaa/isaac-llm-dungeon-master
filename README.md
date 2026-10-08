@@ -7,9 +7,18 @@ curses the next floor carries are all decided by **Claude Haiku 5.5**, playing a
 DM. It sees your hearts, keys, bombs, coins, luck, build and what the floor still demands of
 you — and gives you twelve coins on a floor with no shop.
 
+Two slower planners work above it. At the start of a run, **Claude Opus 5.5** writes the run's
+narrative: a premise, an angle on your character, an arc across the chapters and some running gags.
+At the start of every floor, **Claude Sonnet 5.5** writes a floor brief: the arc beat, which
+resources to starve or flood, how to dress rooms, its stance on items, a multi-room set-piece
+and a voice. Both go into Haiku's system prompt, so every decision serves the plan.
+
 ```
  Isaac (Lua mod)                                   backend (Python)
  ───────────────                                   ────────────────
+                                                     Campaign: Opus narrative (once per run)
+                                                               Sonnet brief (once per floor)
+                                                                   │ system prompt
  scheduler.lua  ── "decide clear:3:85" + snapshot ─▶ Coordinator ── Haiku 5.5 (tool call)
    decides WHEN to ask                                 latest-wins per key     │
  bridge.lua     ◀─ clamped decision ───────────────  clamp() guardrails ◀──────┘
@@ -30,6 +39,13 @@ decides that one event.
 | `item_choice` (ranked real candidates from the pool) | floor start, and again when you stand next to a treasure/shop/boss/devil/ultra secret/… room; chest and beggar pools when one shows up in your room | — | `MC_PRE_GET_COLLECTIBLE` (also catches D6 rerolls) |
 | `consumables` (next cards/runes, next trinkets, an effect per pill colour in play) | floor start | a pill colour the plan doesn't cover appears (held or on the floor), or the card/trinket queues run dry | `MC_GET_CARD`, `MC_GET_TRINKET`, `MC_GET_PILL_EFFECT` |
 | `floor_plan` (curses, treasure distance) | you enter the boss room | boss dies | `MC_POST_CURSE_EVAL` of the next floor |
+
+The planners start when the first request of a new run, or of a new floor (`stage` and
+`stage_type` from the snapshot), reaches the backend. They run in the background and
+**nothing waits for them**. Until the narrative (about 20–60s) or a floor's brief (about
+5–15s) lands, Haiku improvises. The old brief is dropped as soon as the floor changes. A
+floor brief waits up to 25s for the run narrative, then goes ahead without it. If a planner
+fails, it is logged and the DM carries on.
 
 Requests for the same key supersede each other: the backend cancels the stale Haiku call and
 the mod only replaces a result with one for a newer request. The p90 latency is measured live,
@@ -62,9 +78,13 @@ pip install -r requirements.txt
 export OPENROUTER_API_KEY=sk-or-...       # PowerShell: $env:OPENROUTER_API_KEY="sk-or-..."   cmd.exe: set OPENROUTER_API_KEY=sk-or-...
 python server.py --cruelty 6              # TCP on 127.0.0.1:7337, model anthropic/claude-haiku-5.5 via OpenRouter
 python server.py --mock                   # offline stand-in, no key needed
+python server.py --no-planners            # Haiku only: no Opus narrative / Sonnet floor briefs
+python server.py --narrative-model anthropic/claude-opus-5.5 --floor-model anthropic/claude-sonnet-5.5   # the defaults
 
 ```
-The console logs every decision with its latency, intent and taunt — fun on a second monitor.
+The console logs every decision with its latency, intent and taunt, and prints the run
+narrative and each floor brief in full. It's fun on a second monitor. The planners add roughly
+$0.05 per run (Opus) and $0.02–0.03 per floor (Sonnet).
 
 **2. Mod**
 - Copy `mod/llm_dungeon_master/` into `…/steamapps/common/The Binding of Isaac Rebirth/mods/`.
@@ -77,7 +97,8 @@ If LuaSocket won't load on your install, set `TRANSPORT = "file"` in `dm/config.
 `python server.py --bridge file --bridge-dir "<Isaac install>/llmdm_bridge"` (create that folder).
 
 **3. Check the DM's voice first (optional)**: `python tests/live_smoke.py --cruelty 8` makes one
-real call per decision kind and prints the results and latencies.
+real call per decision kind and prints the results and latencies. Add `--planners` to first
+write a real narrative and floor brief and hand them to the DM.
 
 ## Configuration
 
