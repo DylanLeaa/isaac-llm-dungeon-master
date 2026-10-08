@@ -9,8 +9,8 @@ local State  = include("dm.state")
 local Taunt  = include("dm.taunt")
 local Apply  = include("dm.apply")
 local Sched  = include("dm.scheduler")
+local Settings = include("dm.settings")
 local Cons   = include("dm.consumables")
-local json   = require("json")
 
 Taunt.enabled = cfg.SHOW_TAUNTS
 Apply.init(Taunt)
@@ -35,10 +35,14 @@ local function safe(name, fn)
   end
 end
 
+-- Saved DM Settings (cruelty) go out with the first hello.
+Settings.init(mod, cfg, Bridge)
+
 -- Connect as soon as the mod loads so the DM is warm by the time a run starts.
 Bridge.init(cfg, "menu")
 
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function(_, continued)
+  Settings.registerMenu()   -- in case Mod Config Menu loaded after this mod
   local seed = game:GetSeeds():GetStartSeedString()
   Bridge.init(cfg, seed)
   Bridge.setRun(seed, not continued)
@@ -48,11 +52,11 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function
   Cons.onLock = function(locked)
     local pills = {}                       -- string keys: colours are a sparse int table
     for c, e in pairs(locked) do pills[tostring(c)] = e end
-    mod:SaveData(json.encode({ seed = seed, pills = pills }))
+    Settings.save({ seed = seed, pills = pills })
   end
-  if continued and mod:HasData() then
-    local ok, saved = pcall(json.decode, mod:LoadData())
-    if ok and type(saved) == "table" and saved.seed == seed then Cons.restore(saved.pills) end
+  if continued then
+    local saved = Settings.load()
+    if saved.seed == seed then Cons.restore(saved.pills) end
   end
   -- POST_NEW_ROOM / POST_NEW_LEVEL already fired for the first room; replay them.
   Sched.onNewRoom()

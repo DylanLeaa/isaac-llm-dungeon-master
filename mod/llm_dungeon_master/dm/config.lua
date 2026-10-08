@@ -9,6 +9,7 @@ return {
   BRIDGE_DIR = "llmdm_bridge",
 
   -- nil = use the backend's --cruelty. 0 (generous) .. 10 (merciless).
+  -- Only the starting value: once changed in Mod Config Menu > DM Settings, the saved value wins.
   CRUELTY = nil,
 
   -- What the DM controls. Anything switched off stays vanilla.

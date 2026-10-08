@@ -20,6 +20,7 @@ local latencies = {}   -- ring buffer of recent round-trips (ms)
 local LAT_N = 24
 local lastHello = -1e9
 local onResult         -- optional callback(key, result)
+local cruelty          -- nil = backend's --cruelty; set from config / the DM Settings menu
 
 local function now() return Isaac.GetTime() end
 Bridge.now = now
@@ -214,6 +215,14 @@ function Bridge.request(kind, key, state, ctx, deadlineMs)
   return id
 end
 
+--- Change cruelty (0..10, nil = backend default). Sent now if connected, else with the next hello.
+function Bridge.setCruelty(v)
+  cruelty = v
+  if Bridge.ready() then send({ t = "settings", cruelty = v }) end
+end
+
+function Bridge.getCruelty() return cruelty end
+
 function Bridge.event(name, data)
   if Bridge.ready() then send({ t = "event", name = name, data = data or {} }) end
 end
@@ -270,7 +279,7 @@ function Bridge.update()
   transport:tick()
   if transport:ready() and not welcomed and now() - lastHello > 2000 then
     lastHello = now()
-    local h = { t = "hello", session = session, cruelty = cfg.CRUELTY }
+    local h = { t = "hello", session = session, cruelty = cruelty }
     if runIdForHello then h.run, h.new_run = runIdForHello.run, runIdForHello.new_run end
     send(h)
   end
