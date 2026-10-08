@@ -9,11 +9,13 @@ import json
 import logging
 import os
 import random
+import time
 from collections import Counter
 from typing import Callable
 
-from dm_agent import OPENROUTER_URL, _usage
+from dm_agent import OPENROUTER_URL, LLMCallError, call_record
 from prompts import floor_prompt, narrative_prompt
+from receipt import plan_excerpt
 
 log = logging.getLogger("llmdm")
 
@@ -62,6 +64,7 @@ class OpenRouterPlanner:
         self.max_tokens = max_tokens
 
     async def _complete(self, model: str, system: str, user: str) -> tuple[str, dict]:
+        """The plan text, and usage with the receipt's call record under "_call"."""
         resp = await self.client.post(OPENROUTER_URL, json={
             "model": model,
             "max_tokens": self.max_tokens,
@@ -70,15 +73,16 @@ class OpenRouterPlanner:
         })
         resp.raise_for_status()
         data = resp.json()
+        record = {**call_record(model, [system], data), "user": user}
         if "error" in data:
-            raise RuntimeError(f"openrouter: {data['error']}")
+            raise LLMCallError(f"openrouter: {data['error']}", record)
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
-            raise RuntimeError(f"hit max_tokens={self.max_tokens} before finishing the plan")
+            raise LLMCallError(f"hit max_tokens={self.max_tokens} before finishing the plan", record)
         text = (choice["message"].get("content") or "").strip()
         if not text:
-            raise RuntimeError(f"empty plan (finish_reason={choice.get('finish_reason')})")
-        return text, _usage(data)
+            raise LLMCallError(f"empty plan (finish_reason={choice.get('finish_reason')})", record)
+        return text, {**record["usage"], "_call": record}
 
     async def narrative(self, state: dict, cruelty: int) -> tuple[str, dict]:
         user = "Opening snapshot of the run:\n" + _compact_json(state)
@@ -107,21 +111,24 @@ class MockPlanner:
         await asyncio.sleep(self.rng.uniform(*self.latency))
         who = (state.get("player") or {}).get("character", "the player")
         return (f"TITLE: Mock Run\nPREMISE: Make {who} trust the pedestals, then betray them.\n"
-                "CHARACTER ANGLE: mock\nARC: Basement - generous; Caves - the turn\nRUNNING GAGS: pennies"), {}
+                "CHARACTER ANGLE: mock\nARC: Basement - generous; Caves - the turn\nRUNNING GAGS: pennies"), \
+            {"_call": {"model": "mock"}}
 
     async def floor_brief(self, state, narrative, digest, prev_brief, cruelty) -> tuple[str, dict]:
         await asyncio.sleep(self.rng.uniform(*self.latency))
         name = (state.get("level") or {}).get("name", "this floor")
         return (f"ARC BEAT: {name} lulls them.\nRESOURCES: starve keys\nROOMS: light\n"
                 "ITEMS & CONSUMABLES: one good item\nSET-PIECE: key drought, then key by a troll bomb\n"
-                "VOICE: smug"), {}
+                "VOICE: smug"), {"_call": {"model": "mock"}}
 
 
 class Campaign:
     """Starts the planners at the right moments and pushes their text to the DM."""
 
-    def __init__(self, planner, push: Callable[[str], None], stats: dict[str, Counter], usage: Counter) -> None:
+    def __init__(self, planner, push: Callable[[str], None], stats: dict[str, Counter], usage: Counter,
+                 record: Callable[..., None] = lambda what, status, **fields: None) -> None:
         self.planner, self.push, self.stats, self.usage = planner, push, stats, usage
+        self.record = record                          # receipt.add-like: (what, status, **fields)
         self.run_token = 0
         self.tasks: set[asyncio.Task] = set()
         self._clear()
@@ -170,18 +177,26 @@ class Campaign:
         if usage:
             self.usage.update({**usage, "calls": 1})
 
+    def _failed(self, kind: str, e: Exception, t0: float, **fields) -> None:
+        self.stats[kind]["error"] += 1
+        self.record(kind, "error", ms=_ms(t0), error=f"{type(e).__name__}: {e}",
+                    llm=getattr(e, "call", None), **fields)
+
     async def _write_narrative(self, state: dict, cruelty: int, token: int) -> None:
         self.stats["narrative"]["req"] += 1
+        t0 = time.perf_counter()
         try:
             text, usage = await self.planner.narrative(state, cruelty)
         except asyncio.CancelledError:
             raise
         except Exception as e:                        # noqa: BLE001 - a planner must never break the DM
-            self.stats["narrative"]["error"] += 1
+            self._failed("narrative", e, t0)
             log.warning("narrative   failed (%s: %s) -> the DM runs without one", type(e).__name__, e)
             return
         if token != self.run_token:
             return
+        call = usage.pop("_call", None)
+        self.record("narrative", "written", ms=_ms(t0), llm=call, result=plan_excerpt(text), text=text)
         self._account("narrative", usage)
         self.narrative = text
         log.info("narrative   [%s]\n%s", self.planner.narrative_model, _indent(text))
@@ -198,20 +213,32 @@ class Campaign:
             except asyncio.CancelledError:
                 if token != self.run_token:
                     raise
+        t0 = time.perf_counter()
+        floor = f"{self.floor_name} ({sig[0]}.{sig[1]})"
         try:
             text, usage = await self.planner.floor_brief(state, self.narrative, digest, prev, cruelty)
         except asyncio.CancelledError:
             raise
         except Exception as e:                        # noqa: BLE001
-            self.stats["floor_brief"]["error"] += 1
+            self._failed("floor_brief", e, t0, key=floor)
             log.warning("floor_brief failed (%s: %s) -> the DM improvises this floor", type(e).__name__, e)
             return
-        if token != self.run_token or sig != self.floor_sig:
-            return                                    # the run or the floor moved on meanwhile
+        if token != self.run_token:
+            return                                    # the run moved on meanwhile
+        call = usage.pop("_call", None)
+        if sig != self.floor_sig:                     # paid for, but the floor moved on meanwhile
+            self.record("floor_brief", "discarded", key=floor, ms=_ms(t0), llm=call, result=plan_excerpt(text),
+                        text=text)
+            return
+        self.record("floor_brief", "written", key=floor, ms=_ms(t0), llm=call, result=plan_excerpt(text), text=text)
         self._account("floor_brief", usage)
         self.brief = text
         log.info("floor_brief %s [%s]\n%s", self.floor_name, self.planner.floor_model, _indent(text))
         self._push()
+
+
+def _ms(t0: float) -> int:
+    return int((time.perf_counter() - t0) * 1000)
 
 
 def _indent(text: str) -> str:

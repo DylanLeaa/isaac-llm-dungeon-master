@@ -21,9 +21,11 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import epilogue
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from memory import RunMemory
 from planners import FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, Campaign, MockPlanner, OpenRouterPlanner
+from receipt import Receipt
 from schemas import KINDS, clamp
 
 log = logging.getLogger("llmdm")
@@ -31,23 +33,32 @@ Send = Callable[[dict], Awaitable[None]]
 
 MAX_DEADLINE_S = 12.0      # never let a single decision hang longer than this
 MIN_DEADLINE_S = 0.4
+EPITAPH_TIMEOUT_S = 20.0   # the stats screen shows without it; it only fills in the last line
 
 
 class Coordinator:
     """Routes requests to the DM, enforces latest-wins per key, applies guardrails."""
 
-    def __init__(self, dm, cruelty: int, planner=None, max_concurrency: int = 6) -> None:
+    def __init__(self, dm, cruelty: int, planner=None, max_concurrency: int = 6,
+                 receipt: Receipt | None = None, epitaph: bool = True) -> None:
         self.dm = dm
+        self.epitaph = epitaph and hasattr(dm, "epitaph")
         self.cruelty = self.default_cruelty = cruelty
         self.memory = RunMemory()
         self.session: str | None = None
+        self.send: Send | None = None             # the game's connection, for pushing receipt entries
+        # Everything the engine does this run, with the LLM calls behind it (in memory only if no dir).
+        self.receipt = receipt or Receipt()
+        self.receipt_seq: dict[str, int] = {}     # key -> receipt entry of the answer the game holds
+        self.bg: set[asyncio.Task] = set()
         self.inflight: dict[str, tuple[int, asyncio.Task]] = {}
         self.sem = asyncio.Semaphore(max_concurrency)
         # Per decision kind: req, ok, superseded, timeout, error, replaced, applied, fallback.
         self.stats: dict[str, Counter] = defaultdict(Counter)
         self.usage = Counter()                    # in / cached / out tokens, cost, calls
         # Opus narrative once per run + Sonnet brief once per floor, fed to the DM's system prompt.
-        self.campaign = Campaign(planner, getattr(dm, "set_campaign", lambda _text: None), self.stats, self.usage)
+        self.campaign = Campaign(planner, getattr(dm, "set_campaign", lambda _text: None), self.stats, self.usage,
+                                 self._record)
 
     def summary(self) -> None:
         """Log how many answers were requested, paid for, and actually used, per kind."""
@@ -66,13 +77,18 @@ class Coordinator:
         t = msg.get("t")
         if t == "hello":
             self.summary()
-            self.session = str(msg.get("session"))
+            self.session, self.send = str(msg.get("session")), send
             if msg.get("run") != self.memory.run_id or msg.get("new_run"):
                 self.memory.reset(msg.get("run"))
                 self.campaign.reset()
+                self.receipt.start_run(msg.get("run"), fresh=bool(msg.get("new_run")))
+                self.receipt_seq.clear()
+                if self.receipt.path:
+                    log.info("receipt -> %s", self.receipt.path)
             self._set_cruelty(msg.get("cruelty"))
             log.info("game connected  session=%s run=%s cruelty=%s", self.session, msg.get("run"), self.cruelty)
             await send({"t": "welcome", "session": self.session, "cruelty": self.cruelty})
+            await send({"t": "receipt_sync", "session": self.session, **self.receipt.snapshot()})
         elif t == "settings":
             # Changed from the in-game DM Settings menu; takes effect for the next decision.
             self._set_cruelty(msg.get("cruelty"))
@@ -84,12 +100,17 @@ class Coordinator:
             if entry:
                 self.stats[entry["kind"]]["applied"] += 1
             self.memory.on_applied(str(msg.get("key")))
+            self._push_receipt(self.receipt.update(self.receipt_seq.pop(str(msg.get("key")), None), "applied"))
         elif t == "event" and msg.get("name") == "fallback":
             # The game needed a decision and had none: vanilla RNG decided. Not news for the DM.
             data = msg.get("data") or {}
             self.stats[str(data.get("kind"))]["fallback"] += 1
-            log.info("%-11s %-14s no answer in time -> vanilla%s", data.get("kind"), data.get("key"),
-                     "" if data.get("asked") else " (never asked: prefetch fired too late)")
+            why = "no answer in time" if data.get("asked") else "never asked: prefetch fired too late"
+            log.info("%-11s %-14s %s -> vanilla", data.get("kind"), data.get("key"), why)
+            self._record(str(data.get("kind")), "fallback", key=data.get("key"), result=f"vanilla RNG ({why})")
+        elif t == "event" and msg.get("name") in ("death", "victory"):
+            self.memory.on_game_event(str(msg.get("name")), msg.get("data") or {})
+            await self._run_over(str(msg["name"]), msg.get("data") or {}, send)
         elif t == "event":
             self.memory.on_game_event(str(msg.get("name")), msg.get("data") or {})
         elif t == "ping":
@@ -104,8 +125,72 @@ class Coordinator:
             return
         if cruelty != self.cruelty:
             log.info("cruelty %d -> %d", self.cruelty, cruelty)
+            self._record("cruelty", "set", result=f"{self.cruelty} -> {cruelty}")
             self.cruelty = cruelty
             self.dm.set_cruelty(cruelty)
+
+    # ------------------------------------------------------------------ receipt
+    def _record(self, what: str, status: str, **fields) -> int:
+        """Add an entry to the receipt and show it in the game's menu. Returns its seq."""
+        entry = self.receipt.add(what, status, session=self.session, **fields)
+        self._push_receipt(entry)
+        return entry["seq"]
+
+    def _push_receipt(self, entry: dict | None) -> None:
+        if entry is None or self.send is None:
+            return
+        # A copy: the receipt updates its entries in place (applied / replaced) before this is sent.
+        msg = {"t": "receipt", "session": self.session, "entry": dict(entry), "totals": self.receipt.totals()}
+        task = asyncio.create_task(self._send_quietly(self.send, msg))
+        self.bg.add(task)
+        task.add_done_callback(self.bg.discard)
+
+    @staticmethod
+    async def _send_quietly(send: Send, msg: dict) -> None:
+        try:
+            await send(msg)
+        except Exception:                         # noqa: BLE001 - game gone; the file still has it
+            pass
+
+    # ---------------------------------------------------------- after-death screen
+    async def _run_over(self, outcome: str, data: dict, send: Send) -> None:
+        """Answer the game's death / victory with the DM's side of the stats, then its epitaph."""
+        summary = epilogue.build(outcome, data, self.receipt, self.memory.run_id, self.campaign.narrative)
+        summary["epitaph_pending"] = self.epitaph
+        self._record("run_summary", outcome, result=epilogue.one_line(summary), summary=summary)
+        log.info("run over\n%s", "\n".join("    " + line for line in epilogue.as_text(summary).splitlines()))
+        session = self.session                    # the epitaph may land after the next run said hello
+        await send(_summary_msg(session, summary))
+        if self.epitaph:
+            task = asyncio.create_task(self._write_epitaph(summary, session, send))
+            self.bg.add(task)
+            task.add_done_callback(self.bg.discard)
+
+    async def _write_epitaph(self, summary: dict, session: str | None, send: Send) -> None:
+        self.stats["epitaph"]["req"] += 1
+        t0 = time.perf_counter()
+        call = None
+        try:
+            async with self.sem:
+                text, call = await asyncio.wait_for(self.dm.epitaph(epilogue.epitaph_prompt(summary)),
+                                                    EPITAPH_TIMEOUT_S)
+            summary["epitaph"] = epilogue.clean_epitaph(text)
+            if not summary["epitaph"]:
+                raise ValueError("epitaph was empty after cleaning")
+        except Exception as e:                    # noqa: BLE001 - the screen just goes without
+            self.stats["epitaph"]["error"] += 1
+            log.warning("epitaph     failed (%s: %s)", type(e).__name__, e)
+            self._record("epitaph", "error", ms=_ms(t0), error=f"{type(e).__name__}: {e}",
+                         llm=getattr(e, "call", None) or call)
+            summary["epitaph"] = None
+        else:
+            self.stats["epitaph"]["ok"] += 1
+            if (call or {}).get("usage"):
+                self.usage.update({**call["usage"], "calls": 1})
+            self._record("epitaph", "written", ms=_ms(t0), llm=call, result=summary["epitaph"])
+            log.info('epitaph     %5dms  "%s"', _ms(t0), summary["epitaph"])
+        summary["epitaph_pending"] = False
+        await self._send_quietly(send, _summary_msg(session, summary))
 
     # ----------------------------------------------------------------- requests
     def _start(self, msg: dict, send: Send) -> None:
@@ -136,31 +221,44 @@ class Coordinator:
         if prev:                                  # a re-ask replaces this answer; show it so the model restates it
             ctx = {**ctx, "your_previous_answer": _compact(prev)}
         deadline = max(MIN_DEADLINE_S, min(MAX_DEADLINE_S, float(msg.get("deadline_ms", 4000)) / 1000))
+        digest = self.memory.digest()
+        # What the receipt keeps of the request: the user message is exactly these, as JSON.
+        rec = {"key": key, "req_id": rid, "deadline_ms": int(deadline * 1000),
+               "request": {"state": state, "ctx": ctx, "memory": digest}}
         t0 = time.perf_counter()
         base = {"t": "res", "session": self.session, "id": rid, "key": key, "kind": kind}
+        raw: dict = {}
+        call = None
         try:
             async with self.sem:
-                raw = await asyncio.wait_for(
-                    self.dm.decide(kind, state, ctx, self.memory.digest()), timeout=deadline)
+                raw = await asyncio.wait_for(self.dm.decide(kind, state, ctx, digest), timeout=deadline)
             usage = raw.pop("_usage", None)
+            call = raw.pop("_call", None)
             decision = clamp(kind, raw, state, ctx, self.cruelty, self.memory.counters)
         except asyncio.CancelledError:
-            return                                # superseded; the newer request will answer
+            # Superseded; the newer request will answer. A call already in flight may still be billed.
+            self._record(kind, "superseded", ms=_ms(t0), **rec)
+            return
         except asyncio.TimeoutError:
             self.stats[kind]["timeout"] += 1
-            log.warning("%-11s %-14s TIMEOUT after %.0fms -> game falls back to vanilla",
-                        kind, key, (time.perf_counter() - t0) * 1000)
+            log.warning("%-11s %-14s TIMEOUT after %.0fms -> game falls back to vanilla", kind, key, _ms(t0))
+            self._record(kind, "timeout", ms=_ms(t0), **rec)
             await send({**base, "ok": False, "reason": "timeout"})
             return
         except Exception as e:                    # noqa: BLE001 - never crash the bridge
             self.stats[kind]["error"] += 1
             log.exception("%s %s failed: %s", kind, key, e)
+            self._record(kind, "error", ms=_ms(t0), error=f"{type(e).__name__}: {e}",
+                         llm=getattr(e, "call", None) or call, raw=raw or None, **rec)
             await send({**base, "ok": False, "reason": type(e).__name__})
             return
-        ms = int((time.perf_counter() - t0) * 1000)
+        ms = _ms(t0)
         self.stats[kind]["ok"] += 1
+        old_seq = self.receipt_seq.get(key)
         if self.memory.note_issued(key, kind, decision):
             self.stats[kind]["replaced"] += 1    # paid for an answer the game never used
+            self._push_receipt(self.receipt.update(old_seq, "replaced"))
+        self.receipt_seq[key] = self._record(kind, "ok", ms=ms, llm=call, raw=raw, decision=decision, **rec)
         tok = ""
         if usage:
             self.usage.update({**usage, "calls": 1})
@@ -172,6 +270,15 @@ class Coordinator:
         if decision.get("guardrails"):
             log.info("%28s guardrails: %s", "", "; ".join(decision["guardrails"]))
         await send({**base, "ok": True, "ms": ms, "decision": decision})
+
+
+def _ms(t0: float) -> int:
+    return int((time.perf_counter() - t0) * 1000)
+
+
+def _summary_msg(session: str | None, summary: dict) -> dict:
+    """The stats screen for the game; empty fields left out (the mod's json has no null)."""
+    return {"t": "run_summary", "session": session, **{k: v for k, v in summary.items() if v is not None}}
 
 
 def _compact(decision: dict) -> dict:
@@ -274,6 +381,10 @@ def main() -> None:
     ap.add_argument("--mock", action="store_true", help="use the offline rule-based DM")
     ap.add_argument("--mock-latency", type=float, nargs=2, default=(0.25, 1.2), metavar=("MIN", "MAX"),
                     help="fake response time range for --mock, seconds")
+    ap.add_argument("--receipts", type=Path, default=Path(__file__).resolve().parent / "receipts",
+                    help="folder for the per-run receipt (every decision and LLM call, as JSON lines)")
+    ap.add_argument("--no-receipts", action="store_true", help="keep the receipt in memory only (still shown in game)")
+    ap.add_argument("--no-epitaph", action="store_true", help="no DM-written epitaph on the after-death stats screen")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -293,7 +404,8 @@ def main() -> None:
     if planner:
         log.info("Planners: narrative=%s  floor brief=%s", planner.narrative_model, planner.floor_model)
 
-    coord = Coordinator(dm, args.cruelty, planner)
+    coord = Coordinator(dm, args.cruelty, planner, receipt=Receipt(None if args.no_receipts else args.receipts),
+                        epitaph=not args.no_epitaph)
 
     async def run() -> None:
         if args.bridge == "tcp":

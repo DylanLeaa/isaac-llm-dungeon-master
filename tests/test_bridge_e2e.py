@@ -24,7 +24,7 @@ STATE = {"player": {"hp": {"red": 6, "soul": 2}, "resources": {"keys": 0, "bombs
 
 
 def start_server(*args):
-    p = subprocess.Popen([sys.executable, "server.py", "--mock", *args], cwd=BACKEND,
+    p = subprocess.Popen([sys.executable, "server.py", "--mock", "--no-receipts", *args], cwd=BACKEND,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     time.sleep(1.0)
     assert p.poll() is None, p.stdout.read()
@@ -133,14 +133,20 @@ def test_tcp_server():
             f.write(json.dumps(o) + "\n")
             f.flush()
 
+        def read():                                  # receipt entries are pushed in between
+            while True:
+                msg = json.loads(f.readline())
+                if not msg["t"].startswith("receipt"):
+                    return msg
+
         send({"t": "hello", "session": "S", "run": "R", "new_run": True, "cruelty": 9})
-        assert json.loads(f.readline())["cruelty"] == 9
+        assert read()["cruelty"] == 9
         send({"t": "settings", "cruelty": 3})
-        assert json.loads(f.readline()) == {"t": "settings_ok", "session": "S", "cruelty": 3}
+        assert read() == {"t": "settings_ok", "session": "S", "cruelty": 3}
         send({"t": "req", "id": 1, "key": "k", "kind": "room_layout", "deadline_ms": 5000, "state": STATE, "ctx": {}})
         send({"t": "req", "id": 2, "key": "k", "kind": "room_layout", "deadline_ms": 5000, "state": STATE, "ctx": {}})
         send({"t": "req", "id": 3, "key": "t", "kind": "room_clear", "deadline_ms": 10, "state": STATE, "ctx": {}})
-        got = [json.loads(f.readline()) for _ in range(2)]
+        got = [read() for _ in range(2)]
         by_key = {g["key"]: g for g in got}
         assert by_key["k"]["id"] == 2 and by_key["k"]["ok"]           # id 1 was cancelled
         assert by_key["t"]["ok"] is False and by_key["t"]["reason"] == "timeout"   # 400ms floor < 600ms mock
