@@ -1,0 +1,41 @@
+-- LLM Dungeon Master - settings. Edit and restart the run (or `luamod llm_dungeon_master`).
+return {
+  -- "tcp"  : LuaSocket to the backend (fastest).  "file" : two .jsonl files in BRIDGE_DIR.
+  -- "auto" : try tcp, fall back to file if the socket library can't be loaded.
+  TRANSPORT = "auto",
+  HOST = "127.0.0.1",
+  PORT = 7337,
+  -- Relative to the game's working directory (the install folder), or absolute.
+  BRIDGE_DIR = "llmdm_bridge",
+
+  -- nil = use the backend's --cruelty. 0 (generous) .. 10 (merciless).
+  CRUELTY = nil,
+
+  -- What the DM controls. Anything switched off stays vanilla.
+  CONTROL_ROOM_LAYOUT = true,
+  CONTROL_ROOM_CLEAR  = true,
+  CONTROL_ITEMS       = true,
+  CONTROL_FLOOR       = true,
+
+  -- Re-roll the floor (console `reseed`) until the treasure room distance matches the
+  -- DM's preference. Uses a console command, which disables achievements for the run.
+  ALLOW_LAYOUT_RESEED = false,
+  MAX_RESEEDS = 4,
+
+  -- Prefetch timing ---------------------------------------------------------
+  -- Room-clear rewards are requested when the estimated time-to-clear drops below
+  --   LEAD_FACTOR * p90 backend latency + LEAD_PAD_MS
+  -- i.e. as late as possible while still landing before the last enemy dies.
+  LEAD_FACTOR = 1.4,
+  LEAD_PAD_MS = 400,
+  -- A pending prefetch is re-sent with a fresh snapshot when the game state changes
+  -- materially (damage taken, resources changed) and at least this long has passed.
+  REFRESH_MIN_MS = 1500,
+  MAX_REFRESHES = 2,
+  -- How long after entering a room a late room_layout decision may still be applied.
+  LATE_LAYOUT_GRACE_FRAMES = 20,
+  ITEM_CANDIDATES = 6,
+
+  SHOW_TAUNTS = true,
+  SHOW_DEBUG_HUD = true,   -- small latency / connection readout in the corner
+}
