@@ -42,6 +42,12 @@ function State.itemInfo(id)
            active = c.Type == ItemType.ITEM_ACTIVE }
 end
 
+function State.trinketInfo(id)
+  local c = itemConfig:GetTrinket(id)
+  if not c then return nil end
+  return { id = id, name = prettyItemName(c.Name) }
+end
+
 local function gridXY(idx) return idx % 13, math.floor(idx / 13) end
 function State.gridDistance(a, b)
   local ax, ay = gridXY(a)

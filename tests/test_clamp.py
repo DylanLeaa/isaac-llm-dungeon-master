@@ -63,6 +63,40 @@ def test_floor_plan_curse_limits():
     assert "unknown" not in clamp("floor_plan", raw, st(hp_red=1), {}, cruelty=9, counters={})["add_curses"]
 
 
+
+def test_champion_color_and_boss_bonus_cap():
+    out = clamp("room_layout", {"champion_color": "tiny", "taunt": ""}, st(), {}, cruelty=6, counters={})
+    assert out["champion_color"] == "tiny" and out["champion_enum"] == "CHAMPION_TINY"
+    out = clamp("room_layout", {"champion_color": "rainbow", "taunt": ""}, st(), {}, cruelty=6, counters={})
+    assert out["champion_color"] == "random" and "champion_enum" not in out
+    raw = {"rewards": [{"reward": "dime", "count": 3}, {"reward": "soul_heart", "count": 3}], "taunt": ""}
+    bonus = clamp("room_clear", raw, st(), {"mode": "bonus"}, cruelty=6, counters={})
+    assert sum(r["count"] for r in bonus["rewards"]) == 2      # the boss room keeps its own award too
+
+
+def test_consumables_filter_and_bad_pill_cap():
+    ctx = {"trinket_candidates": [{"id": 4}, {"id": 9}],
+           "pill_colors_to_assign": [{"color": 1}, {"color": 2}, {"color": 3}],
+           "pills_locked": [{"color": 7, "effect": "bad_trip"}]}
+    raw = {"cards": ["tower", "suicide_king", "rune_jera"], "trinkets": [9, 99, 9, "x", 4],
+           "pills": [{"color": 1, "effect": "health_down"}, {"color": 2, "effect": "amnesia"},
+                     {"color": 3, "effect": "health_up"}, {"color": 8, "effect": "full_health"},
+                     {"color": 1, "effect": "luck_up"}], "taunt": ""}
+    out = clamp("consumables", raw, st(), ctx, cruelty=0, counters={})
+    assert [c["key"] for c in out["cards"]] == ["tower", "rune_jera"]
+    assert out["cards"][1] == {"key": "rune_jera", "enum": "RUNE_JERA", "cat": "rune"}
+    assert out["trinkets"] == [9, 4]
+    pills = {p["color"]: p for p in out["pills"]}
+    assert set(pills) == {1, 2, 3}                              # colour 8 isn't open, colour 1 only once
+    # cruelty 0: round(4 colours * 0.4) = 2 bad in the run; the locked Bad Trip uses one
+    assert pills[1]["effect"] == "health_down" and pills[1]["phd"] == "PILLEFFECT_HEALTH_UP"
+    assert pills[2]["effect"] == "see_forever"                  # over the cap -> its good counterpart
+    assert pills[3] == {"color": 3, "effect": "health_up", "enum": "PILLEFFECT_HEALTH_UP",
+                        "false_phd": "PILLEFFECT_HEALTH_DOWN"}
+    cruel = clamp("consumables", raw, st(), ctx, cruelty=10, counters={})
+    assert {p["color"]: p["effect"] for p in cruel["pills"]}[2] == "amnesia"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

@@ -1,8 +1,8 @@
 """Headless run of the whole mod (main.lua + dm/*) on a fake Isaac API, against server.py --mock.
 
-Walks a tiny floor: start room -> fight in a normal room -> treasure item -> boss room,
-and checks the prefetch timing: the room-clear decision must be requested *during* the
-fight (not at the end) and be ready when the last enemy dies.
+Walks a tiny floor: start room -> fight in a normal room -> treasure item -> consumables ->
+a golden chest -> boss room, and checks the prefetch timing: the room-clear decision must be
+requested *during* the fight (not at the end) and be ready when the last enemy dies.
 """
 import json
 import subprocess
@@ -113,27 +113,29 @@ def run(bridge_dir):
     champs = sum(1 for i in range(1, 4) if enemies[i].champion)
     print(f"3. room 85 dressed on entry: {changes} spawns/grid edits, {champs} champions")
 
+    def fight(enemies, n, key, dps):
+        """Burn enemy HP at `dps`; return the HP left when the clear decision was requested."""
+        requested_at_hp = None
+        while True:
+            for i in range(1, n + 1):
+                e = enemies[i]
+                if e.HitPoints > 0:
+                    e.HitPoints = max(0, e.HitPoints - dps / 30)
+                    break
+            tick()
+            hp = sum(enemies[i].HitPoints for i in range(1, n + 1))
+            if requested_at_hp is None and Bridge.pendingInfo(key):
+                requested_at_hp = hp
+            if hp <= 0:
+                return requested_at_hp
+
     # --- fight: burn 6 hp/s, watch when the clear decision gets requested -------
-    requested_at_hp = None
     fight_start = time.monotonic()
-    while True:
-        dt = 1 / 30
-        dmg = 6 * dt
-        for i in range(1, 4):
-            e = enemies[i]
-            if e.HitPoints > 0:
-                e.HitPoints = max(0, e.HitPoints - dmg)
-                break
-        tick()
-        hp = sum(enemies[i].HitPoints for i in range(1, 4))
-        if requested_at_hp is None and Bridge.pendingInfo("clear:1:85"):
-            requested_at_hp = hp
-            p90 = Bridge.latencyP90()
-            print(f"4. clear decision requested with {hp:.1f}hp left (~{hp / 6:.1f}s to go);"
-                  f" p90 latency {p90:.0f}ms -> lead {1.4 * p90 + 400:.0f}ms")
-        if hp <= 0:
-            break
+    requested_at_hp = fight(enemies, 3, "clear:1:85", 6)
     assert requested_at_hp is not None and requested_at_hp > 0, "clear was never prefetched"
+    p90 = Bridge.latencyP90()
+    print(f"4. clear decision requested with {requested_at_hp:.1f}hp left (~{requested_at_hp / 6:.1f}s to go);"
+          f" p90 latency {p90:.0f}ms -> lead {1.4 * p90 + 400:.0f}ms")
     assert requested_at_hp < 30, "requested too early (should wait for the ETA window)"
     ready = Bridge.peek("clear:1:85") is not None
     ret = W.fire(MC.MC_PRE_SPAWN_CLEAN_AWARD, g.RNG(), g.Vector(320, 280))
@@ -149,12 +151,57 @@ def run(bridge_dir):
     print(f"6. treasure pedestal -> item {got} (quality {q.get(got)}); removed from pool: {W.removedItem}")
     assert got is not None and W.removedItem == got
 
-    # --- boss room -> plan next floor -> curse eval ------------------------------
-    W.enemies = lua.table_from([W.makeEnemy(100)])
+    # --- consumables: floor plan, then a pill colour the plan doesn't cover ------
+    def plan():
+        res = Bridge.peek("cons:1")
+        return to_py(res.decision) if res else None
+
+    wait(plan, 6, "consumables plan")
+    W.heldPill = 5
+    wait(lambda: any(int(p["color"]) == 5 for p in (plan() or {}).get("pills") or []), 8,
+         "a re-asked plan covering the held pill colour")
+    pill5 = next(p for p in plan()["pills"] if int(p["color"]) == 5)
+    rng = g.RNG()
+    card = W.fire(MC.MC_GET_CARD, rng, 0, True, True, False)
+    rune = W.fire(MC.MC_GET_CARD, rng, 0, True, True, True)
+    print(f"7. consumables plan: card draw -> {card}, rune-only draw -> {rune}")
+    assert card == g.Card.CARD_TOWER and rune == g.Card.RUNE_HAGALAZ
+    trinket = W.fire(MC.MC_GET_TRINKET, 0, rng)
+    golden = W.fire(MC.MC_GET_TRINKET, 32768, rng)
+    print(f"   trinket draws -> {trinket}, golden {golden}; removed from pool: {W.removedTrinket}")
+    assert trinket == plan()["trinkets"][0] and W.removedTrinket == golden - 32768
+    assert golden == plan()["trinkets"][1] | 32768
+
+    effect = W.fire(MC.MC_GET_PILL_EFFECT, 0, 5)
+    W.fire(MC.MC_USE_PILL, effect)
+    horse = W.fire(MC.MC_GET_PILL_EFFECT, 0, 5 | 2048)
+    print(f"8. pill colour 5 -> {pill5['effect']} (effect {effect}), horse pill -> {horse}; saved: {W.saved}")
+    assert effect == g.PillEffect[pill5["enum"]] and horse == effect
+    assert '"5"' in W.saved
+    assert W.fire(MC.MC_GET_PILL_EFFECT, 3, 9) is None             # no plan for colour 9: vanilla
+    W.fire(MC.MC_USE_PILL, 3)
+    assert W.fire(MC.MC_GET_PILL_EFFECT, 3, 9) is None             # ...and it stays vanilla's
+
+    # --- a golden chest shows up: its item pool gets ranked ---------------------
+    golden_pool = g.ItemPoolType.POOL_GOLDEN_CHEST
+    W.pickups = lua.table_from([W.makePickup(g.EntityType.ENTITY_PICKUP, g.PickupVariant.PICKUP_LOCKEDCHEST, 1)])
+    wait(lambda: Bridge.peek(f"items:1:{golden_pool}"), 6, "golden chest pool ranking")
+    W.pickups = lua.table_from([])
+    print("9. golden chest in the room -> its pool was ranked before it was opened")
+
+    # --- boss room -> plan next floor; the boss clear is a bonus on top ---------
+    boss = lua.table_from([W.makeEnemy(100)])
+    W.enemies = boss
     W.enter(86)
     wait(lambda: Bridge.peek("floor:1:next"), 6, "floor plan")
+    fight(boss, 1, "clear:1:86", 30)
+    ready = Bridge.peek("clear:1:86") is not None
+    ret = W.fire(MC.MC_PRE_SPAWN_CLEAN_AWARD, g.RNG(), g.Vector(320, 280))
+    print(f"10. boss dead; bonus decision ready={ready}; PRE_SPAWN_CLEAN_AWARD returned {ret}"
+          " (the game keeps its own boss award)")
+    assert ready and ret is None and Bridge.peek("clear:1:86") is None
     mask = W.fire(MC.MC_POST_CURSE_EVAL, 0)
-    print(f"7. boss room prefetched the next floor; curse mask for floor 2 = {mask}")
+    print(f"11. curse mask for floor 2 = {mask}")
     assert mask == 1
 
     errors = [p for p in printed if "error" in p.lower()]

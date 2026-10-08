@@ -7,7 +7,7 @@ import os
 import random
 from typing import Any
 
-from catalog import ENEMIES, LAYOUT_PICKUP_MODES, REWARDS, TREASURE_DISTANCE
+from catalog import CARDS, ENEMIES, LAYOUT_PICKUP_MODES, PILLS, REWARDS, TREASURE_DISTANCE
 from prompts import system_prompt
 from schemas import TOOLS
 
@@ -103,6 +103,7 @@ class MockDM:
         if kind == "room_layout":
             return {"intent": "mock: sprinkle chaos",
                     "champion_chance": r.uniform(0, 0.4),
+                    "champion_color": r.choice(["random", "red", "dark_red", "tiny"]),
                     "extra_enemies": [{"enemy": r.choice(list(ENEMIES)), "count": r.randint(1, 2)}],
                     "tinted_rocks": r.randint(0, 1) if res.get("bombs", 0) == 0 else 0,
                     "hide_tinted_rocks": res.get("bombs", 0) > 3,
@@ -124,4 +125,11 @@ class MockDM:
             return {"intent": "mock: dim the lights", "add_curses": ["darkness"],
                     "strip_vanilla_curses": False, "treasure_distance": r.choice(TREASURE_DISTANCE),
                     "taunt": "Watch your step."}
+        if kind == "consumables":
+            return {"intent": "mock: tower first, then whatever",
+                    "cards": ["tower", "rune_hagalaz", *r.sample(list(CARDS), 2)],
+                    "trinkets": [c["id"] for c in ctx.get("trinket_candidates", [])][:2],
+                    "pills": [{"color": c["color"], "effect": r.choice(list(PILLS))}
+                              for c in ctx.get("pill_colors_to_assign", [])],
+                    "taunt": "Pick a card. Any card."}
         raise ValueError(kind)

@@ -156,9 +156,13 @@ class Coordinator:
 
 def _compact(decision: dict) -> dict:
     """An issued decision as the model should see it again: its own fields, no engine detail."""
-    out = {k: v for k, v in decision.items() if k != "guardrails"}
+    out = {k: v for k, v in decision.items() if k not in ("guardrails", "champion_enum")}
     if out.get("extra_enemies"):
         out["extra_enemies"] = [{"enemy": e["key"], "count": e["count"]} for e in out["extra_enemies"]]
+    if "cards" in out:
+        out["cards"] = [c["key"] for c in out["cards"]]
+    if "pills" in out:
+        out["pills"] = [{"color": p["color"], "effect": p["effect"]} for p in out["pills"]]
     return out
 
 

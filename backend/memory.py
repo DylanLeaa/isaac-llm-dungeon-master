@@ -83,6 +83,9 @@ class RunMemory:
             self.events.append(f'item handed out from ranked list (top={d.get("order", ["?"])[0]})')
         elif kind == "floor_plan":
             self.events.append(f'floor plan: curses={d.get("add_curses")} treasure={d.get("treasure_distance")}')
+        elif kind == "consumables":
+            self.events.append("consumables plan in play: cards=" + ",".join(c["key"] for c in d.get("cards", []))
+                               + " pills=" + ",".join(f'{p["color"]}:{p["effect"]}' for p in d.get("pills", [])))
 
     def on_game_event(self, name: str, data: dict) -> None:
         if name == "new_level":
@@ -97,6 +100,11 @@ class RunMemory:
         elif name == "room_cleared":
             self.events.append(f'cleared room {data.get("room")} in {data.get("seconds")}s,'
                                f' took {data.get("hits", 0)} hits')
+        elif name == "pill_locked":
+            who = "your pick" if data.get("by") == "dm" else "vanilla's pick"
+            self.events.append(f'{data.get("look")} pills are now {data.get("effect")} for the run ({who})')
+        elif name in ("card_drawn", "trinket_drawn"):
+            self.events.append(f'{name.split("_")[0]} handed out: {data.get("name")}')
         elif name == "death":
             self.events.append("PLAYER DIED")
         else:
