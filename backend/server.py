@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -40,11 +41,27 @@ class Coordinator:
         self.session: str | None = None
         self.inflight: dict[str, tuple[int, asyncio.Task]] = {}
         self.sem = asyncio.Semaphore(max_concurrency)
-        self.stats = {"ok": 0, "timeout": 0, "error": 0, "superseded": 0}
+        # Per decision kind: req, ok, superseded, timeout, error, replaced, applied, fallback.
+        self.stats: dict[str, Counter] = defaultdict(Counter)
+        self.usage = Counter()                    # in / cached / out tokens, cost, calls
+
+    def summary(self) -> None:
+        """Log how many answers were requested, paid for, and actually used, per kind."""
+        if not self.stats:
+            return
+        cols = ("req", "ok", "applied", "replaced", "superseded", "timeout", "error", "fallback")
+        log.info("summary %-11s %s", "kind", " ".join(f"{c:>10}" for c in cols))
+        for kind in sorted(self.stats):
+            log.info("        %-11s %s", kind, " ".join(f"{self.stats[kind][c]:>10}" for c in cols))
+        u = self.usage
+        if u["calls"]:
+            log.info("        tokens in=%d (cached %d, %.0f%%) out=%d  cost=$%.4f over %d calls",
+                     u["in"], u["cached"], 100 * u["cached"] / max(1, u["in"]), u["out"], u["cost"], u["calls"])
 
     async def handle(self, msg: dict, send: Send) -> None:
         t = msg.get("t")
         if t == "hello":
+            self.summary()
             self.session = str(msg.get("session"))
             if msg.get("run") != self.memory.run_id or msg.get("new_run"):
                 self.memory.reset(msg.get("run"))
@@ -56,7 +73,16 @@ class Coordinator:
         elif t == "req":
             self._start(msg, send)
         elif t == "applied":
+            entry = self.memory.issued.get(str(msg.get("key")))
+            if entry:
+                self.stats[entry["kind"]]["applied"] += 1
             self.memory.on_applied(str(msg.get("key")))
+        elif t == "event" and msg.get("name") == "fallback":
+            # The game needed a decision and had none: vanilla RNG decided. Not news for the DM.
+            data = msg.get("data") or {}
+            self.stats[str(data.get("kind"))]["fallback"] += 1
+            log.info("%-11s %-14s no answer in time -> vanilla%s", data.get("kind"), data.get("key"),
+                     "" if data.get("asked") else " (never asked: prefetch fired too late)")
         elif t == "event":
             self.memory.on_game_event(str(msg.get("name")), msg.get("data") or {})
         elif t == "ping":
@@ -68,10 +94,12 @@ class Coordinator:
         if kind not in KINDS:
             log.warning("unknown kind %r", kind)
             return
+        self.stats[kind]["req"] += 1
         old = self.inflight.get(key)
         if old and old[0] < rid and not old[1].done():
             old[1].cancel()                      # latest-wins: newer context supersedes
-            self.stats["superseded"] += 1
+            self.stats[kind]["superseded"] += 1
+            log.debug("%-11s %-14s superseded by a fresher request", kind, key)
         task = asyncio.create_task(self._run(msg, send))
         self.inflight[key] = (rid, task)
         task.add_done_callback(lambda _t, k=key, r=rid: self._cleanup(k, r))
@@ -84,6 +112,9 @@ class Coordinator:
     async def _run(self, msg: dict, send: Send) -> None:
         key, rid, kind = str(msg["key"]), int(msg["id"]), msg["kind"]
         state, ctx = msg.get("state") or {}, msg.get("ctx") or {}
+        prev = self.memory.previous(key)
+        if prev:                                  # a re-ask replaces this answer; show it so the model restates it
+            ctx = {**ctx, "your_previous_answer": _compact(prev)}
         deadline = max(MIN_DEADLINE_S, min(MAX_DEADLINE_S, float(msg.get("deadline_ms", 4000)) / 1000))
         t0 = time.perf_counter()
         base = {"t": "res", "session": self.session, "id": rid, "key": key, "kind": kind}
@@ -91,28 +122,44 @@ class Coordinator:
             async with self.sem:
                 raw = await asyncio.wait_for(
                     self.dm.decide(kind, state, ctx, self.memory.digest()), timeout=deadline)
+            usage = raw.pop("_usage", None)
             decision = clamp(kind, raw, state, ctx, self.cruelty, self.memory.counters)
         except asyncio.CancelledError:
             return                                # superseded; the newer request will answer
         except asyncio.TimeoutError:
-            self.stats["timeout"] += 1
+            self.stats[kind]["timeout"] += 1
             log.warning("%-11s %-14s TIMEOUT after %.0fms -> game falls back to vanilla",
                         kind, key, (time.perf_counter() - t0) * 1000)
             await send({**base, "ok": False, "reason": "timeout"})
             return
         except Exception as e:                    # noqa: BLE001 - never crash the bridge
-            self.stats["error"] += 1
+            self.stats[kind]["error"] += 1
             log.exception("%s %s failed: %s", kind, key, e)
             await send({**base, "ok": False, "reason": type(e).__name__})
             return
         ms = int((time.perf_counter() - t0) * 1000)
-        self.stats["ok"] += 1
-        self.memory.note_issued(key, kind, decision)
-        log.info("%-11s %-14s %5dms  %s%s", kind, key, ms, decision.get("intent", ""),
+        self.stats[kind]["ok"] += 1
+        if self.memory.note_issued(key, kind, decision):
+            self.stats[kind]["replaced"] += 1    # paid for an answer the game never used
+        tok = ""
+        if usage:
+            self.usage.update({**usage, "calls": 1})
+            tok = f'  [{usage["in"]}/{usage["cached"]}c/{usage["out"]} tok]'
+        log.info("%-11s %-14s %5dms%s  %s%s", kind, key, ms, tok, decision.get("intent", ""),
                  f'  "{decision["taunt"]}"' if decision.get("taunt") else "")
+        if sum(c["ok"] for c in self.stats.values()) % 25 == 0:
+            self.summary()
         if decision.get("guardrails"):
             log.info("%28s guardrails: %s", "", "; ".join(decision["guardrails"]))
         await send({**base, "ok": True, "ms": ms, "decision": decision})
+
+
+def _compact(decision: dict) -> dict:
+    """An issued decision as the model should see it again: its own fields, no engine detail."""
+    out = {k: v for k, v in decision.items() if k != "guardrails"}
+    if out.get("extra_enemies"):
+        out["extra_enemies"] = [{"enemy": e["key"], "count": e["count"]} for e in out["extra_enemies"]]
+    return out
 
 
 # ---------------------------------------------------------------- transports
@@ -140,6 +187,7 @@ async def serve_tcp(coord: Coordinator, host: str, port: int) -> None:
             pass
         finally:
             log.info("tcp client %s disconnected", peer)
+            coord.summary()
             writer.close()
 
     server = await asyncio.start_server(on_client, host, port, limit=2**22)
@@ -212,8 +260,9 @@ def main() -> None:
         dm = OpenRouterDM(args.cruelty, model=args.model)
         log.info("Dungeon Master: %s via OpenRouter  cruelty=%d", args.model, args.cruelty)
 
+    coord = Coordinator(dm, args.cruelty)
+
     async def run() -> None:
-        coord = Coordinator(dm, args.cruelty)
         if args.bridge == "tcp":
             await serve_tcp(coord, args.host, args.port)
         else:
@@ -222,7 +271,7 @@ def main() -> None:
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
-        pass
+        coord.summary()
 
 
 if __name__ == "__main__":

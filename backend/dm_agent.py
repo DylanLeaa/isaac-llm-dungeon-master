@@ -23,6 +23,20 @@ def build_user_message(kind: str, state: dict, ctx: dict, memory: dict) -> str:
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_DEFAULT_MODEL = "anthropic/claude-haiku-5.5"      # OpenRouter slugs use dots
 
+# Every call sends all four tools in a fixed order and picks one with tool_choice. Tools sit
+# in front of the system prompt in the cache prefix, so one shared tool list means one cache
+# entry for every decision kind instead of four (tool_choice changes don't break it).
+_OPENAI_TOOLS = [{"type": "function", "function": {
+    "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
+    for t in TOOLS.values()]
+
+
+def _usage(data: dict) -> dict:
+    u = data.get("usage") or {}
+    details = u.get("prompt_tokens_details") or {}
+    return {"in": int(u.get("prompt_tokens") or 0), "cached": int(details.get("cached_tokens") or 0),
+            "out": int(u.get("completion_tokens") or 0), "cost": float(u.get("cost") or 0.0)}
+
 
 class OpenRouterDM:
     """Same Haiku DM, called through OpenRouter's OpenAI-compatible chat endpoint."""
@@ -51,10 +65,9 @@ class OpenRouterDM:
             "max_tokens": self.max_tokens,
             "messages": [self.system,
                          {"role": "user", "content": build_user_message(kind, state, ctx, memory)}],
-            "tools": [{"type": "function", "function": {
-                "name": tool["name"], "description": tool["description"],
-                "parameters": tool["input_schema"]}}],
+            "tools": _OPENAI_TOOLS,
             "tool_choice": {"type": "function", "function": {"name": tool["name"]}},
+            "usage": {"include": True},                 # token + cost accounting in the response
         })
         resp.raise_for_status()
         data = resp.json()
@@ -62,7 +75,8 @@ class OpenRouterDM:
             raise RuntimeError(f"openrouter: {data['error']}")
         msg = data["choices"][0]["message"]
         for call in msg.get("tool_calls") or []:
-            return json.loads(call["function"]["arguments"])
+            if call["function"]["name"] == tool["name"]:
+                return {**json.loads(call["function"]["arguments"]), "_usage": _usage(data)}
         raise RuntimeError(f"no tool call in response (finish_reason={data['choices'][0].get('finish_reason')})")
 
 

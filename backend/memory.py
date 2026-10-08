@@ -19,7 +19,7 @@ class RunMemory:
         self.run_id = run_id
         self.events: deque[str] = deque(maxlen=40)
         self.schemes: deque[str] = deque(maxlen=6)
-        self.taunts: deque[str] = deque(maxlen=8)
+        self.taunts: deque[str] = deque(maxlen=8)          # written, shown or not
         self.issued: dict[str, dict] = {}            # key -> {kind, decision}
         self.counters: dict[str, int] = {
             "troll_bombs_floor": 0, "clears": 0,
@@ -29,13 +29,21 @@ class RunMemory:
         }
 
     # ------------------------------------------------------------ bookkeeping
-    def note_issued(self, key: str, kind: str, decision: dict) -> None:
+    def previous(self, key: str) -> dict | None:
+        """The answer already issued for `key` that the game hasn't used yet, if any."""
+        entry = self.issued.get(key)
+        return entry["decision"] if entry else None
+
+    def note_issued(self, key: str, kind: str, decision: dict) -> bool:
+        """Record an answer sent to the game. Returns True if it replaced an unused one."""
+        replaced = key in self.issued
         self.issued[key] = {"kind": kind, "decision": decision}
         if len(self.issued) > 200:
             for k in list(self.issued)[:100]:
                 self.issued.pop(k, None)
-        if decision.get("scheme"):
-            self.schemes.append(decision["scheme"])
+        # Every taunt written counts, shown or not, so the model stops recycling openers.
+        _append_unique(self.taunts, decision.get("taunt"))
+        return replaced
 
     def on_applied(self, key: str) -> None:
         """The game actually used decision `key`; update the ledgers."""
@@ -43,8 +51,8 @@ class RunMemory:
         if not entry:
             return
         kind, d = entry["kind"], entry["decision"]
-        if d.get("taunt"):
-            self.taunts.append(d["taunt"])
+        # Only schemes the game acted on are real plans; re-asks and unused answers are noise.
+        _append_unique(self.schemes, d.get("scheme"))
         c = self.counters
         if kind == "room_clear":
             fam = summarize_categories(d.get("rewards", []))
@@ -98,6 +106,21 @@ class RunMemory:
         return {
             "recent_events": list(self.events)[-14:],
             "your_active_schemes": list(self.schemes)[-3:],
-            "your_recent_taunts": list(self.taunts)[-4:],
+            "your_recent_taunts": list(self.taunts)[-6:],
             "ledger": dict(self.counters),
         }
+
+
+def _norm(text: str) -> str:
+    return " ".join("".join(ch for ch in text.lower() if ch.isalnum() or ch.isspace()).split())
+
+
+def _append_unique(dq: deque, text: str | None) -> None:
+    """Append `text` unless an equivalent entry is already there (moves it to the end instead)."""
+    if not text:
+        return
+    n = _norm(text)
+    for old in list(dq):
+        if _norm(old) == n:
+            dq.remove(old)
+    dq.append(text)

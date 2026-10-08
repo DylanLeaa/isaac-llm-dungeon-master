@@ -14,8 +14,8 @@ from catalog import (BOMBS, COINS, CURSES, ENEMIES, HEARTS, KEYS,
 
 KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan")
 
-_TAUNT = {"type": "string", "maxLength": 70,
-          "description": "Shown on screen. <=70 chars, plain ASCII, empty string for silence."}
+_TAUNT = {"type": "string", "maxLength": 60,
+          "description": "Shown on screen. <=60 chars, plain ASCII, empty string for silence."}
 _SCHEME = {"type": "string", "maxLength": 160,
            "description": "Private note to your future self: the long con you're setting up. Not shown to the player."}
 _INTENT = {"type": "string", "maxLength": 120,
@@ -73,7 +73,9 @@ TOOLS: dict[str, dict[str, Any]] = {
     "item_choice": {
         "name": "decide_item_choice",
         "description": "Rank candidate collectibles from one item pool. The first id is what the "
-                       "player gets next from this pool; later ids are used for rerolls/extra pedestals.",
+                       "player gets next from this pool; later ids are used for rerolls/extra pedestals. "
+                       "The taunt appears when the first item from this pool spawns (possibly much later): "
+                       "write it for that moment and never name the item.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -111,7 +113,13 @@ def _clean_text(s: Any, limit: int) -> str:
     s = str(s or "")
     s = s.encode("ascii", "ignore").decode()       # Isaac's font is ASCII only
     s = re.sub(r"\s+", " ", s).strip()
-    return s[:limit]
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    space = cut.rfind(" ")
+    if space >= limit * 0.6:                        # end on a whole word unless that loses too much
+        cut = cut[:space]
+    return cut.rstrip(" ,;:-")
 
 
 def _hp_half_hearts(state: dict) -> int:

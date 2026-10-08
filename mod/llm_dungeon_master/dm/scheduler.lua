@@ -23,11 +23,16 @@ local floorNo = 0
 local levelSig
 local room = nil         -- per-room tracker
 local itemQueues = {}    -- pool -> {resultId, ids}
+local itemSigs = {}      -- pool -> signature of the last item_choice request (candidates + build)
+local layoutSends = {}   -- layout key -> {hash, n}: what we last asked about that room, and how often
+local fallbackSent = {}  -- key -> true: vanilla fallback already reported
+local floorPlanAsked = false
 local floorPlanUsed      -- last floor plan applied (re-used if we reseed)
 local reseeds = 0
 Sched.peeking = false
 
 local POOL_FOR_ROOM -- RoomType -> ItemPoolType (filled in init)
+local CONTROLLED_POOL = {}
 local KEY_ROOMS = {}
 
 -- ----------------------------------------------------------------- utilities
@@ -48,12 +53,30 @@ end
 local function leadMs() return cfg.LEAD_FACTOR * Bridge.latencyP90() + cfg.LEAD_PAD_MS end
 
 local function eligibleLayoutRoom(t) return t == RoomType.ROOM_DEFAULT end
+
+-- Tell the backend the game needed a decision and vanilla made it (once per key).
+local function reportFallback(kind, key, asked)
+  if fallbackSent[key] then return end
+  fallbackSent[key] = true
+  Bridge.event("fallback", { kind = kind, key = key, asked = asked })
+end
+
+-- Worth (re)asking about this room? Not if an answer for the same player state is already
+-- waiting or on its way, and never more than MAX_LAYOUT_SENDS times per room.
+local function wantLayout(key, hash)
+  local s = layoutSends[key]
+  if not s then return true end
+  if s.n >= cfg.MAX_LAYOUT_SENDS then return false end
+  return not (s.hash == hash and (Bridge.isPending(key) or Bridge.peek(key)))
+end
 local function eligibleClearRoom(t) return t == RoomType.ROOM_DEFAULT end
 
 -- ------------------------------------------------------------------ requests
 local function requestLayout(desc, reason)
   local key = fkey("layout", desc.SafeGridIndex)
   local level = game:GetLevel()
+  local prev = layoutSends[key]
+  layoutSends[key] = { hash = State.materialHash(), n = (prev and prev.n or 0) + 1 }
   Bridge.request("room_layout", key, State.snapshot(), {
     reason = reason,
     room_type = State.roomTypeName(desc.Data.Type),
@@ -102,13 +125,21 @@ end
 local function requestItems(pool, roomTypeName, reason)
   local cands = peekCandidates(pool)
   if #cands == 0 then return end
-  Bridge.request("item_choice", fkey("items", pool), State.snapshot(), {
+  -- Candidates come from a fixed seed, so walking past the same room again would resend the
+  -- exact same question. Only re-ask when the candidates or the build changed.
+  local key, ids = fkey("items", pool), {}
+  for i, c in ipairs(cands) do ids[i] = tostring(c.id) end
+  local sig = table.concat(ids, ",") .. "|" .. Isaac.GetPlayer(0):GetCollectibleCount()
+  if itemSigs[pool] == sig and (Bridge.isPending(key) or Bridge.peek(key)) then return end
+  itemSigs[pool] = sig
+  Bridge.request("item_choice", key, State.snapshot(), {
     reason = reason, pool = pool, room_type = roomTypeName, candidates = cands,
   }, 10000)
 end
 
 local function requestFloorPlan(reason)
   local level = game:GetLevel()
+  floorPlanAsked = true
   Bridge.request("floor_plan", fkey("floor", "next"), State.snapshot(), {
     reason = reason, current_stage = level:GetStage(), current_stage_type = level:GetStageType(),
     allowed_layout_rerolls = cfg.ALLOW_LAYOUT_RESEED and cfg.MAX_RESEEDS or 0,
@@ -136,8 +167,9 @@ local function prefetchNeighbours(reason)
   for _, d in ipairs(neighbours()) do
     if d.VisitedCount == 0 then
       if cfg.CONTROL_ROOM_LAYOUT and eligibleLayoutRoom(d.Data.Type) then
-        local key = requestLayout(d, reason)
-        room.layoutKeys[key] = State.materialHash()
+        local key, h = fkey("layout", d.SafeGridIndex), State.materialHash()
+        if wantLayout(key, h) then requestLayout(d, reason) end
+        room.layoutKeys[key] = h
       end
       local pool = POOL_FOR_ROOM[d.Data.Type]
       if cfg.CONTROL_ITEMS and pool then
@@ -154,7 +186,7 @@ local function checkLevelChange()
   if sig == levelSig then return false end
   levelSig = sig
   floorNo = floorNo + 1
-  itemQueues = {}
+  itemQueues, itemSigs, layoutSends, fallbackSent = {}, {}, {}, {}
   Bridge.forget("layout:" .. (floorNo - 1))
   Bridge.forget("clear:" .. (floorNo - 1))
   Bridge.forget("items:" .. (floorNo - 1))
@@ -249,12 +281,15 @@ function Sched.update()
   end
 
   -- Late layout: the answer arrived just after the player walked in.
-  if room.firstVisit and not room.layoutApplied and cfg.CONTROL_ROOM_LAYOUT
-      and game:GetFrameCount() - room.enteredFrame <= cfg.LATE_LAYOUT_GRACE_FRAMES then
-    local res = Bridge.take(fkey("layout", room.idx))
-    if res then
-      Apply.roomLayout(res.decision)
-      room.layoutApplied = true
+  if room.firstVisit and not room.layoutApplied and cfg.CONTROL_ROOM_LAYOUT then
+    if game:GetFrameCount() - room.enteredFrame <= cfg.LATE_LAYOUT_GRACE_FRAMES then
+      local res = Bridge.take(fkey("layout", room.idx))
+      if res then
+        Apply.roomLayout(res.decision)
+        room.layoutApplied = true
+      end
+    elseif layoutSends[fkey("layout", room.idx)] then
+      reportFallback("room_layout", fkey("layout", room.idx), true)
     end
   end
 
@@ -263,8 +298,7 @@ function Sched.update()
     room.lastNeighbourRefresh = t
     local h = State.materialHash()
     for key, sentHash in pairs(room.layoutKeys) do
-      local p = Bridge.pendingInfo(key)
-      if sentHash ~= h and (not p or p.sends <= cfg.MAX_REFRESHES) then
+      if sentHash ~= h and wantLayout(key, h) then
         local idx = tonumber(key:match(":(%-?%d+)$"))
         local d = idx and game:GetLevel():GetRoomByIdx(idx)
         if d and d.Data and d.VisitedCount == 0 then
@@ -320,7 +354,10 @@ function Sched.onCleanAward(rng, pos)
   local secs, hits = State.onRoomCleared()
   Bridge.event("room_cleared", { room = room.idx, seconds = secs, hits = hits })
   local res = Bridge.take(fkey("clear", room.idx))
-  if not res then return nil end                      -- DM too slow: vanilla decides
+  if not res then                                     -- DM too slow: vanilla decides
+    reportFallback("room_clear", fkey("clear", room.idx), room.clearSends > 0)
+    return nil
+  end
   Apply.roomClear(res.decision, pos)
   -- Documented API bug: returning true stops the award seed advancing.
   local level = game:GetLevel()
@@ -341,7 +378,10 @@ function Sched.onGetCollectible(pool, decrease, seed)
     q = { resultId = res.id, ids = ids, used = false, taunt = res.decision.taunt }
     itemQueues[pool] = q
   end
-  if not q then return nil end
+  if not q then
+    if CONTROLLED_POOL[pool] and itemSigs[pool] then reportFallback("item_choice", key, true) end
+    return nil
+  end
   local player = Isaac.GetPlayer(0)
   while #q.ids > 0 do
     local id = table.remove(q.ids, 1)
@@ -363,6 +403,8 @@ function Sched.onCurseEval(curses)
   if not cfg.CONTROL_FLOOR or game:IsGreedMode() then return nil end
   local res = Bridge.take(fkey("floor", "next"))
   local plan = res and res.decision or (reseeds > 0 and floorPlanUsed) or nil
+  if not plan and floorPlanAsked then reportFallback("floor_plan", fkey("floor", "next"), true) end
+  floorPlanAsked = false
   if not plan then return nil end
   floorPlanUsed = plan
   if res then Taunt.show(plan.taunt) end
@@ -371,13 +413,17 @@ end
 
 function Sched.resetRun()
   floorNo, levelSig, room, itemQueues, floorPlanUsed, reseeds = 0, nil, nil, {}, nil, 0
+  itemSigs, layoutSends, fallbackSent, floorPlanAsked = {}, {}, {}, false
   floorItemsRequestedFor = -1
 end
 
 function Sched.init(config, bridge, state, apply, taunt)
   cfg, Bridge, State, Apply, Taunt = config, bridge, state, apply, taunt
   POOL_FOR_ROOM = {}
-  local function map(rt, pool) if rt and pool then POOL_FOR_ROOM[rt] = pool end end
+  CONTROLLED_POOL = {}
+  local function map(rt, pool)
+    if rt and pool then POOL_FOR_ROOM[rt], CONTROLLED_POOL[pool] = pool, true end
+  end
   map(RoomType.ROOM_TREASURE, ItemPoolType.POOL_TREASURE)
   map(RoomType.ROOM_BOSS, ItemPoolType.POOL_BOSS)
   map(RoomType.ROOM_SHOP, ItemPoolType.POOL_SHOP)
