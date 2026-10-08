@@ -248,6 +248,13 @@ function Cons.onUsePill(effect)
   if Cons.onLock then Cons.onLock(locked) end
 end
 
+--- Every pill colour swallowed this run: {effect, by = "dm" | "vanilla"} (for the stats screen).
+function Cons.lockedList()
+  local out = {}
+  for _, e in pairs(locked) do out[#out + 1] = { effect = e.effect, by = e.by } end
+  return out
+end
+
 -- --------------------------------------------------------------- lifecycle
 function Cons.onNewFloor(n)
   Bridge.forget("cons:" .. floorNo)

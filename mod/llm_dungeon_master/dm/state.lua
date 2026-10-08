@@ -60,7 +60,7 @@ local T = {}
 function State.resetRun()
   T = { floorHits = 0, runHits = 0, itemsTaken = {}, floorClears = 0, clearSecs = {},
         lockedDoors = {}, tintedSeen = {}, roomHits = 0, roomEnteredAt = 0,
-        itemCount = -1, owned = {} }
+        itemCount = -1, owned = {}, runClears = 0, pills = 0, lastHitBy = nil }
 end
 State.resetRun()
 
@@ -68,7 +68,8 @@ function State.onNewFloor()
   T.floorHits, T.floorClears, T.clearSecs, T.lockedDoors, T.tintedSeen = 0, 0, {}, {}, {}
 end
 
-function State.onPlayerHit(amount)
+function State.onPlayerHit(amount, by)
+  T.lastHitBy = by
   T.floorHits = T.floorHits + amount
   T.runHits = T.runHits + amount
   T.roomHits = T.roomHits + amount
@@ -99,6 +100,7 @@ end
 
 function State.onRoomCleared()
   T.floorClears = T.floorClears + 1
+  T.runClears = T.runClears + 1
   local secs = (Isaac.GetTime() - T.roomEnteredAt) / 1000
   T.clearSecs[#T.clearSecs + 1] = secs
   return round(secs, 1), T.roomHits
@@ -108,6 +110,55 @@ function State.onItemTaken(id)
   local info = State.itemInfo(id)
   if info then T.itemsTaken[#T.itemsTaken + 1] = info.name end
   return info
+end
+
+function State.onPillUsed() T.pills = T.pills + 1 end
+
+--- Who hit the player, readably: a projectile or creep counts as whoever fired it.
+function State.hitSourceName(ent)
+  if not ent then return "the room" end
+  local t = ent.Type
+  if ent.SpawnerType and ent.SpawnerType > 0 and t ~= EntityType.ENTITY_PLAYER
+      and (t == EntityType.ENTITY_PROJECTILE or t == EntityType.ENTITY_LASER or t == EntityType.ENTITY_EFFECT) then
+    t = ent.SpawnerType
+  end
+  return (enumName(EntityType, t, "^ENTITY_"):gsub("_", " "))
+end
+
+-- The run totals a continued run picks up again (saved on exit, see main.lua).
+local CARRIED = { "runHits", "runClears", "pills", "lastHitBy" }
+function State.saveRun()
+  local out = { items = T.itemsTaken }
+  for _, k in ipairs(CARRIED) do out[k] = T[k] end
+  return out
+end
+
+function State.restoreRun(saved)
+  if type(saved) ~= "table" then return end
+  for _, k in ipairs(CARRIED) do
+    if saved[k] ~= nil then T[k] = saved[k] end
+  end
+  if type(saved.items) == "table" then T.itemsTaken = saved.items end
+end
+
+local function clock(frames)
+  local s = math.floor(frames / 30)
+  if s >= 3600 then return string.format("%d:%02d:%02d", s // 3600, s // 60 % 60, s % 60) end
+  return string.format("%d:%02d", s // 60, s % 60)
+end
+
+--- The player's column of the after-death stats screen: {label, value} rows.
+function State.runRows()
+  local frames = game.TimeCounter or game:GetFrameCount()
+  return {
+    { "Reached", game:GetLevel():GetName() },
+    { "Time", clock(frames) },
+    { "Rooms cleared", tostring(T.runClears) },
+    { "Damage taken", string.format("%g heart%s", T.runHits / 2, T.runHits == 2 and "" or "s") },
+    { "Items taken", tostring(#T.itemsTaken) },
+    { "Pills eaten", tostring(T.pills) },
+    { "Last hit by", T.lastHitBy or "nothing" },
+  }
 end
 
 -- ------------------------------------------------------------------ player
