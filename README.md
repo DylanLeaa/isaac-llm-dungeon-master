@@ -51,7 +51,7 @@ Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the
 ```bash
 cd backend
 pip install -r requirements.txt
-export OPENROUTER_API_KEY=sk-or-...       # Windows: set OPENROUTER_API_KEY=...
+export OPENROUTER_API_KEY=sk-or-...       # PowerShell: $env:OPENROUTER_API_KEY="sk-or-..."   cmd.exe: set OPENROUTER_API_KEY=sk-or-...
 python server.py --cruelty 6              # TCP on 127.0.0.1:7337, model anthropic/claude-haiku-5.5 via OpenRouter
 python server.py --mock                   # offline stand-in, no key needed
 
