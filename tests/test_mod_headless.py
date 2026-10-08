@@ -105,6 +105,16 @@ def run(bridge_dir):
     W.fire(MC.MC_POST_GAME_STARTED, False)
     wait(Bridge.ready, 5, "backend welcome")
     print("1. connected:", Bridge.status())
+    # --- loading screen: input is blocked until the backend says the narrative is in ----
+    Loading = modules["dm.loading"]
+    assert Loading.active(), "a new run starts on the loading screen"
+    assert Loading.blockInput(None, None, g.InputHook.IS_ACTION_PRESSED, 7) is False
+    assert Loading.blockInput(None, None, g.InputHook.GET_ACTION_VALUE, 7) == 0
+    assert Loading.blockInput(None, None, g.InputHook.IS_ACTION_PRESSED, g.ButtonAction.ACTION_PAUSE) is None
+    wait(lambda: not Loading.active(), 5, "the narrative (mock) to land and the loading screen to end")
+    assert Loading.blockInput(None, None, g.InputHook.IS_ACTION_PRESSED, 7) is None, "input is back"
+    assert any(json.loads(l).get("t") == "prepare" for l in open(Path(bridge_dir) / "to_dm.jsonl") if l.strip())
+    print("   loading screen held input until the narrative was in, then released it")
 
     # --- DM Settings menu: cruelty slider, applied live and saved -----------------
     menu = [mcm.settings[i] for i in range(1, len(mcm.settings) + 1)]

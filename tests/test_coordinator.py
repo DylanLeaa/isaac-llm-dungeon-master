@@ -233,3 +233,74 @@ def test_planner_failure_never_breaks_decisions():
     assert sent and sent[-1]["ok"] is True
     assert coord.stats["floor_brief"]["error"] == 1
     assert "NARRATIVE for Isaac" in dm.campaigns[-1] and "still being prepared" in dm.campaigns[-1]
+
+
+def _prepare_msgs(planner, msgs):
+    """Feed messages to a coordinator; returns what it sent to the game."""
+    coord = Coordinator(CampaignDM(2), cruelty=6, planner=planner)
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        for m in msgs:
+            await coord.handle(m, send)
+        await asyncio.sleep(0.1)
+        return coord
+
+    return sent, coord, go
+
+
+def test_prepare_answers_ready_once_the_narrative_is_written():
+    planner = ScriptedPlanner(gated=True)
+    sent, coord, go = _prepare_msgs(planner, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+                                              {"t": "prepare", "state": floor_req(1, 1, "Basement I")["state"]}])
+
+    async def run():
+        task = asyncio.create_task(go())
+        await asyncio.sleep(0.05)
+        assert not [m for m in sent if m["t"] == "ready"]      # still writing: the game keeps waiting
+        planner.gate.set()
+        await task
+
+    asyncio.run(run())
+    assert [m for m in sent if m["t"] == "ready"] == [{"t": "ready", "session": "S", "status": "ready"}]
+    assert len(planner.narratives) == 1
+
+
+def test_prepare_twice_writes_one_narrative_and_a_late_request_adds_no_second():
+    planner = ScriptedPlanner()
+    state = floor_req(1, 1, "Basement I")["state"]
+    sent, coord, go = _prepare_msgs(planner, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+                                              {"t": "prepare", "state": state}, {"t": "prepare", "state": state},
+                                              floor_req(1, 1, "Basement I")])
+    asyncio.run(go())
+    assert len(planner.narratives) == 1
+    assert [m["status"] for m in sent if m["t"] == "ready"] == ["ready", "ready"]
+
+
+def test_prepare_without_planner_is_ready_at_once():
+    sent, coord, go = _prepare_msgs(None, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+                                           {"t": "prepare", "state": {}}])
+    asyncio.run(go())
+    assert [m["status"] for m in sent if m["t"] == "ready"] == ["none"]
+
+
+def test_prepare_reports_a_failed_narrative_and_ignores_an_abandoned_run():
+    class Boom(ScriptedPlanner):
+        async def narrative(self, state, cruelty):
+            raise RuntimeError("boom")
+
+    state = floor_req(1, 1, "Basement I")["state"]
+    sent, coord, go = _prepare_msgs(Boom(), [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+                                             {"t": "prepare", "state": state}])
+    asyncio.run(go())
+    assert [m["status"] for m in sent if m["t"] == "ready"] == ["failed"]
+
+    gated = ScriptedPlanner(gated=True)
+    sent, coord, go = _prepare_msgs(gated, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+                                            {"t": "prepare", "state": state},
+                                            {"t": "hello", "session": "S", "run": "R2", "new_run": True}])
+    asyncio.run(go())
+    assert not [m for m in sent if m["t"] == "ready"]            # the old run's wait is dropped

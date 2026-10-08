@@ -166,6 +166,26 @@ class Campaign:
             self._push()
             self._spawn(self._write_brief(state, digest, prev, cruelty, self.run_token, sig))
 
+    def narrative_waiter(self):
+        """Call when the game asks; await the result. It is "ready", "failed" (the DM goes without),
+        "none" (no planner) or "cancelled" (a new run started meanwhile). The run is pinned now, not
+        when the awaiting starts, so a hello in between can't pass for the same run."""
+        return self._narrative_status(self.run_token, self.narrative_task)
+
+    async def _narrative_status(self, token: int, task: asyncio.Task | None) -> str:
+        if not self.planner:
+            return "none"
+        if task is not None and not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if token != self.run_token:
+                    return "cancelled"
+                raise
+        if token != self.run_token:
+            return "cancelled"
+        return "ready" if self.narrative else "failed"
+
     def _spawn(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
         self.tasks.add(task)

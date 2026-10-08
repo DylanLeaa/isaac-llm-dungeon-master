@@ -22,6 +22,7 @@ local lastHello = -1e9
 local onResult         -- optional callback(key, result)
 local onReceipt        -- optional callback(msg) for the backend's receipt / receipt_sync messages
 local onSummary        -- optional callback(msg) for the backend's run_summary (after-death stats)
+local onReady          -- optional callback(msg) for the backend's "ready" (the run narrative is in)
 local cruelty          -- nil = backend's --cruelty; set from config / the DM Settings menu
 
 local function now() return Isaac.GetTime() end
@@ -172,6 +173,7 @@ function Bridge.status()
 end
 
 function Bridge.ready() return transport ~= nil and welcomed end
+function Bridge.hasTransport() return transport ~= nil end
 
 local function send(tbl)
   if not transport then return false end
@@ -232,6 +234,14 @@ function Bridge.setReceiptHandler(fn) onReceipt = fn end
 --- next run has started, so the handler matches them to the run they describe.
 function Bridge.setSummaryHandler(fn) onSummary = fn end
 
+--- Where the backend's "ready" goes (the loading screen).
+function Bridge.setReadyHandler(fn) onReady = fn end
+
+--- Start the planners now and be told when the run narrative is in. Safe to repeat.
+function Bridge.prepare(state)
+  if Bridge.ready() then send({ t = "prepare", state = state }) end
+end
+
 function Bridge.event(name, data)
   if Bridge.ready() then send({ t = "event", name = name, data = data or {} }) end
 end
@@ -263,6 +273,10 @@ end
 local function handle(msg)
   if msg.t == "welcome" then
     if msg.session == session then welcomed = true end
+    return
+  end
+  if msg.t == "ready" then
+    if msg.session == session and onReady then onReady(msg) end
     return
   end
   if msg.t == "run_summary" then

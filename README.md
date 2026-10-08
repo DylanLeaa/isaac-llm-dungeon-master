@@ -41,9 +41,12 @@ decides that one event.
 | `floor_plan` (curses, treasure distance) | you enter the boss room | boss dies | `MC_POST_CURSE_EVAL` of the next floor |
 
 The planners start when the first request of a new run, or of a new floor (`stage` and
-`stage_type` from the snapshot), reaches the backend. They run in the background and
-**nothing waits for them**. Until the narrative (about 20–60s) or a floor's brief (about
-5–15s) lands, Haiku improvises. The old brief is dropped as soon as the floor changes. A
+`stage_type` from the snapshot), reaches the backend. A new run opens on a **loading screen**: the mod
+sends `prepare`, input is blocked and you can't be hurt until the backend answers `ready` (the narrative,
+about 20–60s, is written or has failed). Enter skips it, and it gives up by itself after
+`LOADING_CONNECT_MS` with no backend or `LOADING_TIMEOUT_MS` without a narrative (`LOADING_SCREEN = false`
+turns it off). The time spent there isn't counted in the run's clock. Nothing else waits: until a floor's
+brief (about 5–15s) lands, Haiku improvises. The old brief is dropped as soon as the floor changes. A
 floor brief waits up to 25s for the run narrative, then goes ahead without it. If a planner
 fails, it is logged and the DM carries on.
 

@@ -39,7 +39,7 @@ BatterySubType = { BATTERY_NORMAL = 1 }
 BombVariant = { BOMB_NORMAL = 0, BOMB_TROLL = 3 }
 LevelCurse = { CURSE_NONE = 0, CURSE_OF_DARKNESS = 1, CURSE_OF_LABYRINTH = 2, CURSE_OF_THE_LOST = 4,
   CURSE_OF_THE_UNKNOWN = 8, CURSE_OF_MAZE = 32, CURSE_OF_BLIND = 64 }
-ModCallbacks = { MC_POST_UPDATE = 1, MC_POST_RENDER = 2, MC_USE_PILL = 10, MC_ENTITY_TAKE_DMG = 11,
+ModCallbacks = { MC_POST_UPDATE = 1, MC_POST_RENDER = 2, MC_INPUT_ACTION = 13, MC_USE_PILL = 10, MC_ENTITY_TAKE_DMG = 11,
   MC_POST_CURSE_EVAL = 12, MC_POST_GAME_STARTED = 15, MC_POST_GAME_END = 16, MC_PRE_GAME_EXIT = 17, MC_POST_NEW_LEVEL = 18,
   MC_POST_NEW_ROOM = 19, MC_GET_CARD = 20, MC_GET_TRINKET = 47, MC_PRE_GET_COLLECTIBLE = 62,
   MC_GET_PILL_EFFECT = 65, MC_PRE_SPAWN_CLEAN_AWARD = 70 }
@@ -62,6 +62,12 @@ PillEffect = enum({ "PILLEFFECT_BAD_GAS", "PILLEFFECT_BAD_TRIP", "PILLEFFECT_BAL
 -- Every card/rune name resolves; a few have their real ids so tests can tell them apart.
 Card = setmetatable({ CARD_TOWER = 17, RUNE_HAGALAZ = 32 }, { __index = function(_, k)
   if tostring(k):match("^CARD_") or tostring(k):match("^RUNE_") then return 50 end end })
+InputHook = { IS_ACTION_PRESSED = 0, IS_ACTION_TRIGGERED = 1, GET_ACTION_VALUE = 2 }
+ButtonAction = { ACTION_PAUSE = 1, ACTION_MENUCONFIRM = 2, ACTION_MAP = 3 }
+Keyboard = { KEY_ENTER = 257 }
+Input = { skip = false }
+function Input.IsButtonTriggered() return Input.skip end
+function Input.IsActionTriggered() return false end
 ChampionColor = { CHAMPION_RED = 0, CHAMPION_DARK_RED = 12, CHAMPION_TINY = 18 }
 
 -- ---------------------------------------------------------------- vectors
