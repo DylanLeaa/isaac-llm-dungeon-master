@@ -32,6 +32,9 @@ return {
   -- materially (damage taken, resources changed) and at least this long has passed.
   REFRESH_MIN_MS = 1500,
   MAX_REFRESHES = 2,
+  -- Hard cap on room_layout requests per room per floor (first ask + refreshes). A room the
+  -- player keeps walking past is only re-asked when their state changed since the last ask.
+  MAX_LAYOUT_SENDS = 3,
   -- How long after entering a room a late room_layout decision may still be applied.
   LATE_LAYOUT_GRACE_FRAMES = 20,
   ITEM_CANDIDATES = 6,
