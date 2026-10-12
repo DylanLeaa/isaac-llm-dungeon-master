@@ -11,6 +11,8 @@ import json
 import logging
 from typing import Any
 
+from isaac_knowledge import GATE_KNOWLEDGE
+
 
 log = logging.getLogger("llmdm")
 
@@ -35,7 +37,8 @@ GATE_QUESTION = {
         "are small, cosmetic or unrelated (a coin or two, timers, counters, an unrelated room cleared). "
         "`plan` is the floor brief the game-master is following, if any. If the plan already dictates the earlier "
         "answer and still dictates it after the changes, it still fits, even after a big swing. A change that "
-        "trips one of the plan's own conditions (for example a health threshold) is a reason to think again."),
+        "trips one of the plan's own conditions (for example a health threshold) is a reason to think again. "
+        + GATE_KNOWLEDGE),
     "criteria": {"true": "The earlier answer no longer fits; a new one is needed",
                  "false": "The earlier answer still fits"},
 }

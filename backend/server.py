@@ -23,7 +23,8 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 import epilogue
-from claude_code import CLAUDE_CODE_DM_MODEL, CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeDM, ClaudeCodePlanner
+from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_CODE_LATE_GRACE_S,
+                         CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeDM, ClaudeCodePlanner)
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
 from memory import RunMemory
@@ -34,7 +35,7 @@ from schemas import KINDS, clamp
 log = logging.getLogger("llmdm")
 Send = Callable[[dict], Awaitable[None]]
 
-MAX_DEADLINE_S = 12.0      # never let a single decision hang longer than this
+MAX_DEADLINE_S = 12.0      # never let a single decision hang longer than this (plus any late grace)
 MIN_DEADLINE_S = 0.4
 EPITAPH_TIMEOUT_S = 20.0   # the stats screen shows without it; it only fills in the last line
 
@@ -43,8 +44,9 @@ class Coordinator:
     """Routes requests to the DM, enforces latest-wins per key, applies guardrails."""
 
     def __init__(self, dm, cruelty: int, planner=None, max_concurrency: int = 6,
-                 receipt: Receipt | None = None, epitaph: bool = True, gate=None) -> None:
+                 receipt: Receipt | None = None, epitaph: bool = True, gate=None, late_grace_s: float = 0.0) -> None:
         self.dm = dm
+        self.late_grace_s = late_grace_s          # how long past its deadline a call may still be delivered
         self.gate = gate                          # fast model that vetoes re-asks the DM would answer the same
         self.last_req: dict[str, dict] = {}       # key -> what the issued answer was written against
         self.epitaph = epitaph and hasattr(dm, "epitaph")
@@ -58,7 +60,7 @@ class Coordinator:
         self.bg: set[asyncio.Task] = set()
         self.inflight: dict[str, tuple[int, asyncio.Task]] = {}
         self.sem = asyncio.Semaphore(max_concurrency)
-        # Per decision kind: req, ok, superseded, timeout, error, replaced, applied, fallback.
+        # Per decision kind: req, ok, late, superseded, timeout, error, replaced, applied, fallback.
         self.stats: dict[str, Counter] = defaultdict(Counter)
         self.usage = Counter()                    # in / cached / out tokens, cost, calls
         # Opus narrative once per run + Sonnet brief once per floor, fed to the DM's system prompt.
@@ -69,7 +71,7 @@ class Coordinator:
         """Log how many answers were requested, paid for, and actually used, per kind."""
         if not self.stats:
             return
-        cols = ("req", "ok", "applied", "replaced", "reused", "superseded", "timeout", "error", "fallback")
+        cols = ("req", "ok", "late", "applied", "replaced", "reused", "superseded", "timeout", "error", "fallback")
         log.info("summary %-11s %s", "kind", " ".join(f"{c:>10}" for c in cols))
         for kind in sorted(k for k in self.stats if k != "gate"):
             log.info("        %-11s %s", kind, " ".join(f"{self.stats[kind][c]:>10}" for c in cols))
@@ -263,9 +265,8 @@ class Coordinator:
             if prev and await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
                 await send({**base, "ok": True, "ms": _ms(t0), "decision": prev})
                 return
-            async with self.sem:
-                raw = await asyncio.wait_for(self.dm.decide(kind, state, ctx, digest),
-                                             timeout=max(MIN_DEADLINE_S, deadline - (time.perf_counter() - t0)))
+            async with self.sem:              # the deadline counts from here: queueing for a slot isn't the DM's time
+                raw, late = await self._decide(kind, key, state, ctx, digest, deadline, t0)
             usage = raw.pop("_usage", None)
             call = raw.pop("_call", None)
             decision = clamp(kind, raw, state, ctx, self.cruelty, self.memory.counters)
@@ -288,18 +289,21 @@ class Coordinator:
             return
         ms = _ms(t0)
         self.stats[kind]["ok"] += 1
+        if late:
+            self.stats[kind]["late"] += 1
         old_seq = self.receipt_seq.get(key)
         if self.memory.note_issued(key, kind, decision):
             self.stats[kind]["replaced"] += 1    # paid for an answer the game never used
             self._push_receipt(self.receipt.update(old_seq, "replaced"))
-        self.receipt_seq[key] = self._record(kind, "ok", ms=ms, llm=call, raw=raw, decision=decision, **rec)
+        self.receipt_seq[key] = self._record(kind, "ok", ms=ms, llm=call, raw=raw, decision=decision,
+                                             **({"late": True} if late else {}), **rec)
         self.last_req[key] = {"state": state, "ctx": asked_ctx, "events": digest["recent_events"],
                               "campaign": getattr(self.dm, "campaign", "")}
         tok = ""
         if usage:
             self.usage.update({**usage, "calls": 1})
             tok = f'  [{usage["in"]}/{usage["cached"]}c/{usage["out"]} tok]'
-        log.info("%-11s %-14s %5dms%s  %s%s", kind, key, ms, tok, decision.get("intent", ""),
+        log.info("%-11s %-14s %5dms%s%s  %s%s", kind, key, ms, " LATE" if late else "", tok, decision.get("intent", ""),
                  f'  "{decision["taunt"]}"' if decision.get("taunt") else "")
         if sum(c["ok"] for c in self.stats.values()) % 25 == 0:
             self.summary()
@@ -307,6 +311,24 @@ class Coordinator:
             log.info("%28s guardrails: %s", "", "; ".join(decision["guardrails"]))
         await send({**base, "ok": True, "ms": ms, "decision": decision})
 
+    async def _decide(self, kind: str, key: str, state: dict, ctx: dict, digest: dict, deadline: float,
+                      t0: float) -> tuple[dict, bool]:
+        """(raw answer, whether it came after the deadline). With a late grace, a call past its deadline
+        keeps running and is delivered when it lands: the game holds the key as pending meanwhile (so it
+        doesn't re-ask) and takes a late result whenever it arrives. Without one, the deadline is final."""
+        call = asyncio.ensure_future(self.dm.decide(kind, state, ctx, digest))
+        try:
+            try:
+                return await asyncio.wait_for(asyncio.shield(call), deadline), False
+            except asyncio.TimeoutError:
+                if not self.late_grace_s:
+                    raise
+            log.info("%-11s %-14s past its %.0fms deadline after %.0fms -> still waiting (up to %.0fs)",
+                     kind, key, deadline * 1000, _ms(t0), self.late_grace_s)
+            return await asyncio.wait_for(asyncio.shield(call), self.late_grace_s), True
+        finally:
+            if not call.done():
+                call.cancel()                     # timed out or superseded: stop the call (kills claude -p)
 
     async def _gate_keeps(self, kind: str, key: str, state: dict, ctx: dict, digest: dict, prev: dict,
                           t0: float) -> bool:
@@ -477,6 +499,7 @@ def main() -> None:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    concurrency, late_grace = 6, 0.0
     if args.mock:
         dm = MockDM(args.cruelty, latency=tuple(args.mock_latency))
         planner = None if args.no_planners else MockPlanner()
@@ -495,6 +518,7 @@ def main() -> None:
                 gate = OpenRouterGate(args.gate_model, args.gate_threshold)
             else:
                 log.info("Re-ask gate: off (no OPENROUTER_API_KEY), every re-ask goes to the DM")
+        concurrency, late_grace = CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_LATE_GRACE_S
         log.info("Dungeon Master: %s via Claude Code (%s)  cruelty=%d", model, dm.runner.bin, args.cruelty)
     else:
         if not os.environ.get("OPENROUTER_API_KEY"):
@@ -510,8 +534,9 @@ def main() -> None:
     if planner:
         log.info("Planners: narrative=%s  floor brief=%s", planner.narrative_model, planner.floor_model)
 
-    coord = Coordinator(dm, args.cruelty, planner, receipt=Receipt(None if args.no_receipts else args.receipts),
-                        epitaph=not args.no_epitaph, gate=gate)
+    coord = Coordinator(dm, args.cruelty, planner, max_concurrency=concurrency,
+                        receipt=Receipt(None if args.no_receipts else args.receipts),
+                        epitaph=not args.no_epitaph, gate=gate, late_grace_s=late_grace)
 
     async def run() -> None:
         if args.bridge == "tcp":

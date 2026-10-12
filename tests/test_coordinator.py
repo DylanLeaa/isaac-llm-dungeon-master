@@ -333,3 +333,61 @@ def test_generosity_ledger_counts_applied_gifts_against_vanilla():
 
     m.reset("R2")
     assert m.digest()["generosity"]["run"]["luck_given"] == 0
+
+
+class SlowDM(ScriptedDM):
+    """Answers after `delay` seconds; counts how many calls were cancelled."""
+
+    def __init__(self, n, delay):
+        super().__init__([{"intent": "slow", "rewards": [], "taunt": ""}] * n)
+        self.delay, self.cancelled = delay, 0
+
+    async def decide(self, kind, state, ctx, memory):
+        try:
+            await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        return await super().decide(kind, state, ctx, memory)
+
+
+def _ask(coord, msgs, settle):
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        for m in msgs:
+            await coord.handle(m, send)
+        await asyncio.sleep(settle)
+
+    asyncio.run(go())
+    return [m for m in sent if m.get("t") == "res"]
+
+
+def _fast(rid, key="clear:1:82"):
+    return {**clear_req(rid), "key": key, "deadline_ms": 100}         # deadline floors at 0.4s
+
+
+def test_late_answer_is_delivered_not_killed():
+    dm = SlowDM(1, 0.6)
+    res = _ask(Coordinator(dm, cruelty=6, late_grace_s=1.0), [_fast(1)], 0.9)
+    assert [(r["ok"], r["decision"]["intent"]) for r in res] == [(True, "slow")]   # no timeout reply first
+    assert dm.cancelled == 0
+
+
+def test_without_grace_or_past_it_the_call_times_out_and_is_stopped():
+    for grace in (0.0, 0.1):
+        dm = SlowDM(1, 0.8)
+        coord = Coordinator(dm, cruelty=6, late_grace_s=grace)
+        res = _ask(coord, [_fast(1)], 0.9)
+        assert [(r["ok"], r["reason"]) for r in res] == [(False, "timeout")]
+        assert dm.cancelled == 1 and coord.stats["room_clear"]["timeout"] == 1
+
+
+def test_waiting_for_a_slot_does_not_eat_the_deadline():
+    dm = SlowDM(2, 0.3)
+    coord = Coordinator(dm, cruelty=6, max_concurrency=1)
+    res = _ask(coord, [_fast(1, "clear:1:1"), _fast(2, "clear:1:2")], 0.8)  # second waits 0.3s, then has 0.4s
+    assert [r["ok"] for r in res] == [True, True]
