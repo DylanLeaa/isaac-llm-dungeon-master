@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
+from catalog import CHESTS, LUCK, VANILLA_DROP_RATE, VANILLA_PICKUPS_PER_CLEAR
 from schemas import summarize_categories
 
 
@@ -27,6 +28,9 @@ class RunMemory:
             "clears_since_coin": 0, "clears_since_heart": 0,
             "floor": 0,
         }
+        # What the DM has given away, against vanilla: this floor, last floor and the whole run.
+        self.gen_floor, self.gen_run = _new_gen(), _new_gen()
+        self.gen_last_floor: dict | None = None
 
     # ------------------------------------------------------------ bookkeeping
     def previous(self, key: str) -> dict | None:
@@ -54,6 +58,9 @@ class RunMemory:
         # Only schemes the game acted on are real plans; re-asks and unused answers are noise.
         _append_unique(self.schemes, d.get("scheme"))
         c = self.counters
+        if kind in ("room_clear", "room_layout"):
+            for g in (self.gen_floor, self.gen_run):
+                _count_gifts(g, kind, d)
         if kind == "room_clear":
             fam = summarize_categories(d.get("rewards", []))
             c["clears"] += 1
@@ -90,6 +97,9 @@ class RunMemory:
     def on_game_event(self, name: str, data: dict) -> None:
         if name == "new_level":
             self.counters["troll_bombs_floor"] = 0
+            if any(self.gen_floor.values()):
+                self.gen_last_floor = _gen_view(self.gen_floor)
+            self.gen_floor = _new_gen()
             self.counters["floor"] = int(data.get("stage", self.counters["floor"]))
             self.events.append(f'--- entered {data.get("name", "new floor")} ---')
         elif name == "damage":
@@ -116,7 +126,72 @@ class RunMemory:
             "your_active_schemes": list(self.schemes)[-3:],
             "your_recent_taunts": list(self.taunts)[-6:],
             "ledger": dict(self.counters),
+            "generosity": self.generosity(),
         }
+
+    def generosity(self) -> dict:
+        """What the DM has handed out, next to what vanilla would have, with a one-line verdict."""
+        return {
+            "this_floor": _gen_view(self.gen_floor),
+            "last_floor": self.gen_last_floor,
+            "run": _gen_view(self.gen_run),
+            "vanilla": {"drop_rate": VANILLA_DROP_RATE, "pickups_per_clear": VANILLA_PICKUPS_PER_CLEAR,
+                        "luck_per_run": "about 1"},
+            "verdict": _verdict(self.gen_floor, self.gen_run),
+        }
+
+
+def _new_gen() -> dict[str, int]:
+    return {"clears": 0, "clears_with_drop": 0, "clear_pickups": 0, "bait_pickups": 0,
+            "luck": 0, "tinted_rocks": 0, "chests": 0}
+
+
+def _count_gifts(g: dict[str, int], kind: str, d: dict) -> None:
+    """Add one applied room_clear / room_layout decision to a generosity tally."""
+    if kind == "room_clear":
+        given = [(r["reward"], int(r.get("count", 1))) for r in d.get("rewards", [])]
+        n = sum(c for _, c in given)
+        g["clears"] += 1
+        g["clears_with_drop"] += int(n > 0)
+        g["clear_pickups"] += n
+    else:
+        given = [(r, 1) for r in d.get("bonus_pickups", [])]
+        g["bait_pickups"] += len(given)
+        g["tinted_rocks"] += int(d.get("tinted_rocks") or 0)
+    g["luck"] += sum(LUCK.get(r, 0) * c for r, c in given)
+    g["chests"] += sum(c for r, c in given if r in CHESTS)
+
+
+def _gen_view(g: dict[str, int]) -> dict:
+    c = g["clears"]
+    return {
+        "room_clears": c,
+        "drop_rate": round(g["clears_with_drop"] / c, 2) if c else None,
+        "pickups_from_clears": g["clear_pickups"],
+        "vanilla_pickups_for_these_clears": round(c * VANILLA_PICKUPS_PER_CLEAR, 1),
+        "bait_pickups_placed": g["bait_pickups"],
+        "luck_given": g["luck"],
+        "tinted_rocks_added": g["tinted_rocks"],
+        "chests_given": g["chests"],
+    }
+
+
+def _verdict(floor: dict[str, int], run: dict[str, int]) -> str:
+    """Plain-language read of the tallies, so the model doesn't have to do the arithmetic."""
+    # Every placed pickup and added tinted rock (loot inside) is on top of what vanilla drops.
+    given = floor["clear_pickups"] + floor["bait_pickups"] + floor["tinted_rocks"]
+    excess = given - floor["clears"] * VANILLA_PICKUPS_PER_CLEAR
+    if excess >= 3:
+        out = f"this floor: {excess:.0f} pickups over vanilla - let the next clears drop nothing"
+    elif excess >= 1:
+        out = "this floor: above vanilla - hold back"
+    elif excess <= -2:
+        out = "this floor: below vanilla - room for a deliberate gift"
+    else:
+        out = "this floor: about vanilla"
+    if run["luck"] >= 2:
+        out += f"; run: {run['luck']} luck given already (vanilla ~1 a run) - no more lucky pennies"
+    return out
 
 
 def _norm(text: str) -> str:

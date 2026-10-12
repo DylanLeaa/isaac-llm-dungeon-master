@@ -30,14 +30,14 @@ ENEMIES = {
 # Reward names the mod knows how to spawn (see mod dm/apply.lua REWARDS table).
 REWARDS = {
     "penny": "1 coin", "double_penny": "2 coins", "nickel": "5 coins", "dime": "10 coins",
-    "lucky_penny": "coin +1 luck", "sticky_nickel": "nickel stuck to the floor (needs a bomb)",
+    "lucky_penny": "1 coin AND +1 luck for the rest of the run (a stat up, not a coin)", "sticky_nickel": "nickel stuck to the floor (needs a bomb)",
     "bomb": "1 bomb", "double_bomb": "2 bombs", "golden_bomb": "infinite bombs for the floor",
     "troll_bomb": "LIVE bomb that explodes ~2s after spawning",
     "key": "1 key", "double_key": "2 keys", "golden_key": "infinite keys for the floor",
     "charged_key": "key + active charge",
     "red_heart": "full red heart", "half_heart": "half red heart", "soul_heart": "soul heart",
     "black_heart": "black heart", "eternal_heart": "eternal heart",
-    "chest": "brown chest", "locked_chest": "golden chest (needs a key)",
+    "chest": "brown chest (1-3 pickups)", "locked_chest": "golden chest (needs a key; can hold a pedestal item)",
     "red_chest": "red chest (gamble)", "spiked_chest": "spiked chest (hurts)",
     "mimic_chest": "chest that is secretly a trap",
     "grab_bag": "sack of random pickups",
@@ -46,6 +46,12 @@ REWARDS = {
     "trinket": "the next trinket in your consumables plan", "battery": "lil battery",
 }
 LOW_VALUE = {"penny", "half_heart", "pill"}
+LUCK = {"lucky_penny": 1}                   # permanent luck each reward gives
+CHESTS = {"chest", "locked_chest", "red_chest", "spiked_chest", "mimic_chest"}
+
+# Vanilla room clears, for the generosity ledger (matches the mod's VANILLA_PER_CLEAR).
+VANILLA_DROP_RATE = 0.40                    # share of normal room clears that drop anything
+VANILLA_PICKUPS_PER_CLEAR = 0.5             # pickups per clear, empty clears included
 TRAPS = {"troll_bomb", "mimic_chest", "spiked_chest", "sticky_nickel"}
 KEYS = {"key", "double_key", "golden_key", "charged_key"}
 BOMBS = {"bomb", "double_bomb", "golden_bomb"}
