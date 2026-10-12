@@ -2,6 +2,8 @@
 
     python tests/live_smoke.py [--cruelty 8] [--planners]
 
+--backend claude-code sends the same calls through your local Claude Code (`claude -p`) instead.
+
 --planners first writes a real run narrative (Opus 5.5) and floor brief (Sonnet 5.5) and
 gives them to the DM, so the decisions show whether Haiku follows the campaign.
 
@@ -16,6 +18,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+from claude_code import ClaudeCodeDM, ClaudeCodePlanner  # noqa: E402
 from dm_agent import OpenRouterDM  # noqa: E402
 from memory import RunMemory  # noqa: E402
 from planners import OpenRouterPlanner, campaign_text  # noqa: E402
@@ -46,8 +49,7 @@ CASES = [
 ]
 
 
-async def plan(dm: OpenRouterDM, cruelty: int, digest: dict) -> None:
-    planner = OpenRouterPlanner()
+async def plan(dm, planner, cruelty: int, digest: dict) -> None:
     t0 = time.perf_counter()
     narrative, u = await planner.narrative(STATE, cruelty)
     print(f"\n== narrative [{planner.narrative_model}]  ({time.perf_counter() - t0:.1f} s, "
@@ -59,11 +61,15 @@ async def plan(dm: OpenRouterDM, cruelty: int, digest: dict) -> None:
     dm.set_campaign(campaign_text(narrative, brief, STATE["level"]["name"]))
 
 
-async def main(cruelty: int, planners: bool) -> None:
-    dm, mem = OpenRouterDM(cruelty), RunMemory()
+async def main(cruelty: int, planners: bool, backend: str) -> None:
+    if backend == "claude-code":
+        dm, planner = ClaudeCodeDM(cruelty), ClaudeCodePlanner()
+    else:
+        dm, planner = OpenRouterDM(cruelty), OpenRouterPlanner()
+    mem = RunMemory()
     mem.events.extend(["cleared room 84 in 9s, took 1 hits", "clear reward: 1x penny"])
     if planners:
-        await plan(dm, cruelty, mem.digest())
+        await plan(dm, planner, cruelty, mem.digest())
     for kind, ctx in CASES:
         t0 = time.perf_counter()
         raw = await dm.decide(kind, STATE, ctx, mem.digest())
@@ -78,5 +84,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--cruelty", type=int, default=7)
     ap.add_argument("--planners", action="store_true", help="also run the Opus narrative + Sonnet floor brief")
+    ap.add_argument("--backend", choices=["openrouter", "claude-code"], default="openrouter")
     args = ap.parse_args()
-    asyncio.run(main(args.cruelty, args.planners))
+    asyncio.run(main(args.cruelty, args.planners, args.backend))

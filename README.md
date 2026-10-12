@@ -83,8 +83,17 @@ python server.py --cruelty 6              # TCP on 127.0.0.1:7337, model anthrop
 python server.py --mock                   # offline stand-in, no key needed
 python server.py --no-planners            # Haiku only: no Opus narrative / Sonnet floor briefs
 python server.py --narrative-model anthropic/claude-opus-5.5 --floor-model anthropic/claude-sonnet-5.5   # default is both sonnet
+python server.py --backend claude-code    # same DM/planners through your local Claude Code (claude -p), no OpenRouter key
 
 ```
+`--backend claude-code` (or `LLMDM_BACKEND=claude-code`) runs every Claude call as a headless
+`claude -p` process: no tools, settings or MCP servers, and our system prompt in place of Claude
+Code's. It bills however Claude Code is signed in (subscription or API key). The defaults are
+`claude-haiku-5-5` for the DM and `claude-sonnet-5-5` for the planners, and `--model` and the
+planner flags take Claude model IDs. The re-ask gate isn't a Claude model, so it stays on OpenRouter
+when `OPENROUTER_API_KEY` is set and is off otherwise. Each call starts a fresh process, so
+decisions take about 9–19 s instead of a few seconds. Use `--claude-bin` if `claude` isn't on PATH.
+`python tests/live_smoke.py --backend claude-code` checks it.
 The console logs every decision with its latency, intent and taunt, and prints the run
 narrative and each floor brief in full. It's fun on a second monitor. The planners add roughly
 $0.05 per run (Opus) and $0.02–0.03 per floor (Sonnet).
