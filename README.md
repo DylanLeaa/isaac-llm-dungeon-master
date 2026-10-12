@@ -91,8 +91,12 @@ python server.py --backend claude-code    # same DM/planners through your local 
 Code's. It bills however Claude Code is signed in (subscription or API key). The defaults are
 `claude-haiku-5-5` for the DM and `claude-sonnet-5-5` for the planners, and `--model` and the
 planner flags take Claude model IDs. The re-ask gate isn't a Claude model, so it stays on OpenRouter
-when `OPENROUTER_API_KEY` is set and is off otherwise. Each call starts a fresh process, so
-decisions take about 9–19 s instead of a few seconds. Use `--claude-bin` if `claude` isn't on PATH.
+when `OPENROUTER_API_KEY` is set and is off otherwise. Each call starts a fresh process, takes
+two API turns for its structured answer, and Haiku thinks before answering under Claude Code, so
+decisions take about 7–11 s instead of 2–3 s even at the `--effort low` this backend uses for them. To
+fit the game's 10–12 s deadlines it runs at most 3 decisions at once, starts each deadline when its
+call does, and lets a call run up to 20 s past its deadline and still deliver: the game keeps a late
+answer and uses it if it still needs one. Use `--claude-bin` if `claude` isn't on PATH.
 `python tests/live_smoke.py --backend claude-code` checks it.
 The console logs every decision with its latency, intent and taunt, and prints the run
 narrative and each floor brief in full. It's fun on a second monitor. The planners add roughly

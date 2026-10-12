@@ -1,5 +1,6 @@
 """System prompt for the trolling Dungeon Master."""
 from catalog import CARDS, CHAMPION_COLORS, CURSES, ENEMIES, LAYOUT_PICKUP_MODES, PILLS, REWARDS
+from isaac_knowledge import ISAAC_KNOWLEDGE
 
 
 def _bullets(d: dict, fmt) -> str:
@@ -107,6 +108,8 @@ RULES THE ENGINE ENFORCES (don't fight them)
 
 {_ECONOMY}
 
+{ISAAC_KNOWLEDGE}
+
 THE CAMPAIGN
 Two planners work above you. A showrunner wrote this run's narrative once, at the start;
 a floor strategist writes a brief at the start of every floor. Both appear in the CAMPAIGN
@@ -162,6 +165,8 @@ CRUELTY SETTING: {cruelty}/10. 0 = mischievous but generous, 10 = merciless (sti
 
 {_ECONOMY}
 
+{ISAAC_KNOWLEDGE}
+
 {_menus()}
 
 YOUR TASK
@@ -192,6 +197,8 @@ CRUELTY SETTING: {cruelty}/10. 0 = mischievous but generous, 10 = merciless (sti
 {_LEVERS}
 
 {_ECONOMY}
+
+{ISAAC_KNOWLEDGE}
 
 {_menus()}
 

@@ -23,6 +23,12 @@ from schemas import TOOLS
 
 CLAUDE_CODE_DM_MODEL = "claude-haiku-5-5"
 CLAUDE_CODE_PLANNER_MODEL = "claude-sonnet-5-5"
+# Haiku thinks by default under Claude Code (~1K hidden output tokens a decision); low effort roughly halves that.
+CLAUDE_CODE_DM_EFFORT = "low"
+# Each call is a whole claude.exe; a burst of six slows every one of them past its deadline.
+CLAUDE_CODE_CONCURRENCY = 3
+# How long a decision may run past its deadline and still be delivered (the game keeps late answers).
+CLAUDE_CODE_LATE_GRACE_S = 20.0
 
 _PROMPT_DIR = Path(tempfile.gettempdir()) / "llmdm_claude_code"
 
@@ -63,9 +69,10 @@ def _usage(data: dict) -> dict:
 class ClaudeCodeRunner:
     """Runs one headless Claude Code completion per call."""
 
-    def __init__(self, claude_bin: str | None = None, timeout: float = 60.0) -> None:
+    def __init__(self, claude_bin: str | None = None, timeout: float = 60.0, effort: str | None = None) -> None:
         self.bin = find_claude(claude_bin)
         self.timeout = timeout
+        self.effort = effort
 
     async def complete(self, model: str, system: str, user: str, schema: dict | None = None,
                        timeout: float | None = None) -> tuple[Any, dict]:
@@ -74,6 +81,8 @@ class ClaudeCodeRunner:
                 "--system-prompt-file", _prompt_file(system),
                 "--tools", "", "--setting-sources", "", "--strict-mcp-config",
                 "--no-session-persistence", "--disable-slash-commands"]
+        if self.effort:
+            argv += ["--effort", self.effort]
         if schema is not None:
             argv += ["--json-schema", json.dumps(schema, separators=(",", ":"))]
         record = {"model": model, "provider": "claude-code", "system": [system], "user": user}
@@ -112,8 +121,8 @@ class ClaudeCodeDM:
     """The DM through Claude Code. Same persona, campaign and tool schemas as OpenRouterDM."""
 
     def __init__(self, cruelty: int, model: str = CLAUDE_CODE_DM_MODEL, claude_bin: str | None = None,
-                 timeout: float = 60.0) -> None:
-        self.runner = ClaudeCodeRunner(claude_bin, timeout)
+                 timeout: float = 60.0, effort: str | None = CLAUDE_CODE_DM_EFFORT) -> None:
+        self.runner = ClaudeCodeRunner(claude_bin, timeout, effort)
         self.model = model
         self.campaign = ""
         self.set_cruelty(cruelty)
