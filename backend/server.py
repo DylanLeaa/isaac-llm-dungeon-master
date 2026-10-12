@@ -23,6 +23,7 @@ from typing import Awaitable, Callable
 
 import epilogue
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
+from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
 from memory import RunMemory
 from planners import FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, Campaign, MockPlanner, OpenRouterPlanner
 from receipt import Receipt
@@ -40,8 +41,10 @@ class Coordinator:
     """Routes requests to the DM, enforces latest-wins per key, applies guardrails."""
 
     def __init__(self, dm, cruelty: int, planner=None, max_concurrency: int = 6,
-                 receipt: Receipt | None = None, epitaph: bool = True) -> None:
+                 receipt: Receipt | None = None, epitaph: bool = True, gate=None) -> None:
         self.dm = dm
+        self.gate = gate                          # fast model that vetoes re-asks the DM would answer the same
+        self.last_req: dict[str, dict] = {}       # key -> what the issued answer was written against
         self.epitaph = epitaph and hasattr(dm, "epitaph")
         self.cruelty = self.default_cruelty = cruelty
         self.memory = RunMemory()
@@ -64,10 +67,13 @@ class Coordinator:
         """Log how many answers were requested, paid for, and actually used, per kind."""
         if not self.stats:
             return
-        cols = ("req", "ok", "applied", "replaced", "superseded", "timeout", "error", "fallback")
+        cols = ("req", "ok", "applied", "replaced", "reused", "superseded", "timeout", "error", "fallback")
         log.info("summary %-11s %s", "kind", " ".join(f"{c:>10}" for c in cols))
-        for kind in sorted(self.stats):
+        for kind in sorted(k for k in self.stats if k != "gate"):
             log.info("        %-11s %s", kind, " ".join(f"{self.stats[kind][c]:>10}" for c in cols))
+        g = self.stats.get("gate")
+        if g:
+            log.info("        gate        keep=%d (DM call saved) reask=%d error=%d", g["keep"], g["reask"], g["error"])
         u = self.usage
         if u["calls"]:
             log.info("        tokens in=%d (cached %d, %.0f%%) out=%d  cost=$%.4f over %d calls",
@@ -83,6 +89,7 @@ class Coordinator:
                 self.campaign.reset()
                 self.receipt.start_run(msg.get("run"), fresh=bool(msg.get("new_run")))
                 self.receipt_seq.clear()
+                self.last_req.clear()
                 if self.receipt.path:
                     log.info("receipt -> %s", self.receipt.path)
             self._set_cruelty(msg.get("cruelty"))
@@ -238,6 +245,7 @@ class Coordinator:
         key, rid, kind = str(msg["key"]), int(msg["id"]), msg["kind"]
         state, ctx = msg.get("state") or {}, msg.get("ctx") or {}
         prev = self.memory.previous(key)
+        asked_ctx = ctx                           # before the previous answer is mixed in: this is what the gate diffs
         if prev:                                  # a re-ask replaces this answer; show it so the model restates it
             ctx = {**ctx, "your_previous_answer": _compact(prev)}
         deadline = max(MIN_DEADLINE_S, min(MAX_DEADLINE_S, float(msg.get("deadline_ms", 4000)) / 1000))
@@ -250,8 +258,12 @@ class Coordinator:
         raw: dict = {}
         call = None
         try:
+            if prev and await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
+                await send({**base, "ok": True, "ms": _ms(t0), "decision": prev})
+                return
             async with self.sem:
-                raw = await asyncio.wait_for(self.dm.decide(kind, state, ctx, digest), timeout=deadline)
+                raw = await asyncio.wait_for(self.dm.decide(kind, state, ctx, digest),
+                                             timeout=max(MIN_DEADLINE_S, deadline - (time.perf_counter() - t0)))
             usage = raw.pop("_usage", None)
             call = raw.pop("_call", None)
             decision = clamp(kind, raw, state, ctx, self.cruelty, self.memory.counters)
@@ -279,6 +291,8 @@ class Coordinator:
             self.stats[kind]["replaced"] += 1    # paid for an answer the game never used
             self._push_receipt(self.receipt.update(old_seq, "replaced"))
         self.receipt_seq[key] = self._record(kind, "ok", ms=ms, llm=call, raw=raw, decision=decision, **rec)
+        self.last_req[key] = {"state": state, "ctx": asked_ctx, "events": digest["recent_events"],
+                              "campaign": getattr(self.dm, "campaign", "")}
         tok = ""
         if usage:
             self.usage.update({**usage, "calls": 1})
@@ -290,6 +304,46 @@ class Coordinator:
         if decision.get("guardrails"):
             log.info("%28s guardrails: %s", "", "; ".join(decision["guardrails"]))
         await send({**base, "ok": True, "ms": ms, "decision": decision})
+
+
+    async def _gate_keeps(self, kind: str, key: str, state: dict, ctx: dict, digest: dict, prev: dict,
+                          t0: float) -> bool:
+        """Ask the fast gate whether the answer already issued for `key` still fits. True = reuse it.
+        Fails open: no gate, no earlier request to compare, a gate error or an unreadable reply all re-ask."""
+        last = self.last_req.get(key)
+        if self.gate is None or last is None:
+            return False
+        campaign_changed = last["campaign"] != getattr(self.dm, "campaign", "")
+        changes = diff({"state": last["state"], "ctx": last["ctx"]}, {"state": state, "ctx": ctx})
+        fresh = new_events(last["events"], digest["recent_events"])
+        if fresh:
+            changes["new_events"] = fresh[-6:]
+        call = None
+        try:
+            if not changes and not campaign_changed:
+                reask, why = False, "nothing changed"     # no model needed to see that
+            elif campaign_changed:
+                reask, why = True, "campaign changed"     # a new brief is the reason to think again
+            else:
+                reask, why, call = await self.gate.should_reask(kind, _compact(prev), changes, campaign_changed,
+                                                                plan=self.campaign.brief)
+        except Exception as e:                    # noqa: BLE001 - the gate is an optimisation, never a blocker
+            self.stats["gate"]["error"] += 1
+            log.warning("%-11s %-14s gate failed (%s: %s) -> re-ask", kind, key, type(e).__name__, e)
+            self._record("gate", "error", ms=_ms(t0), error=f"{type(e).__name__}: {e}",
+                         llm=getattr(e, "call", None), key=key)
+            return False
+        if call and call.get("usage"):
+            self.usage.update({**call["usage"], "calls": 1})
+        self.stats["gate"]["reask" if reask else "keep"] += 1
+        if reask:
+            self._record("gate", "reask", ms=_ms(t0), llm=call, key=key, result=why)
+            log.info("%-11s %-14s gate: re-ask (%s)", kind, key, why)
+            return False
+        self.stats[kind]["reused"] += 1
+        self._record("gate", "reused", ms=_ms(t0), llm=call, key=key, result=why)
+        log.info("%-11s %-14s gate: keep (%s) -> reused answer, %d change(s) ignored", kind, key, why, len(changes))
+        return True
 
 
 def _ms(t0: float) -> int:
@@ -396,6 +450,11 @@ def main() -> None:
                     help="OpenRouter model that writes the run narrative (once per run)")
     ap.add_argument("--floor-model", default=os.environ.get("LLMDM_FLOOR_MODEL", FLOOR_DEFAULT_MODEL),
                     help="OpenRouter model that writes the floor brief (once per floor)")
+    ap.add_argument("--gate-model", default=os.environ.get("LLMDM_GATE_MODEL", GATE_DEFAULT_MODEL),
+                    help="small OpenRouter decisions model that decides whether a re-asked decision needs a new DM call")
+    ap.add_argument("--gate-threshold", type=float, default=GATE_THRESHOLD,
+                    help="re-ask the DM when the gate's P(new answer needed) is at least this (lower = more re-asks)")
+    ap.add_argument("--no-gate", action="store_true", help="always re-ask the DM (no fast gate)")
     ap.add_argument("--no-planners", action="store_true", help="no narrative / floor brief: the DM plays solo")
     ap.add_argument("--cruelty", type=int, default=6, help="0 (generous) .. 10 (merciless)")
     ap.add_argument("--mock", action="store_true", help="use the offline rule-based DM")
@@ -414,18 +473,22 @@ def main() -> None:
     if args.mock:
         dm = MockDM(args.cruelty, latency=tuple(args.mock_latency))
         planner = None if args.no_planners else MockPlanner()
+        gate = None if args.no_gate else MockGate()
         log.info("Dungeon Master: MOCK (offline)")
     else:
         if not os.environ.get("OPENROUTER_API_KEY"):
             raise SystemExit("Set OPENROUTER_API_KEY (or run with --mock).")
         dm = OpenRouterDM(args.cruelty, model=args.model)
         planner = None if args.no_planners else OpenRouterPlanner(args.narrative_model, args.floor_model)
+        gate = None if args.no_gate else OpenRouterGate(args.gate_model, args.gate_threshold)
         log.info("Dungeon Master: %s via OpenRouter  cruelty=%d", args.model, args.cruelty)
+    if gate:
+        log.info("Re-ask gate: %s", gate.model)
     if planner:
         log.info("Planners: narrative=%s  floor brief=%s", planner.narrative_model, planner.floor_model)
 
     coord = Coordinator(dm, args.cruelty, planner, receipt=Receipt(None if args.no_receipts else args.receipts),
-                        epitaph=not args.no_epitaph)
+                        epitaph=not args.no_epitaph, gate=gate)
 
     async def run() -> None:
         if args.bridge == "tcp":

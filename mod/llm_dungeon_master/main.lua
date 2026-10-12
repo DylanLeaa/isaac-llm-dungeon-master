@@ -50,6 +50,14 @@ Bridge.setReadyHandler(Loading.handle)
 Bridge.init(cfg, "menu")
 
 local runSeed
+-- POST_NEW_LEVEL / POST_NEW_ROOM fire for a run's first room before POST_GAME_STARTED, while the
+-- scheduler still holds the last run's floor counter: answering them would ask the DM about this
+-- floor under a stale key, then again after the reset. Ignore them until the run has started;
+-- game_started replays both. Frame 0 is the start of a fresh game (also a restart, which skips
+-- PRE_GAME_EXIT); later floors and reseeds happen past it.
+local started = false
+local function live() return started and game:GetFrameCount() > 0 end
+
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function(_, continued)
   Settings.registerMenu()   -- in case Mod Config Menu loaded after this mod
   local seed = game:GetSeeds():GetStartSeedString()
@@ -72,13 +80,14 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function
     local stats = saved.run_stats            -- so the stats screen counts the whole run
     if type(stats) == "table" and stats.seed == seed then State.restoreRun(stats) end
   end
-  -- POST_NEW_ROOM / POST_NEW_LEVEL already fired for the first room; replay them.
+  -- POST_NEW_ROOM / POST_NEW_LEVEL already fired for the first room (and were ignored); replay them.
+  started = true
   Sched.onNewRoom()
   Sched.onNewLevel()
 end))
 
-mod:AddCallback(ModCallbacks.MC_POST_NEW_ROOM, safe("new_room", function() Sched.onNewRoom() end))
-mod:AddCallback(ModCallbacks.MC_POST_NEW_LEVEL, safe("new_level", function() Sched.onNewLevel() end))
+mod:AddCallback(ModCallbacks.MC_POST_NEW_ROOM, safe("new_room", function() if live() then Sched.onNewRoom() end end))
+mod:AddCallback(ModCallbacks.MC_POST_NEW_LEVEL, safe("new_level", function() if live() then Sched.onNewLevel() end end))
 
 local lastQueued
 mod:AddCallback(ModCallbacks.MC_POST_UPDATE, safe("update", function()
@@ -101,7 +110,7 @@ mod:AddCallback(ModCallbacks.MC_POST_RENDER, safe("render", function()
   Loading.render()
   Taunt.render()
   Death.render()
-  if cfg.SHOW_DEBUG_HUD then
+  if cfg.SHOW_DEBUG_HUD and not Death.active() then
     Taunt.renderDebug(Bridge.status(), math.floor(Bridge.latencyAvg()), math.floor(Bridge.latencyP90()),
       Sched.debugCounts())
   end
@@ -156,6 +165,7 @@ end))
 
 -- Quitting to the menu mid-run: keep the run's totals so a continue picks them up.
 mod:AddCallback(ModCallbacks.MC_PRE_GAME_EXIT, safe("game_exit", function(_, shouldSave)
+  started = false
   if not (shouldSave and runSeed) then return end
   local stats = State.saveRun()
   stats.seed = runSeed

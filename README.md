@@ -82,7 +82,7 @@ export OPENROUTER_API_KEY=sk-or-...       # PowerShell: $env:OPENROUTER_API_KEY=
 python server.py --cruelty 6              # TCP on 127.0.0.1:7337, model anthropic/claude-haiku-5.5 via OpenRouter
 python server.py --mock                   # offline stand-in, no key needed
 python server.py --no-planners            # Haiku only: no Opus narrative / Sonnet floor briefs
-python server.py --narrative-model anthropic/claude-opus-5.5 --floor-model anthropic/claude-sonnet-5.5   # the defaults
+python server.py --narrative-model anthropic/claude-opus-5.5 --floor-model anthropic/claude-sonnet-5.5   # default is both sonnet
 
 ```
 The console logs every decision with its latency, intent and taunt, and prints the run
@@ -131,9 +131,13 @@ finish reason, raw response message, tokens and cost.
 
 ## The after-death stats screen
 
-When a run ends in death, the game-over screen gets a stats column down each side of the death note
-(the note is drawn after every mod callback, so nothing can sit on top of it; if the columns still
-run under the note, raise `PAPER_W` at the top of `dm/deathscreen.lua`):
+When a run ends in death, the game-over screen gets the run's stats down either side of the death
+note. The note (and the seed, EXIT and RESTART notes around it) is drawn after every mod callback,
+so nothing can sit on top of it, and the strips beside it hold about eight lines a side. So the
+screen is two pages that take turns every nine seconds (the map button turns the page): the stats,
+then the DM's epitaph and its con. The note positions are measured constants at the top of
+`dm/deathscreen.lua`; if text runs under a note, adjust `PAPER_W`, the `SEED_*` box or `EXIT_Y` /
+`RESTART_Y`.
 
 - **You**: floor reached, run time, rooms cleared, damage taken, items, pills eaten and
   what hit you last. These come from the mod, so they appear at once, even with the backend offline.
@@ -144,7 +148,7 @@ run under the note, raise `PAPER_W` at the top of `dm/deathscreen.lua`):
   (its private `scheme`, revealed at last) and an **epitaph** Haiku writes for the run. The
   epitaph arrives a second or two after the rest (`--no-epitaph` turns it off).
 
-The map button hides and shows the screen; `SHOW_DEATH_SCREEN = false` in `dm/config.lua` turns
+`SHOW_DEATH_SCREEN = false` in `dm/config.lua` turns
 the overlay off. The last finished run, including a victory, is kept in the save file under
 Mod Config Menu → **DM Settings → Last run**. The backend also logs it and adds `run_summary` and
 `epitaph` entries to the receipt.
