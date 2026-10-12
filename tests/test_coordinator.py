@@ -304,3 +304,32 @@ def test_prepare_reports_a_failed_narrative_and_ignores_an_abandoned_run():
                                             {"t": "hello", "session": "S", "run": "R2", "new_run": True}])
     asyncio.run(go())
     assert not [m for m in sent if m["t"] == "ready"]            # the old run's wait is dropped
+
+
+def test_generosity_ledger_counts_applied_gifts_against_vanilla():
+    from memory import RunMemory
+
+    m = RunMemory()
+    m.note_issued("clear:1:1", "room_clear", {"rewards": [{"reward": "lucky_penny", "count": 1},
+                                                          {"reward": "penny", "count": 2}]})
+    m.note_issued("clear:1:2", "room_clear", {"rewards": []})
+    m.note_issued("layout:1:3", "room_layout", {"bonus_pickups": ["lucky_penny", "locked_chest"],
+                                                "tinted_rocks": 1})
+    m.note_issued("clear:1:4", "room_clear", {"rewards": [{"reward": "dime", "count": 1}]})
+    for key in ("clear:1:1", "clear:1:2", "layout:1:3"):                 # clear:1:4 never used
+        m.on_applied(key)
+
+    g = m.digest()["generosity"]
+    assert g["this_floor"] == {"room_clears": 2, "drop_rate": 0.5, "pickups_from_clears": 3,
+                               "vanilla_pickups_for_these_clears": 1.0, "bait_pickups_placed": 2,
+                               "luck_given": 2, "tinted_rocks_added": 1, "chests_given": 1}
+    assert "5 pickups over vanilla" in g["verdict"] and "no more lucky pennies" in g["verdict"]
+
+    # A new floor starts a fresh tally; last floor and the run keep the history.
+    m.on_game_event("new_level", {"stage": 2, "name": "Basement II"})
+    g = m.digest()["generosity"]
+    assert g["this_floor"]["room_clears"] == 0 and g["last_floor"]["luck_given"] == 2
+    assert g["run"]["luck_given"] == 2 and g["verdict"].startswith("this floor: about vanilla")
+
+    m.reset("R2")
+    assert m.digest()["generosity"]["run"]["luck_given"] == 0

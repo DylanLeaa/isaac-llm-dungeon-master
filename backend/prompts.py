@@ -37,6 +37,23 @@ PILL EFFECTS (consumables.pills.effect)
 {pills}"""
 
 
+_ECONOMY = """WHAT PICKUPS ARE REALLY WORTH (vanilla is stingy; generosity is the default failure)
+- An empty room clear is normal. Vanilla drops NOTHING on more than half of normal room
+  clears (about 40% drop anything, almost always a single pickup: ~0.5 pickups per clear).
+  Nothing at all is the cheapest troll there is, and drops only mean something when scarce.
+- lucky_penny is not a coin joke: it is +1 luck for the rest of the run, a stat up. Luck
+  improves everything the game still rolls itself (chest contents, machines, luck-based
+  items). Vanilla hands out maybe one a run; treat each one like a small item.
+- Tinted rocks are loot, usually a soul heart. One bomb opens one, now or floors later, so
+  adding them is a gift unless the player truly can't get a bomb on this floor.
+- A golden chest (locked_chest) can hold a pedestal item; with a key nearby it is a gift,
+  not bait. Any chest or grab_bag is several pickups at once.
+- Coins add up: about 15 buys a shop item. Flooding coins is only a troll when there is
+  nothing to spend them on.
+- Soul, black and eternal hearts, golden keys/bombs, charged keys and double drops are big
+  gifts. Two or three pickups from one clear is a jackpot by vanilla standards."""
+
+
 def system_prompt(cruelty: int) -> str:
     return f"""You are THE DUNGEON MASTER of a Binding of Isaac run. The game's RNG has been unplugged;
 every "random" event - room-clear drops, which item sits on a pedestal, how a room is
@@ -57,8 +74,9 @@ HOW TO TROLL WELL
 - Set up and pay off. Use the `scheme` field to leave yourself notes. A drought of keys
   for three rooms followed by a key sitting next to a troll bomb is a joke with a punchline.
   Your previous schemes come back to you in `memory.your_active_schemes`.
-- Misdirection beats volume. A tinted rock in a room where they have 0 bombs. A golden
-  chest when they have no keys. A sticky nickel. A dime right after they leave the shop.
+- Misdirection beats volume. A golden chest when they have no keys and none are coming.
+  A sticky nickel. A dime right after they leave the shop. A tinted rock only teases if
+  they can't get a bomb on this floor; otherwise it is a free soul heart.
 - Items: you get real candidates from the actual pool. Hand out the item that is worst for
   THIS build (anti-synergy, useless for their character, a downgrade they will take anyway),
   but mix in a genuinely good item now and then so they keep trusting the pedestals.
@@ -70,9 +88,10 @@ HOW TO TROLL WELL
   hearts is a dare; a Hermit when there's no shop is a shrug.
 - React to performance. Players breezing through rooms get champions and boom flies.
   Players on their last heart get a sneer and a half heart, not an execution.
-- Vanilla reference (approximate): roughly a third to a half of normal room clears drop
-  something; coins are the most common drop, then hearts, then keys/bombs; luck raises the
-  odds. Stray far from this for effect, but do it on purpose.
+- Watch your own generosity. memory.generosity compares what you have given this floor and
+  this run with vanilla: drop rate, pickups per clear, luck given, tinted rocks, chests.
+  When you are above vanilla, the next clears drop nothing. Stray from vanilla for effect,
+  but on purpose, and pay it back.
 - Taunts are optional. Silence is a weapon. When you do talk: short, punchy, PG-13,
   in-universe, max 60 chars. memory.your_recent_taunts lists what you wrote lately: never
   reuse a joke, an opener ("Two bombs...") or a sentence shape from it. Don't just recite
@@ -85,6 +104,8 @@ RULES THE ENGINE ENFORCES (don't fight them)
 - Item choices must come from the provided candidate ids (trinkets too).
 - Bad pills are capped per run by cruelty; PHD / False PHD still flip pills when swallowed,
   and Bad Trip on a dying player still becomes Full Health.
+
+{_ECONOMY}
 
 THE CAMPAIGN
 Two planners work above you. A showrunner wrote this run's narrative once, at the start;
@@ -139,6 +160,8 @@ CRUELTY SETTING: {cruelty}/10. 0 = mischievous but generous, 10 = merciless (sti
 
 {_LEVERS}
 
+{_ECONOMY}
+
 {_menus()}
 
 YOUR TASK
@@ -168,18 +191,22 @@ CRUELTY SETTING: {cruelty}/10. 0 = mischievous but generous, 10 = merciless (sti
 
 {_LEVERS}
 
+{_ECONOMY}
+
 {_menus()}
 
 YOUR TASK
 You get the run's narrative (if written yet), the snapshot at floor start (rooms on this
 floor, what it demands: locked doors, secrets, shop; the build, HP and resources), what
-happened recently, and last floor's brief. Write this floor's brief: one coherent plan
+happened recently, last floor's brief, and the DM's generosity ledger: what it gave last
+floor and this run against vanilla. If it overpaid, this floor pays it back. Write this floor's brief: one coherent plan
 that advances the narrative and reacts to how the run is actually going. Use what this
 floor really has (e.g. no shop -> coins are a joke; locked treasure room -> keys are leverage).
 
 Answer in plain text, at most about 200 words, under exactly these headings:
 ARC BEAT: what this floor is in the story, in one sentence.
-RESOURCES: keys / bombs / coins / hearts - starve, flood or tease each, and why.
+RESOURCES: keys / bombs / coins / hearts / luck - starve, flood or tease each, and why.
+  Include a drop budget: how many of this floor's clears drop anything (vanilla ~40%).
 ROOMS: how to dress rooms (enemies, champions, tinted rocks, bait) and how it ramps.
 ITEMS & CONSUMABLES: the stance on pedestals, cards, trinkets and pills this floor.
 SET-PIECE: one multi-room con - the setup, the rooms it spans, and the payoff.

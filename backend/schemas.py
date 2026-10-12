@@ -41,7 +41,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                         "required": ["enemy", "count"]},
                     "description": "Only applied in rooms that already have enemies."},
                 "tinted_rocks": {"type": "integer", "minimum": 0, "maximum": 2,
-                                 "description": "Turn this many ordinary rocks into tinted (secret, loot-bearing) rocks."},
+                                 "description": "Turn this many ordinary rocks into tinted rocks. Each one holds loot (usually a soul heart): a gift to anyone who has or will get a bomb."},
                 "hide_tinted_rocks": {"type": "boolean",
                                       "description": "Turn the room's existing tinted rocks back into plain rocks."},
                 "layout_pickups": {"type": "string", "enum": list(LAYOUT_PICKUP_MODES)},
