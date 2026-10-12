@@ -7,6 +7,7 @@ Speaks newline-delimited JSON with the Isaac mod over either
 Run:  python server.py                 # Haiku 5.5 DM + Opus narrative + Sonnet floor briefs, TCP
       python server.py --no-planners  # Haiku alone
       python server.py --mock          # no API key needed
+      python server.py --backend claude-code   # same DM through your local Claude Code (claude -p)
       python server.py --bridge file --bridge-dir "C:/.../The Binding of Isaac Rebirth/llmdm_bridge"
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 import epilogue
+from claude_code import CLAUDE_CODE_DM_MODEL, CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeDM, ClaudeCodePlanner
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
 from memory import RunMemory
@@ -444,12 +446,17 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7337)
     ap.add_argument("--bridge-dir", type=Path, default=Path("llmdm_bridge"))
-    ap.add_argument("--model", default=os.environ.get("LLMDM_MODEL", OPENROUTER_DEFAULT_MODEL),
-                    help="OpenRouter model slug")
-    ap.add_argument("--narrative-model", default=os.environ.get("LLMDM_NARRATIVE_MODEL", NARRATIVE_DEFAULT_MODEL),
-                    help="OpenRouter model that writes the run narrative (once per run)")
-    ap.add_argument("--floor-model", default=os.environ.get("LLMDM_FLOOR_MODEL", FLOOR_DEFAULT_MODEL),
-                    help="OpenRouter model that writes the floor brief (once per floor)")
+    ap.add_argument("--backend", choices=["openrouter", "claude-code"],
+                    default=os.environ.get("LLMDM_BACKEND", "openrouter"),
+                    help="where the Claude calls go: OpenRouter, or your local Claude Code in headless mode")
+    ap.add_argument("--claude-bin", default=None,
+                    help="Claude Code executable for --backend claude-code (default: claude on PATH)")
+    ap.add_argument("--model", default=os.environ.get("LLMDM_MODEL"),
+                    help=f"DM model (default {OPENROUTER_DEFAULT_MODEL} on OpenRouter, {CLAUDE_CODE_DM_MODEL} on Claude Code)")
+    ap.add_argument("--narrative-model", default=os.environ.get("LLMDM_NARRATIVE_MODEL"),
+                    help="model that writes the run narrative (once per run)")
+    ap.add_argument("--floor-model", default=os.environ.get("LLMDM_FLOOR_MODEL"),
+                    help="model that writes the floor brief (once per floor)")
     ap.add_argument("--gate-model", default=os.environ.get("LLMDM_GATE_MODEL", GATE_DEFAULT_MODEL),
                     help="small OpenRouter decisions model that decides whether a re-asked decision needs a new DM call")
     ap.add_argument("--gate-threshold", type=float, default=GATE_THRESHOLD,
@@ -475,13 +482,29 @@ def main() -> None:
         planner = None if args.no_planners else MockPlanner()
         gate = None if args.no_gate else MockGate()
         log.info("Dungeon Master: MOCK (offline)")
+    elif args.backend == "claude-code":
+        model = args.model or CLAUDE_CODE_DM_MODEL
+        dm = ClaudeCodeDM(args.cruelty, model=model, claude_bin=args.claude_bin)
+        planner = None if args.no_planners else ClaudeCodePlanner(
+            args.narrative_model or CLAUDE_CODE_PLANNER_MODEL, args.floor_model or CLAUDE_CODE_PLANNER_MODEL,
+            claude_bin=args.claude_bin)
+        # The gate isn't a Claude model: it stays on OpenRouter, when there's a key for it.
+        gate = None
+        if not args.no_gate:
+            if os.environ.get("OPENROUTER_API_KEY"):
+                gate = OpenRouterGate(args.gate_model, args.gate_threshold)
+            else:
+                log.info("Re-ask gate: off (no OPENROUTER_API_KEY), every re-ask goes to the DM")
+        log.info("Dungeon Master: %s via Claude Code (%s)  cruelty=%d", model, dm.runner.bin, args.cruelty)
     else:
         if not os.environ.get("OPENROUTER_API_KEY"):
-            raise SystemExit("Set OPENROUTER_API_KEY (or run with --mock).")
-        dm = OpenRouterDM(args.cruelty, model=args.model)
-        planner = None if args.no_planners else OpenRouterPlanner(args.narrative_model, args.floor_model)
+            raise SystemExit("Set OPENROUTER_API_KEY (or run with --mock or --backend claude-code).")
+        model = args.model or OPENROUTER_DEFAULT_MODEL
+        dm = OpenRouterDM(args.cruelty, model=model)
+        planner = None if args.no_planners else OpenRouterPlanner(
+            args.narrative_model or NARRATIVE_DEFAULT_MODEL, args.floor_model or FLOOR_DEFAULT_MODEL)
         gate = None if args.no_gate else OpenRouterGate(args.gate_model, args.gate_threshold)
-        log.info("Dungeon Master: %s via OpenRouter  cruelty=%d", args.model, args.cruelty)
+        log.info("Dungeon Master: %s via OpenRouter  cruelty=%d", model, args.cruelty)
     if gate:
         log.info("Re-ask gate: %s", gate.model)
     if planner:
