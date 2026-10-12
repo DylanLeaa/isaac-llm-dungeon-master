@@ -19,7 +19,7 @@ from receipt import plan_excerpt
 
 log = logging.getLogger("llmdm")
 
-NARRATIVE_DEFAULT_MODEL = "anthropic/claude-opus-5.5"
+NARRATIVE_DEFAULT_MODEL = "anthropic/claude-sonnet-5.5"
 FLOOR_DEFAULT_MODEL = "anthropic/claude-sonnet-5.5"
 
 NARRATIVE_WAIT_S = 25.0     # a floor brief waits this long for the run narrative, then goes without
