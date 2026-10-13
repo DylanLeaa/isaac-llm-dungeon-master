@@ -43,7 +43,7 @@ Settings.init(mod, cfg, Bridge, Receipt, Death)
 Bridge.setReceiptHandler(Receipt.handle)
 Death.init(cfg, Bridge, State, Cons, Settings, Receipt.wrap)
 Bridge.setSummaryHandler(Death.handle)
-Loading.init(cfg, Bridge, State, Taunt)
+Loading.init(cfg, Bridge, State, Taunt, Sched)
 Bridge.setReadyHandler(Loading.handle)
 
 -- Connect as soon as the mod loads so the DM is warm by the time a run starts.

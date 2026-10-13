@@ -47,11 +47,14 @@ return {
   -- Characters per line in Mod Config Menu > DM Settings > Receipt. Lower it if lines get cut off.
   RECEIPT_WIDTH = 32,
 
-  -- A new run waits on a loading screen until the Opus narrative is written (Enter skips).
-  -- It gives up on its own: CONNECT if the backend isn't there, TIMEOUT if the narrative never lands.
+  -- Every floor waits on a loading screen until the DM is ready for it (Enter skips): the run
+  -- narrative (first floor), the floor brief, and answers to the floor's opening decisions.
+  -- It gives up on its own: CONNECT if the backend isn't there, TIMEOUT (run start) or
+  -- FLOOR_TIMEOUT (later floors) if the plans never land.
   LOADING_SCREEN = true,
   LOADING_CONNECT_MS = 3000,
   LOADING_TIMEOUT_MS = 90000,
+  LOADING_FLOOR_TIMEOUT_MS = 60000,
 
   SHOW_TAUNTS = true,
   -- After-death stats (yours and the DM's, plus its epitaph) over the game-over screen; the map

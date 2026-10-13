@@ -181,6 +181,59 @@ local function ownedItems(player)
   return list
 end
 
+-- Empty slots say "none" outright: a missing key reads as "unknown", and the models then fill it in
+-- from what the character usually starts with (an Isaac without the D6 still got D6 plans).
+local function maybe(f) local ok, v = pcall(f) if ok then return v end end
+
+local function activeName(p, slot)
+  local id = slot and maybe(function() return p:GetActiveItem(slot) end) or 0
+  return id and id > 0 and (State.itemInfo(id) or {}).name or "none"
+end
+
+local GOLDEN_TRINKET = 32768
+local function trinketNames(p)
+  local out = {}
+  for slot = 0, 1 do
+    local id = math.tointeger(p:GetTrinket(slot)) or 0
+    if id > 0 then
+      local info = State.trinketInfo(id & (GOLDEN_TRINKET - 1))
+      out[#out + 1] = (info and info.name or tostring(id)) .. ((id & GOLDEN_TRINKET) ~= 0 and " (golden)" or "")
+    end
+  end
+  return #out > 0 and table.concat(out, ", ") or "none"
+end
+
+local function pocketName(p)
+  local card = maybe(function() return p:GetCard(0) end) or 0
+  if card > 0 then
+    local c = maybe(function() return itemConfig:GetCard(card) end)
+    return "card: " .. (c and prettyItemName(c.Name) or tostring(card))
+  end
+  local pill = maybe(function() return p:GetPill(0) end) or 0
+  if pill > 0 then return "pill: " .. enumName(PillColor, pill, "^PILL_") end
+  return "none"
+end
+
+--- How much of the item catalogue this save has unlocked (locked items never show up). Tells a
+--- fresh save from a finished one, so the planners don't promise items or chapters it lacks.
+local function saveProgress()
+  if T.save == nil then
+    T.save = false                              -- no IsAvailable on this version: say nothing
+    local total, unlocked = 0, 0
+    local ok = pcall(function()
+      for id = 1, itemConfig:GetCollectibles().Size - 1 do
+        local c = itemConfig:GetCollectible(id)
+        if c then
+          total = total + 1
+          if c:IsAvailable() then unlocked = unlocked + 1 end
+        end
+      end
+    end)
+    if ok and total > 0 then T.save = { items_unlocked = unlocked, items_total = total } end
+  end
+  return T.save or nil
+end
+
 function State.player()
   local p = Isaac.GetPlayer(0)
   local hp = {
@@ -188,9 +241,13 @@ function State.player()
     bone = p:GetBoneHearts(), eternal = p:GetEternalHearts(), golden = p:GetGoldenHearts(),
     broken = p:GetBrokenHearts(), rotten = p:GetRottenHearts(),
   }
-  local active = p:GetActiveItem(ActiveSlot.SLOT_PRIMARY)
+  local ptype = maybe(function() return p:GetPlayerType() end)
+  local tainted                                 -- Tainted characters report the base name
+  if ptype and PlayerType and PlayerType.PLAYER_ISAAC_B then tainted = ptype >= PlayerType.PLAYER_ISAAC_B end
   return {
     character = p:GetName(),
+    player_type = ptype and PlayerType and enumName(PlayerType, ptype, "^PLAYER_") or nil,
+    tainted = tainted,
     hp = hp,
     resources = {
       coins = p:GetNumCoins(), bombs = p:GetNumBombs(), keys = p:GetNumKeys(),
@@ -201,8 +258,10 @@ function State.player()
       range = round(p.TearRange / 40), shot_speed = round(p.ShotSpeed), luck = round(p.Luck),
       flying = p.CanFly,
     },
-    active_item = active > 0 and (State.itemInfo(active) or {}).name or nil,
-    trinkets = { p:GetTrinket(0), p:GetTrinket(1) },
+    active_item = activeName(p, ActiveSlot.SLOT_PRIMARY),
+    pocket_active = ActiveSlot.SLOT_POCKET and activeName(p, ActiveSlot.SLOT_POCKET) or nil,
+    trinkets = trinketNames(p),
+    pocket = pocketName(p),
     items = ownedItems(p),
   }
 end
@@ -281,6 +340,7 @@ function State.snapshot()
     frame = game:GetFrameCount(),
     difficulty = game.Difficulty,
     player = State.player(),
+    save = saveProgress(),
     level = State.level(),
     performance = State.performance(),
   }

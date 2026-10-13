@@ -1,6 +1,8 @@
 """The planners above the DM: a run narrative (Claude Opus 5.5, once per run) and a floor brief
 (Claude Sonnet 5.5, once per floor). Both are written in the background and handed to the DM as
-the CAMPAIGN block of its system prompt; a decision never waits for them.
+the CAMPAIGN block of its system prompt. The narrative never holds up a decision; a decision does
+wait (up to BRIEF_WAIT_S) for its floor's brief, so it isn't written against a brief that is about
+to replace it. The game covers that wait with its per-floor loading screen.
 """
 from __future__ import annotations
 
@@ -23,10 +25,30 @@ NARRATIVE_DEFAULT_MODEL = "anthropic/claude-sonnet-5.5"
 FLOOR_DEFAULT_MODEL = "anthropic/claude-sonnet-5.5"
 
 NARRATIVE_WAIT_S = 25.0     # a floor brief waits this long for the run narrative, then goes without
+BRIEF_WAIT_S = 45.0         # a decision (or the loading screen) waits this long for its floor's brief
 
 
 def _compact_json(obj) -> str:
     return json.dumps(obj, separators=(",", ":"))
+
+
+def loadout(state: dict) -> str:
+    """What the player really holds, as one line above the snapshot. Buried in the JSON, an empty slot
+    loses to what the character usually starts with (an Isaac without the D6 got a D6 narrative)."""
+    p = state.get("player") or {}
+    if not p:
+        return "WHAT THEY HOLD: unknown (no player in the snapshot)"
+    items = p.get("items") if isinstance(p.get("items"), list) else []   # an empty Lua list can arrive as {}
+    who = p.get("character") or "?"
+    if p.get("tainted"):
+        who = f"Tainted {who}"
+    save = state.get("save") or {}
+    progress = (f"; save has {save['items_unlocked']}/{save['items_total']} items unlocked"
+                if save.get("items_total") else "")
+    return (f"WHAT THEY HOLD (the truth; ignore the character's usual loadout): {who}; "
+            f"active item: {p.get('active_item') or 'none'}; pocket active: {p.get('pocket_active') or 'none'}; "
+            f"trinkets: {p.get('trinkets') or 'none'}; pocket: {p.get('pocket') or 'none'}; "
+            f"items: {', '.join(items) or 'none'}{progress}")
 
 
 def floor_signature(state: dict) -> tuple | None:
@@ -85,7 +107,7 @@ class OpenRouterPlanner:
         return text, {**record["usage"], "_call": record}
 
     async def narrative(self, state: dict, cruelty: int) -> tuple[str, dict]:
-        user = "Opening snapshot of the run:\n" + _compact_json(state)
+        user = loadout(state) + "\n\nOpening snapshot of the run:\n" + _compact_json(state)
         return await self._complete(self.narrative_model, narrative_prompt(cruelty), user)
 
     async def floor_brief(self, state: dict, narrative: str | None, digest: dict, prev_brief: str | None,
@@ -94,7 +116,7 @@ class OpenRouterPlanner:
             "RUN NARRATIVE:\n" + (narrative or "(not written yet - set the tone yourself)"),
             "LAST FLOOR'S BRIEF:\n" + (prev_brief or "(none - this is the first floor)"),
             "RECENT EVENTS AND THE DM'S NOTES:\n" + _compact_json(digest),
-            "SNAPSHOT AT FLOOR START:\n" + _compact_json(state),
+            loadout(state) + "\nSNAPSHOT AT FLOOR START:\n" + _compact_json(state),
         ])
         return await self._complete(self.floor_model, floor_prompt(cruelty), user)
 
@@ -139,6 +161,7 @@ class Campaign:
         self.floor_sig: tuple | None = None
         self.floor_name: str | None = None
         self.narrative_task: asyncio.Task | None = None
+        self.brief_task: asyncio.Task | None = None
 
     def reset(self) -> None:
         """New run: forget the plans and drop anything still being written for the old one."""
@@ -164,7 +187,7 @@ class Campaign:
             self.floor_name = (state.get("level") or {}).get("name") or f"stage {sig[0]}"
             prev, self.brief = self.brief, None      # never follow last floor's brief on this one
             self._push()
-            self._spawn(self._write_brief(state, digest, prev, cruelty, self.run_token, sig))
+            self.brief_task = self._spawn(self._write_brief(state, digest, prev, cruelty, self.run_token, sig))
 
     def narrative_waiter(self):
         """Call when the game asks; await the result. It is "ready", "failed" (the DM goes without),
@@ -185,6 +208,27 @@ class Campaign:
         if token != self.run_token:
             return "cancelled"
         return "ready" if self.narrative else "failed"
+
+    async def brief_waiter(self, sig: tuple | None, timeout: float | None = None) -> str:
+        """Wait for the brief of floor `sig` (call `observe` first). Returns "ready", "failed" (the DM
+        improvises this floor), "timeout", "moved" (the game is on another floor now), "cancelled" (a
+        new run started) or "none" (no planner, or no floor to plan)."""
+        if not self.planner or sig is None:
+            return "none"
+        if sig != self.floor_sig:
+            return "moved"
+        task, token = self.brief_task, self.run_token
+        if task is not None and not task.done():
+            # asyncio.wait, not shield: the brief being cancelled (new run) must not look like this
+            # waiter being cancelled; this waiter's own cancellation still propagates.
+            await asyncio.wait({task}, timeout=BRIEF_WAIT_S if timeout is None else timeout)
+            if not task.done():
+                return "timeout"
+        if token != self.run_token or (task is not None and task.cancelled()):
+            return "cancelled"
+        if sig != self.floor_sig:
+            return "moved"
+        return "ready" if self.brief else "failed"
 
     def _spawn(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)

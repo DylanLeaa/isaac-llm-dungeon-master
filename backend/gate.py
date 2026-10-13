@@ -112,12 +112,12 @@ class OpenRouterGate:
 
 
 class MockGate:
-    """Offline stand-in: keep unless a resource crossed zero."""
+    """Offline stand-in: keep unless a resource changed or there are new pill colours to assign."""
 
     model = "mock"
 
     async def should_reask(self, kind: str, previous: dict, changes: dict, campaign_changed: bool,
                            plan: str | None = None) -> tuple[bool, str, dict]:
-        crossed = any(p.startswith("state.player.resources") for p in changes)
+        crossed = any(p.startswith(("state.player.resources", "ctx.pill_colors_to_assign")) for p in changes)
         return crossed, "mock: resource changed" if crossed else "mock: nothing that matters",\
             {"model": "mock", "finish": "stop"}

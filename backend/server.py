@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import heapq
+import itertools
 import json
 import logging
 import os
@@ -28,7 +30,8 @@ from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_C
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
 from memory import RunMemory
-from planners import FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, Campaign, MockPlanner, OpenRouterPlanner
+from planners import (FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, Campaign, MockPlanner, OpenRouterPlanner,
+                      floor_signature)
 from receipt import Receipt
 from schemas import KINDS, clamp
 
@@ -38,6 +41,74 @@ Send = Callable[[dict], Awaitable[None]]
 MAX_DEADLINE_S = 12.0      # never let a single decision hang longer than this (plus any late grace)
 MIN_DEADLINE_S = 0.4
 EPITAPH_TIMEOUT_S = 20.0   # the stats screen shows without it; it only fills in the last line
+
+# Who gets the next free DM slot. A floor's start sends a burst of item rankings and consumables;
+# the room the player is about to walk into (or is about to clear) must not queue behind it.
+URGENT, NEXT_DOOR, BACKGROUND = 0, 1, 2
+
+
+def _priority(kind: str, ctx: dict) -> int:
+    if kind == "room_clear":
+        return URGENT
+    if kind == "room_layout":
+        return NEXT_DOOR
+    if kind == "item_choice" and ctx.get("reason") != "floor start":
+        return NEXT_DOOR
+    return BACKGROUND
+
+
+class PrioritySemaphore:
+    """A semaphore whose waiters get a free slot lowest priority first, then first come first served.
+    `async with sem.slot(priority):`, or plain `async with sem:` for BACKGROUND work."""
+
+    def __init__(self, value: int) -> None:
+        self._value = value
+        self._waiters: list[tuple[int, int, asyncio.Future]] = []
+        self._order = itertools.count()
+
+    def slot(self, priority: int = BACKGROUND) -> "_Slot":
+        return _Slot(self, priority)
+
+    async def __aenter__(self) -> None:
+        await self.acquire(BACKGROUND)
+
+    async def __aexit__(self, *exc) -> None:
+        self.release()
+
+    async def acquire(self, priority: int) -> None:
+        if self._value > 0 and not self._waiters:
+            self._value -= 1
+            return
+        entry = (priority, next(self._order), asyncio.get_running_loop().create_future())
+        heapq.heappush(self._waiters, entry)
+        try:
+            await entry[2]
+        except asyncio.CancelledError:
+            if entry[2].done() and not entry[2].cancelled():
+                self.release()                    # handed a slot just as we were cancelled: pass it on
+            else:
+                self._waiters.remove(entry)
+                heapq.heapify(self._waiters)
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            fut = heapq.heappop(self._waiters)[2]
+            if not fut.done():
+                fut.set_result(None)
+                return
+        self._value += 1
+
+
+class _Slot:
+    def __init__(self, sem: PrioritySemaphore, priority: int) -> None:
+        self.sem, self.priority = sem, priority
+
+    async def __aenter__(self) -> None:
+        await self.sem.acquire(self.priority)
+
+    async def __aexit__(self, *exc) -> None:
+        self.sem.release()
 
 
 class Coordinator:
@@ -59,7 +130,7 @@ class Coordinator:
         self.receipt_seq: dict[str, int] = {}     # key -> receipt entry of the answer the game holds
         self.bg: set[asyncio.Task] = set()
         self.inflight: dict[str, tuple[int, asyncio.Task]] = {}
-        self.sem = asyncio.Semaphore(max_concurrency)
+        self.sem = PrioritySemaphore(max_concurrency)
         # Per decision kind: req, ok, late, superseded, timeout, error, replaced, applied, fallback.
         self.stats: dict[str, Counter] = defaultdict(Counter)
         self.usage = Counter()                    # in / cached / out tokens, cost, calls
@@ -207,21 +278,29 @@ class Coordinator:
 
     # ------------------------------------------------------------------ loading
     def _prepare(self, msg: dict, send: Send) -> None:
-        """The game is on its loading screen: start the planners now and say when the narrative is in.
-        Safe to repeat (the game re-sends after a reconnect): the narrative is only ever written once."""
-        self.campaign.observe(msg.get("state") or {}, self.memory.digest(), self.cruelty)
-        session = self.session
-        task = asyncio.create_task(self._announce_ready(session, send, self.campaign.narrative_waiter()))
+        """The game is on a loading screen (run start, or a new floor): start the planners now and say
+        when this floor's plans are in, i.e. the run narrative and the floor brief. Safe to repeat (the
+        game re-sends after a reconnect): each plan is only ever written once."""
+        state = msg.get("state") or {}
+        self.campaign.observe(state, self.memory.digest(), self.cruelty)
+        session, floor = self.session, msg.get("floor")
+        task = asyncio.create_task(self._announce_ready(session, floor, send, self.campaign.narrative_waiter(),
+                                                        floor_signature(state)))
         self.bg.add(task)
         task.add_done_callback(self.bg.discard)
 
-    async def _announce_ready(self, session: str | None, send: Send, waiter) -> None:
+    async def _announce_ready(self, session: str | None, floor, send: Send, narrative, sig) -> None:
         t0 = time.perf_counter()
-        status = await waiter
+        status = await narrative
         if status == "cancelled":
             return                                # a new run said hello; its own prepare will answer
-        log.info("narrative %s after %dms -> run starts", status, _ms(t0))
-        await self._send_quietly(send, {"t": "ready", "session": session, "status": status})
+        brief = await self.campaign.brief_waiter(sig)
+        if brief == "cancelled":
+            return
+        if status == "ready" and brief not in ("ready", "none"):
+            status = brief                        # the narrative is in but this floor's brief isn't
+        log.info("floor %s plans %s after %dms (brief: %s) -> floor starts", floor, status, _ms(t0), brief)
+        await self._send_quietly(send, {"t": "ready", "session": session, "floor": floor, "status": status})
 
     # ----------------------------------------------------------------- requests
     def _start(self, msg: dict, send: Send) -> None:
@@ -248,6 +327,13 @@ class Coordinator:
     async def _run(self, msg: dict, send: Send) -> None:
         key, rid, kind = str(msg["key"]), int(msg["id"]), msg["kind"]
         state, ctx = msg.get("state") or {}, msg.get("ctx") or {}
+        # Never answer against a brief that is about to replace itself: wait for this floor's plan.
+        # Superseding cancels this wait too, so it costs nothing. Like the slot queue, not the DM's time.
+        tb = time.perf_counter()
+        brief = await self.campaign.brief_waiter(floor_signature(state))
+        waited = _ms(tb)
+        if waited >= 50:
+            log.info("%-11s %-14s waited %dms for the floor brief (%s)", kind, key, waited, brief)
         prev = self.memory.previous(key)
         asked_ctx = ctx                           # before the previous answer is mixed in: this is what the gate diffs
         if prev:                                  # a re-ask replaces this answer; show it so the model restates it
@@ -256,16 +342,20 @@ class Coordinator:
         digest = self.memory.digest()
         # What the receipt keeps of the request: the user message is exactly these, as JSON.
         rec = {"key": key, "req_id": rid, "deadline_ms": int(deadline * 1000),
+               **({"brief_wait_ms": waited} if waited >= 50 else {}),
                "request": {"state": state, "ctx": ctx, "memory": digest}}
         t0 = time.perf_counter()
         base = {"t": "res", "session": self.session, "id": rid, "key": key, "kind": kind}
         raw: dict = {}
         call = None
+        campaign = ""
         try:
             if prev and await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
                 await send({**base, "ok": True, "ms": _ms(t0), "decision": prev})
                 return
-            async with self.sem:              # the deadline counts from here: queueing for a slot isn't the DM's time
+            # the deadline counts from here: queueing for a slot isn't the DM's time
+            async with self.sem.slot(_priority(kind, ctx)):
+                campaign = getattr(self.dm, "campaign", "")   # what this answer is written against
                 raw, late = await self._decide(kind, key, state, ctx, digest, deadline, t0)
             usage = raw.pop("_usage", None)
             call = raw.pop("_call", None)
@@ -298,7 +388,7 @@ class Coordinator:
         self.receipt_seq[key] = self._record(kind, "ok", ms=ms, llm=call, raw=raw, decision=decision,
                                              **({"late": True} if late else {}), **rec)
         self.last_req[key] = {"state": state, "ctx": asked_ctx, "events": digest["recent_events"],
-                              "campaign": getattr(self.dm, "campaign", "")}
+                              "campaign": campaign}
         tok = ""
         if usage:
             self.usage.update({**usage, "calls": 1})
