@@ -16,6 +16,8 @@ local welcomed = false
 local nextId = 1
 local pending = {}     -- key -> {id, sentAt, kind, sends}
 local results = {}     -- key -> {id, kind, decision, at, ms}
+local failed = {}      -- key -> true: the backend answered "no decision" (timeout / error)
+local holding = false  -- a loading screen is up: requests wait on the floor brief, don't expire them
 local latencies = {}   -- ring buffer of recent round-trips (ms)
 local LAT_N = 24
 local lastHello = -1e9
@@ -150,7 +152,7 @@ function Bridge.init(config, runId, callback)
   cfg = config
   onResult = callback
   session = tostring(runId) .. "-" .. tostring(now())
-  welcomed, pending, results, latencies = false, {}, {}, {}
+  welcomed, pending, results, failed, latencies = false, {}, {}, {}, {}
   lastHello = -1e9
   if transport then return Bridge.status() end   -- keep the socket across runs
   local err1, err2
@@ -214,6 +216,7 @@ function Bridge.request(kind, key, state, ctx, deadlineMs)
   nextId = nextId + 1
   local prev = pending[key]
   pending[key] = { id = id, sentAt = now(), kind = kind, sends = (prev and prev.sends or 0) + 1 }
+  failed[key] = nil
   send({ t = "req", id = id, key = key, kind = kind, deadline_ms = deadlineMs or 4000,
          state = state, ctx = ctx or {} })
   return id
@@ -237,9 +240,19 @@ function Bridge.setSummaryHandler(fn) onSummary = fn end
 --- Where the backend's "ready" goes (the loading screen).
 function Bridge.setReadyHandler(fn) onReady = fn end
 
---- Start the planners now and be told when the run narrative is in. Safe to repeat.
-function Bridge.prepare(state)
-  if Bridge.ready() then send({ t = "prepare", state = state }) end
+--- Start the planners now and be told when this floor's plans (narrative + brief) are in. Safe to repeat.
+function Bridge.prepare(state, floor)
+  if Bridge.ready() then send({ t = "prepare", state = state, floor = floor }) end
+end
+
+--- While a loading screen is up, requests sit on the backend waiting for the floor brief: keep them
+--- pending however long that takes. When it ends, their 15s expiry starts over.
+function Bridge.holdPending(on)
+  if holding and not on then
+    local t = now()
+    for _, p in pairs(pending) do p.sentAt = t end
+  end
+  holding = on and true or false
 end
 
 function Bridge.event(name, data)
@@ -249,6 +262,8 @@ end
 function Bridge.isPending(key) return pending[key] ~= nil end
 function Bridge.pendingInfo(key) return pending[key] end
 function Bridge.peek(key) return results[key] end
+--- The backend has answered this key, with a decision or with "none in time".
+function Bridge.settled(key) return results[key] ~= nil or failed[key] == true end
 
 --- Remove and return a result, telling the backend it was actually used.
 function Bridge.take(key)
@@ -268,6 +283,7 @@ function Bridge.markApplied(key) send({ t = "applied", key = key }) end
 function Bridge.forget(prefix)
   for k in pairs(pending) do if k:sub(1, #prefix) == prefix then pending[k] = nil end end
   for k in pairs(results) do if k:sub(1, #prefix) == prefix then results[k] = nil end end
+  for k in pairs(failed) do if k:sub(1, #prefix) == prefix then failed[k] = nil end end
 end
 
 local function handle(msg)
@@ -300,6 +316,8 @@ local function handle(msg)
       results[key] = { id = id, kind = msg.kind, decision = msg.decision, at = now(), ms = msg.ms }
       if onResult then onResult(key, results[key]) end
     end
+  elseif not msg.ok and (not p or id >= p.id) then
+    failed[key] = true
   end
   if p and id >= p.id then pending[key] = nil end
 end
@@ -320,6 +338,7 @@ function Bridge.update()
     if ok and type(msg) == "table" then handle(msg) end
   end
   -- Forget requests the backend never answered (it gives up after its own deadline).
+  if holding then return end
   local t = now()
   for k, p in pairs(pending) do
     if t - p.sentAt > 15000 then pending[k] = nil end

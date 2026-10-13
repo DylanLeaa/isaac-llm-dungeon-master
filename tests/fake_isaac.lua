@@ -23,7 +23,8 @@ EntityType = { ENTITY_PLAYER = 1, ENTITY_BOMB = 4, ENTITY_PICKUP = 5, ENTITY_GAP
   ENTITY_HOST = 27, ENTITY_ATTACKFLY = 18, ENTITY_KNIGHT = 41, ENTITY_DIP = 217 }
 setmetatable(EntityType, { __index = function(_, k) if tostring(k):match("^ENTITY_") then return 900 end end })
 EntityFlag = { FLAG_FRIENDLY = 1 << 29 }
-ActiveSlot = { SLOT_PRIMARY = 0 }
+ActiveSlot = { SLOT_PRIMARY = 0, SLOT_POCKET = 2 }
+PlayerType = { PLAYER_ISAAC = 0, PLAYER_MAGDALENE = 1, PLAYER_ISAAC_B = 21 }
 ItemType = { ITEM_PASSIVE = 1, ITEM_ACTIVE = 3 }
 PickupVariant = { PICKUP_OLDCHEST = 55, PICKUP_WOODENCHEST = 56, PICKUP_MOMSCHEST = 390, PICKUP_HEART = 10, PICKUP_COIN = 20, PICKUP_KEY = 30, PICKUP_BOMB = 40, PICKUP_CHEST = 50,
   PICKUP_SPIKEDCHEST = 52, PICKUP_MIMICCHEST = 54, PICKUP_LOCKEDCHEST = 60, PICKUP_GRAB_BAG = 69,
@@ -125,6 +126,8 @@ function player:GetTrinket() return 0 end
 function player:HasTrinket() return false end
 function player:GetPill(slot) return slot == 0 and (W.heldPill or 0) or 0 end
 function player:GetName() return "Isaac" end
+function player:GetPlayerType() return PlayerType.PLAYER_ISAAC end
+function player:GetCard() return 0 end
 function player:GetCollectibleCount() return 0 end
 function player:HasCollectible() return false end
 function player:ToPlayer() return self end
@@ -182,9 +185,11 @@ function level:GetCurrentRoomIndex() return W.cur end
 function level:GetRoomDesc(i) return W.rooms[i] end
 function level:GetRoomByIdx(i) return W.rooms[i] end
 function level:GetStartingRoomIndex() return 84 end
-function level:GetStage() return 1 end
+W.stage = 1
+local STAGE_NAMES = { "Basement I", "Basement II", "Caves I" }
+function level:GetStage() return W.stage end
 function level:GetStageType() return 0 end
-function level:GetName() return "Basement I" end
+function level:GetName() return STAGE_NAMES[W.stage] or ("stage " .. W.stage) end
 function level:GetCurseName() return "" end
 function level:GetRooms()
   local list = {}
@@ -204,7 +209,7 @@ end
 function itemPool:RemoveCollectible(id) W.removedItem = id end
 function itemPool:RemoveTrinket(id) W.removedTrinket = id end
 
-local seeds = { GetStageSeed = function() return 777 end, GetStartSeed = function() return 4242 end,
+local seeds = { GetStageSeed = function(_, stage) return 777 + (stage or 0) end, GetStartSeed = function() return 4242 end,
                 GetStartSeedString = function() return "TEST 1234" end }
 local game = { Difficulty = 0 }
 function game:GetLevel() return level end
@@ -216,7 +221,8 @@ function game:GetItemPool() return itemPool end
 function Game() return game end
 
 local ITEMS = {}
-for id = 1, 8 do ITEMS[id] = { Name = "#ITEM_" .. id .. "_NAME", Quality = id % 5, Type = ItemType.ITEM_PASSIVE } end
+for id = 1, 8 do ITEMS[id] = { Name = "#ITEM_" .. id .. "_NAME", Quality = id % 5, Type = ItemType.ITEM_PASSIVE,
+                                IsAvailable = function() return id ~= 3 end } end
 local TRINKETS = {}
 for id = 1, 20 do TRINKETS[id] = { Name = "#TRINKET_" .. id .. "_NAME", IsAvailable = function() return id ~= 7 end } end
 local itemConfig = { GetCollectible = function(_, id) return ITEMS[id] end,

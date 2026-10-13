@@ -254,10 +254,44 @@ def run(bridge_dir):
     assert len(files) == 1, files
     recs = [json.loads(l) for l in files[0].read_text().splitlines()]
     calls = [r for r in recs if r["type"] == "entry" and (r.get("llm") or {}).get("model") == "mock"]
-    assert calls and all("request" in r for r in calls if r["what"] not in ("narrative", "floor_brief"))
+    assert calls and all("request" in r for r in calls if r["what"] not in ("narrative", "floor_brief", "gate"))
     assert any(r["type"] == "update" and r["status"] == "applied" for r in recs)
     assert any(r.get("what") == "cruelty" and r.get("result") == "6 -> 3" for r in recs)
     print(f"    receipt file {files[0].name}: {len(recs)} records, {len(calls)} LLM calls")
+
+    # --- floor 2: a loading screen again, held until the brief and the opening decisions are in ---
+    W.stage = 2
+    for idx in (84, 85, 71, 86):
+        W.rooms[idx].VisitedCount = 0
+    W.enemies = lua.table_from([])
+    W.cur = 84
+    W.rooms[84].VisitedCount = 1
+    W.fire(MC.MC_POST_NEW_LEVEL)
+    W.fire(MC.MC_POST_NEW_ROOM)
+    tick()
+    assert Loading.active(), "a new floor starts on the loading screen"
+    assert Loading.blockInput(None, None, g.InputHook.IS_ACTION_PRESSED, 7) is False
+    Loading.handle(lua.table_from({"status": "ready", "floor": 1}))           # a stale ready from floor 1
+    tick()
+    assert Loading.active(), "a ready for another floor doesn't end this floor's wait"
+    wait(lambda: not Loading.active(), 8, "floor 2's plans and opening decisions")
+    opening = [k for k in ("layout:2:85", "items:2:0", "cons:2") if Bridge.settled(k)]
+    assert opening == ["layout:2:85", "items:2:0", "cons:2"], opening
+    prepares = [json.loads(l) for l in open(Path(bridge_dir) / "to_dm.jsonl") if '"prepare"' in l]
+    assert prepares[-1]["floor"] == 2 and prepares[-1]["state"]["level"]["stage"] == 2
+    # Empty slots are spelled out, so a planner can't fill them from the character's usual loadout.
+    who = prepares[-1]["state"]["player"]
+    assert (who["active_item"], who["pocket_active"], who["trinkets"]) == ("none",) * 3, who
+    assert who["pocket"] == "pill: reddots_red", who      # the pill picked up earlier on floor 1
+    assert who["player_type"] == "isaac" and who["tainted"] is False, who
+    assert prepares[-1]["state"]["save"] == {"items_unlocked": 7, "items_total": 8}, prepares[-1]["state"]["save"]
+    recs = [json.loads(l) for l in files[0].read_text().splitlines()]
+    brief2 = next(i for i, r in enumerate(recs) if r.get("what") == "floor_brief" and "Basement II" in r.get("key", ""))
+    early = [r["key"] for r in recs[:brief2] if r.get("type") == "entry" and str(r.get("key", "")).startswith(
+        ("layout:2:", "items:2:", "cons:2"))]
+    assert not early, f"floor 2 decisions made before its brief: {early}"
+    print("13. floor 2: loading screen held until its brief and opening decisions were in"
+          " (layout:2:85, items:2:0, cons:2), none made before the brief")
 
     # --- death: the player's stats at once, then the DM's side and its epitaph ------
     gaper = lua.table_from({"Entity": lua.table_from({"Type": g.EntityType.ENTITY_GAPER, "Variant": 0})})
@@ -269,15 +303,15 @@ def run(bridge_dir):
         return " | ".join(l for l in (s.Display() for s in last_run) if l)
 
     text = last()
-    assert text.startswith("HERE LIES ISAAC") and "Reached: Basement I" in text and "Last hit by: gaper" in text
+    assert text.startswith("HERE LIES ISAAC") and "Reached: Basement II" in text and "Last hit by: gaper" in text
     assert "Rooms cleared: 2" in text and "Pills eaten: 2" in text and "tallying" in text, text
     death = [json.loads(l) for l in open(Path(bridge_dir) / "to_dm.jsonl") if '"death"' in l]
-    assert death and death[0]["data"]["run"] == "TEST 1234" and death[0]["data"]["rows"][0] == ["Reached", "Basement I"]
+    assert death and death[0]["data"]["run"] == "TEST 1234" and death[0]["data"]["rows"][0] == ["Reached", "Basement II"]
     wait(lambda: "Extra enemies" in last(), 5, "the DM's side of the stats")
     wait(lambda: "The dice were mine" in last(), 5, "the DM's epitaph")
     tick(3)                                   # the overlay draws without errors
     assert "The dice were mine" in json.loads(W.saved)["last_run"]["epitaph"], "kept for the next session"
-    print("13. death -> DM Settings > Last run:\n      " + last().replace(" | ", "\n      "))
+    print("14. death -> DM Settings > Last run:\n      " + last().replace(" | ", "\n      "))
 
     errors = [p for p in printed if "error" in p.lower()]
     assert not errors, errors

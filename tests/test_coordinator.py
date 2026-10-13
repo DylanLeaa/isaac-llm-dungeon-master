@@ -255,7 +255,8 @@ def _prepare_msgs(planner, msgs):
 def test_prepare_answers_ready_once_the_narrative_is_written():
     planner = ScriptedPlanner(gated=True)
     sent, coord, go = _prepare_msgs(planner, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
-                                              {"t": "prepare", "state": floor_req(1, 1, "Basement I")["state"]}])
+                                              {"t": "prepare", "floor": 1,
+                                               "state": floor_req(1, 1, "Basement I")["state"]}])
 
     async def run():
         task = asyncio.create_task(go())
@@ -265,7 +266,7 @@ def test_prepare_answers_ready_once_the_narrative_is_written():
         await task
 
     asyncio.run(run())
-    assert [m for m in sent if m["t"] == "ready"] == [{"t": "ready", "session": "S", "status": "ready"}]
+    assert [m for m in sent if m["t"] == "ready"] == [{"t": "ready", "session": "S", "floor": 1, "status": "ready"}]
     assert len(planner.narratives) == 1
 
 
@@ -391,3 +392,148 @@ def test_waiting_for_a_slot_does_not_eat_the_deadline():
     coord = Coordinator(dm, cruelty=6, max_concurrency=1)
     res = _ask(coord, [_fast(1, "clear:1:1"), _fast(2, "clear:1:2")], 0.8)  # second waits 0.3s, then has 0.4s
     assert [r["ok"] for r in res] == [True, True]
+
+
+# ------------------------------------------------- decisions wait for their floor's brief
+class BriefGatedPlanner(ScriptedPlanner):
+    """The narrative answers at once; each floor brief waits for `brief_gate`."""
+
+    def __init__(self):
+        super().__init__()
+        self.brief_gate = asyncio.Event()
+
+    async def floor_brief(self, state, narrative, digest, prev_brief, cruelty):
+        await self.brief_gate.wait()
+        return await super().floor_brief(state, narrative, digest, prev_brief, cruelty)
+
+
+class SnapshotDM(CampaignDM):
+    """Records the campaign each decision was made against."""
+
+    campaign = ""
+
+    def set_campaign(self, text):
+        super().set_campaign(text)
+        self.campaign = text
+
+    async def decide(self, kind, state, ctx, memory):
+        self.made_against = getattr(self, "made_against", []) + [self.campaign]
+        return await super().decide(kind, state, ctx, memory)
+
+
+def test_a_decision_waits_for_its_floor_brief_and_is_made_against_it():
+    dm, planner = SnapshotDM(2), BriefGatedPlanner()
+    coord = Coordinator(dm, cruelty=6, planner=planner)
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle(floor_req(1, 1, "Basement I"), send)
+        await asyncio.sleep(0.05)
+        assert not dm.seen and not sent                  # held until the brief is in
+        planner.brief_gate.set()
+        await asyncio.sleep(0.05)
+        await coord.handle(floor_req(2, 1, "Basement I"), send)   # brief already written: no wait
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    assert len(dm.made_against) == 2
+    assert all("BRIEF for Basement I" in c for c in dm.made_against)
+
+
+def test_a_brief_that_never_comes_only_holds_a_decision_for_the_brief_wait():
+    import planners
+    dm, planner = SnapshotDM(1), BriefGatedPlanner()
+    coord = Coordinator(dm, cruelty=6, planner=planner)
+    old, planners.BRIEF_WAIT_S = planners.BRIEF_WAIT_S, 0.1
+    try:
+        res = _ask(coord, [floor_req(1, 1, "Basement I")], 0.3)
+    finally:
+        planners.BRIEF_WAIT_S = old
+    assert [r["ok"] for r in res] == [True]
+    assert "still being prepared" in dm.made_against[0]
+
+
+def test_floor_prepare_answers_ready_for_that_floor_once_its_brief_is_in():
+    planner = BriefGatedPlanner()
+    sent, coord, go = _prepare_msgs(planner, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+                                              {"t": "prepare", "floor": 2,
+                                               "state": floor_req(1, 2, "Caves I")["state"]}])
+
+    async def run():
+        task = asyncio.create_task(go())
+        await asyncio.sleep(0.05)
+        assert not [m for m in sent if m["t"] == "ready"]          # narrative in, brief still writing
+        planner.brief_gate.set()
+        await task
+
+    asyncio.run(run())
+    assert [m for m in sent if m["t"] == "ready"] == [{"t": "ready", "session": "S", "floor": 2, "status": "ready"}]
+
+
+def test_the_gate_compares_against_the_campaign_a_call_started_with():
+    dm = SlowDM(1, 0.1)
+    dm.campaign = "brief A"
+    coord = Coordinator(dm, cruelty=6)
+
+    async def send(msg):
+        pass
+
+    async def go():
+        await coord.handle(clear_req(1), send)
+        await asyncio.sleep(0.03)
+        dm.campaign = "brief B"                          # lands mid-call
+        await asyncio.sleep(0.2)
+
+    asyncio.run(go())
+    assert coord.last_req["clear:1:82"]["campaign"] == "brief A"
+
+
+def test_urgent_asks_get_the_next_slot_before_background_work():
+    from server import BACKGROUND, NEXT_DOOR, URGENT, PrioritySemaphore, _priority
+    assert _priority("room_clear", {}) == URGENT
+    assert _priority("room_layout", {"reason": "player entered an adjacent room"}) == NEXT_DOOR
+    assert _priority("item_choice", {"reason": "player is next to this room"}) == NEXT_DOOR
+    assert _priority("item_choice", {"reason": "floor start"}) == BACKGROUND
+    assert _priority("consumables", {}) == BACKGROUND
+
+    order = []
+
+    async def go():
+        sem = PrioritySemaphore(1)
+
+        async def job(name, prio, hold=0.01):
+            async with sem.slot(prio):
+                order.append(name)
+                await asyncio.sleep(hold)
+
+        first = asyncio.create_task(job("busy", BACKGROUND, 0.05))
+        await asyncio.sleep(0.01)
+        jobs = [asyncio.create_task(job(n, p)) for n, p in
+                [("items-1", BACKGROUND), ("items-2", BACKGROUND), ("cancelled", URGENT),
+                 ("layout", NEXT_DOOR), ("clear", URGENT)]]
+        await asyncio.sleep(0)
+        jobs[2].cancel()                                 # a superseded waiter gives up its place
+        await asyncio.gather(first, *jobs, return_exceptions=True)
+        # every slot came back
+        async with sem.slot(URGENT):
+            order.append("after")
+
+    asyncio.run(asyncio.wait_for(go(), 2))
+    assert order == ["busy", "clear", "layout", "items-1", "items-2", "after"]
+
+
+def test_planners_are_told_what_the_player_really_holds():
+    from planners import loadout
+    bare = {"player": {"character": "Isaac", "active_item": "none", "pocket_active": "none", "trinkets": "none",
+                       "pocket": "none", "items": {}, "tainted": False},
+            "save": {"items_unlocked": 120, "items_total": 719}}
+    line = loadout(bare)
+    assert "Isaac; active item: none;" in line and "items: none" in line and "120/719" in line
+    assert "Tainted" not in line
+    held = {"player": {"character": "Isaac", "tainted": True, "active_item": "The D6", "items": ["The D6 (q4)"]}}
+    line = loadout(held)
+    assert "Tainted Isaac" in line and "active item: The D6" in line and "unlocked" not in line
+    assert "unknown" in loadout({})

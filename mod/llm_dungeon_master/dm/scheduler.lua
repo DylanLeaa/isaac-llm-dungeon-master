@@ -493,6 +493,24 @@ function Sched.init(config, bridge, state, apply, taunt, cons)
   end
 end
 
+function Sched.floor() return floorNo end
+
+--- The decisions this floor opened with: the start room's neighbour layouts, the item pools asked
+--- so far and the consumables plan. The loading screen waits for these. Only keys that were
+--- actually sent count (a request made while disconnected would never settle).
+function Sched.floorReadyKeys()
+  local keys = {}
+  local function add(key)
+    if key and (Bridge.isPending(key) or Bridge.settled(key)) then keys[#keys + 1] = key end
+  end
+  if room then
+    for key in pairs(room.layoutKeys) do add(key) end
+  end
+  for pool in pairs(itemSigs) do add(fkey("items", pool)) end
+  add(Cons.askedKey())
+  return keys
+end
+
 function Sched.debugCounts()
   return string.format("floor %d", floorNo)
 end

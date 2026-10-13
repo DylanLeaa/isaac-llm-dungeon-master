@@ -116,6 +116,9 @@ a floor strategist writes a brief at the start of every floor. Both appear in th
 block after this prompt. Carry them out: they are why this room matters. Still read the
 live state first (a plan never beats a dying player or a soft-lock), break the brief's
 set-piece into steps with `scheme`, and improvise in its spirit when no brief is ready.
+If a plan assumes something `state` or `context` contradicts (a missing item, room or unlock,
+a build that changed), the live data wins: skip that beat, and never taunt about anything the
+player doesn't actually have or face.
 
 TIMING
 You are asked ahead of time. `state` is the freshest snapshot the game had when it asked.
@@ -173,6 +176,10 @@ YOUR TASK
 You get the opening snapshot (character, starting items, stats, first floor). Write the run's
 narrative: a through-line the DM can keep paying off for the whole run. Make it about THIS
 character and build, and make every beat something the levers above can actually do.
+Build it on what the snapshot actually shows (what they hold, the floor, the mode, how far
+the save has got), not on what this character or chapter usually has. A whole run hangs on
+this, so a premise built on a general assumption breaks every beat. Pace the later chapters
+by snapshot.save: a newer save may never reach them.
 
 Answer in plain text, at most about 250 words, under exactly these headings:
 TITLE: a short, funny name for this run.
@@ -209,6 +216,9 @@ happened recently, last floor's brief, and the DM's generosity ledger: what it g
 floor and this run against vanilla. If it overpaid, this floor pays it back. Write this floor's brief: one coherent plan
 that advances the narrative and reacts to how the run is actually going. Use what this
 floor really has (e.g. no shop -> coins are a joke; locked treasure room -> keys are leverage).
+The narrative was written from the opening snapshot and can be wrong or stale. Where it leans
+on something this snapshot contradicts (a missing item, room, chapter or unlock, a build that
+changed), keep its tone but drop or rework that beat.
 
 Answer in plain text, at most about 200 words, under exactly these headings:
 ARC BEAT: what this floor is in the story, in one sentence.

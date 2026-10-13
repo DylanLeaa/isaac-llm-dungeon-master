@@ -256,6 +256,9 @@ function Cons.lockedList()
 end
 
 -- --------------------------------------------------------------- lifecycle
+--- This floor's consumables key, once it has been asked about.
+function Cons.askedKey() return sends > 0 and key() or nil end
+
 function Cons.onNewFloor(n)
   Bridge.forget("cons:" .. floorNo)
   floorNo, plan, sends, lastAskAt, askedColors, seenColors = n, nil, 0, -1e9, {}, {}

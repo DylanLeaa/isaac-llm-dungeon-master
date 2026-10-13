@@ -8,6 +8,25 @@ the DM and both planners; GATE_KNOWLEDGE is the short form for the re-ask gate, 
 
 ISAAC_KNOWLEDGE = """ISAAC KNOWLEDGE (vanilla Repentance: what the player knows, expects and plays around)
 
+THE GAME IN FRONT OF YOU BEATS GENERAL KNOWLEDGE
+- Everything below is general knowledge of vanilla Repentance with everything unlocked. Any one
+  run can differ from it, and where they disagree the snapshot and context are right and this
+  is wrong. Common ways a run differs:
+  - Unlocks: a save may lack a character's starting items, many pool items, characters, alt
+    floors, rooms or whole late chapters.
+  - The build: items taken, lost, rerolled or swapped change what a character has and needs.
+    A character's usual loadout is at most where they started.
+  - The floor: which special rooms, curses and locked doors exist is in `level`, not in the
+    general "every floor has..." rules.
+  - The mode: snapshot.difficulty (0 normal, 1 hard, 2-3 Greed), challenges and other mods
+    change rules, drops and what's on offer.
+- So read the specific context before applying a general rule. What they hold is exactly
+  player.* ("none" means none), what is on offer is exactly the candidates, what the floor has
+  is exactly `level`. Never build a plan, gag or taunt on something the snapshot doesn't show,
+  however standard it is in vanilla. When you are unsure, plan around what you can see.
+- snapshot.save.items_unlocked / items_total hints at how far this save has got. Well under half
+  unlocked is a newer save that may not reach the later chapters: keep those beats loose.
+
 FLOORS (snapshot level.stage; stage_type picks the variant)
 - 1-2 Basement/Cellar/Burning Basement (alt: Downpour/Dross), 3-4 Caves/Catacombs/Flooded Caves
   (alt: Mines/Ashpit), 5-6 Depths/Necropolis/Dank Depths (alt: Mausoleum/Gehenna; Mom on floor 6),
@@ -80,8 +99,8 @@ ITEMS
   Daemon's Tail turns most heart drops into keys.
 - Curse of the Blind hides every pedestal until it's picked up: perfect cover for a bad item.
 
-CHARACTERS (snapshot player.character; Tainted versions may report the base name, so tell them by
-their signature item)
+CHARACTERS (snapshot player.character; Tainted versions report the base name, player.tainted says
+which. Starting items listed are the unlocked loadout: check the snapshot for what they really hold)
 - Isaac: 3 red, 1 bomb, D6 (rerolls pedestals, so a bad item can be rerolled).
 - Magdalene: 4 red, Yum Heart (heals; red hearts matter less).
 - Cain: 2 red, 1 key, Lucky Foot (+luck, better pills and machines).
