@@ -47,7 +47,7 @@ return {
   -- Characters per line in Mod Config Menu > DM Settings > Receipt. Lower it if lines get cut off.
   RECEIPT_WIDTH = 32,
 
-  -- Every floor waits on a loading screen until the DM is ready for it (Enter skips): the run
+  -- Every floor waits on a loading screen until the DM is ready for it: the run
   -- narrative (first floor), the floor brief, and answers to the floor's opening decisions.
   -- It gives up on its own: CONNECT if the backend isn't there, TIMEOUT (run start) or
   -- FLOOR_TIMEOUT (later floors) if the plans never land.
