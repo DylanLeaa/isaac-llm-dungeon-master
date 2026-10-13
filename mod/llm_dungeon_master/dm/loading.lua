@@ -10,7 +10,7 @@
 --
 -- On a new floor the mod sends "prepare" with a snapshot and the floor number; the backend
 -- answers "ready" for that floor. Meanwhile input is blocked, the player can't be hurt, the HUD is
--- hidden and the run clock is stopped. Enter skips the wait. The screen also ends on its own if the
+-- hidden and the run clock is stopped. The wait can't be skipped. The screen also ends on its own if the
 -- backend can't be reached (CONNECT) or takes too long (TIMEOUT): a DM that never answers must not
 -- lock the player out of the game. Nothing here ever blocks the game after it ends.
 local Loading = {}
@@ -26,7 +26,14 @@ local startedAt, startFrame, readyAt
 local sent = false
 local verdict            -- the backend's "ready" status for this floor, once it arrives
 local keysDone, keysTotal = 0, 0
-local checking = false   -- reading input ourselves: the input block must let that through
+local clock, lastTime = 0, nil  -- ms spent on screen while the game ran: a pause or tab-out doesn't count
+
+local function tick()
+  local now = Isaac.GetTime()
+  if lastTime then clock = clock + math.max(0, math.min(now - lastTime, 250)) end
+  lastTime = now
+  return clock
+end
 
 local font = Font()
 local fontOk = pcall(function() font:Load("font/pftempestasevencondensed.fnt") end) and font:IsLoaded()
@@ -56,7 +63,7 @@ local function begin(n)
   floor, sent, verdict, keysDone, keysTotal = n, false, nil, 0, 0
   if on then return end                  -- a reseed mid-wait: same screen, new floor number
   if cfg.LOADING_SCREEN == false or not Bridge.hasTransport() then return end
-  on, startedAt, startFrame, readyAt = true, Isaac.GetTime(), game:GetFrameCount(), nil
+  on, startedAt, startFrame, readyAt = true, tick(), game:GetFrameCount(), nil
   Bridge.holdPending(true)
   hud(false)
 end
@@ -86,16 +93,6 @@ function Loading.handle(msg)
   verdict = tostring(msg.status)
 end
 
-local function skipped()
-  checking = true
-  local ok, pressed = pcall(function()
-    return Input.IsButtonTriggered(Keyboard.KEY_ENTER, 0)
-        or Input.IsActionTriggered(ButtonAction.ACTION_MENUCONFIRM, Isaac.GetPlayer(0).ControllerIndex)
-  end)
-  checking = false
-  return ok and pressed
-end
-
 -- How many of the floor's opening decisions have an answer (or a definite "none").
 local function countKeys()
   local keys = Sched.floorReadyKeys()
@@ -115,7 +112,7 @@ function Loading.update()
     begin(f)
   end
   if not on then return end
-  local t = Isaac.GetTime()
+  local t = tick()
   if floor == 0 then return end           -- run start, before the first floor is known
   if Bridge.ready() then
     if not sent then                     -- also again after a reconnect: the backend answers once per ask
@@ -129,7 +126,6 @@ function Loading.update()
     keysDone, keysTotal = countKeys()
     if keysDone >= keysTotal then return finish(verdict) end
   end
-  if skipped() then return finish("skipped") end
   if not readyAt and t - startedAt > cfg.LOADING_CONNECT_MS then return finish("offline") end
   local limit = runStart and cfg.LOADING_TIMEOUT_MS or (cfg.LOADING_FLOOR_TIMEOUT_MS or cfg.LOADING_TIMEOUT_MS)
   if readyAt and t - readyAt > limit then return finish("timeout") end
@@ -140,7 +136,7 @@ end
 
 --- MC_INPUT_ACTION: nothing the player presses reaches the game while the screen is up.
 function Loading.blockInput(_, _, hook, action)
-  if not on or checking then return nil end
+  if not on then return nil end
   if action == ButtonAction.ACTION_PAUSE then return nil end   -- they can always leave
   if hook == InputHook.GET_ACTION_VALUE then return 0 end
   return false
@@ -158,7 +154,7 @@ end
 --- MC_POST_RENDER.
 function Loading.render()
   if not on then return end
-  local t = Isaac.GetTime()
+  local t = clock
   local w, h = Isaac.GetScreenWidth(), Isaac.GetScreenHeight()
   local secs = math.floor((t - startedAt) / 1000)
   local line
@@ -172,7 +168,6 @@ function Loading.render()
   end
   draw(line .. string.rep(".", 1 + math.floor(t / 400) % 3), 0, h / 2 - 14, RED, w)
   draw(string.format("%ds", secs), 0, h / 2 + 4, WHITE, w)
-  draw("Enter: skip and play without the DM's plan", 0, h - 22, GREY, w)
 end
 
 function Loading.init(config, bridge, state, taunt, sched)
