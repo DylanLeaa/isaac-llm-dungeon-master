@@ -444,6 +444,28 @@ def test_a_decision_waits_for_its_floor_brief_and_is_made_against_it():
     assert all("BRIEF for Basement I" in c for c in dm.made_against)
 
 
+def test_a_new_run_drops_decisions_still_waiting_on_the_old_runs_brief():
+    dm, planner = SnapshotDM(1), BriefGatedPlanner()
+    coord = Coordinator(dm, cruelty=6, planner=planner)
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True}, send)
+        await coord.handle(floor_req(1, 1, "Basement I"), send)
+        await asyncio.sleep(0.05)
+        assert not dm.seen and not [m for m in sent if m.get("t") == "res"]   # held for the brief
+        await coord.handle({"t": "hello", "proto": PROTO, "session": "S2", "run": "R2", "new_run": True}, send)
+        planner.brief_gate.set()
+        await asyncio.sleep(0.1)
+
+    asyncio.run(go())
+    assert not dm.seen                                   # never answered against an empty campaign
+    assert not [m for m in sent if m.get("t") == "res"]
+
+
 def test_a_brief_that_never_comes_only_holds_a_decision_for_the_brief_wait():
     import planners
     dm, planner = SnapshotDM(1), BriefGatedPlanner()

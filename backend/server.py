@@ -32,7 +32,7 @@ from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_C
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
 from memory import RunMemory
-from planners import (FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, Campaign, MockPlanner, OpenRouterPlanner,
+from planners import (FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, NARRATIVE_WAIT_S, Campaign, MockPlanner, OpenRouterPlanner,
                       floor_signature)
 from receipt import Receipt
 from schemas import KINDS, clamp
@@ -196,6 +196,9 @@ class Coordinator:
             if msg.get("run") != self.memory.run_id or msg.get("new_run"):
                 self.memory.reset(msg.get("run"))
                 self.campaign.reset()
+                for _rid, task in list(self.inflight.values()):
+                    task.cancel()                 # asked in the old run: don't spend DM slots on it
+                self.inflight.clear()
                 self.receipt.start_run(msg.get("run"), fresh=bool(msg.get("new_run")))
                 self.receipt_seq.clear()
                 self.last_req.clear()
@@ -364,10 +367,20 @@ class Coordinator:
         # Never answer against a brief that is about to replace itself: wait for this floor's plan.
         # Superseding cancels this wait too, so it costs nothing. Like the slot queue, not the DM's time.
         tb = time.perf_counter()
-        brief = await self.campaign.brief_waiter(floor_signature(state))
+        try:                                      # the brief waits for it too, but not if the floor has no signature
+            narrative = await asyncio.wait_for(self.campaign.narrative_waiter(), NARRATIVE_WAIT_S)
+        except asyncio.TimeoutError:
+            narrative = "timeout"
+        brief = narrative if narrative == "cancelled" else await self.campaign.brief_waiter(floor_signature(state))
         waited = _ms(tb)
         if waited >= 50:
             log.info("%-11s %-14s waited %dms for the floor brief (%s)", kind, key, waited, brief)
+        if brief in ("cancelled", "moved"):
+            # A new run (or floor) replaced what this was asked against: answering would be written with
+            # no campaign, and the game re-asks under the new one.
+            self._record(kind, "superseded", ms=waited, key=key, req_id=rid, reason=brief)
+            self.stats[kind]["superseded"] += 1
+            return
         prev = self.memory.previous(key)
         asked_ctx = ctx                           # before the previous answer is mixed in: this is what the gate diffs
         if prev:                                  # a re-ask replaces this answer; show it so the model restates it
