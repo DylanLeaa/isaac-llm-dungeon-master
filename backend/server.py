@@ -20,9 +20,11 @@ import logging
 import os
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import appdata
 import bridge
 import epilogue
 from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_CODE_LATE_GRACE_S,
@@ -120,11 +122,13 @@ class Coordinator:
         self.late_grace_s = late_grace_s          # how long past its deadline a call may still be delivered
         self.gate = gate                          # fast model that vetoes re-asks the DM would answer the same
         self.last_req: dict[str, dict] = {}       # key -> what the issued answer was written against
+        self.epitaph_wanted = epitaph
         self.epitaph = epitaph and hasattr(dm, "epitaph")
         self.cruelty = self.default_cruelty = cruelty
         self.memory = RunMemory()
         self.session: str | None = None
         self.mismatched = None                    # the last session whose hello had the wrong protocol
+        self.last_seen = 0.0                      # monotonic time of the game's last message
         self.send: Send | None = None             # the game's connection, for pushing receipt entries
         # Everything the engine does this run, with the LLM calls behind it (in memory only if no dir).
         self.receipt = receipt or Receipt()
@@ -155,7 +159,26 @@ class Coordinator:
             log.info("        tokens in=%d (cached %d, %.0f%%) out=%d  cost=$%.4f over %d calls",
                      u["in"], u["cached"], 100 * u["cached"] / max(1, u["in"]), u["out"], u["cost"], u["calls"])
 
+    def reconfigure(self, engine: "Engine") -> None:
+        """Swap in other models mid-run (the app's Settings). The run, its receipt, memory and plans carry
+        on; calls already in flight finish on the old models."""
+        old = (self.dm, self.campaign.planner, self.gate)
+        self.dm, self.gate, self.late_grace_s = engine.dm, engine.gate, engine.late_grace
+        self.epitaph = self.epitaph_wanted and hasattr(engine.dm, "epitaph")
+        self.sem = PrioritySemaphore(engine.concurrency)
+        self.dm.set_cruelty(self.cruelty)
+        self.campaign.planner = engine.planner
+        self.campaign.push = getattr(engine.dm, "set_campaign", lambda _text: None)
+        self.campaign._push()
+        replaced = [o for o in old if hasattr(o, "client") and o not in (self.dm, engine.planner, self.gate)]
+        if replaced:
+            task = asyncio.create_task(_close_later(replaced))
+            self.bg.add(task)
+            task.add_done_callback(self.bg.discard)
+        engine.describe()
+
     async def handle(self, msg: dict, send: Send) -> None:
+        self.last_seen = time.monotonic()
         t = msg.get("t")
         if t == "hello":
             if msg.get("proto") != bridge.PROTO:
@@ -471,6 +494,17 @@ class Coordinator:
         return True
 
 
+async def _close_later(models: list, after_s: float = 60.0) -> None:
+    """Close replaced models' HTTP clients once the calls they still had running are done."""
+    await asyncio.sleep(after_s)
+    for m in models:
+        if hasattr(m.client, "aclose"):
+            try:
+                await m.client.aclose()
+            except Exception:                     # noqa: BLE001 - only tidying up
+                pass
+
+
 def _ms(t0: float) -> int:
     return int((time.perf_counter() - t0) * 1000)
 
@@ -490,6 +524,58 @@ def _compact(decision: dict) -> dict:
     if "pills" in out:
         out["pills"] = [{"color": p["color"], "effect": p["effect"]} for p in out["pills"]]
     return out
+
+
+@dataclass
+class Engine:
+    """The models behind the DM: what build_dm makes and Coordinator.reconfigure swaps in."""
+    dm: object
+    planner: object = None
+    gate: object = None
+    concurrency: int = 6
+    late_grace: float = 0.0
+    label: str = ""
+
+    def describe(self) -> None:
+        log.info("Dungeon Master: %s", self.label)
+        if self.gate:
+            log.info("Re-ask gate: %s", self.gate.model)
+        else:
+            log.info("Re-ask gate: off, every re-ask goes to the DM")
+        if self.planner:
+            log.info("Planners: narrative=%s  floor brief=%s", self.planner.narrative_model, self.planner.floor_model)
+
+
+def build_dm(backend: str, api_key: str, *, cruelty: int, model: str | None = None,
+             narrative_model: str | None = None, floor_model: str | None = None,
+             gate_model: str = GATE_DEFAULT_MODEL, gate_threshold: float = GATE_THRESHOLD, no_gate: bool = False,
+             no_planners: bool = False, claude_bin: str | None = None,
+             mock_latency: tuple[float, float] = (0.25, 1.2)) -> Engine:
+    """The DM, planners and gate for a backend: "openrouter", "claude-code" or "mock".
+    ValueError, with a message for the player, when it can't be set up."""
+    if backend == "mock":
+        return Engine(MockDM(cruelty, latency=mock_latency), None if no_planners else MockPlanner(),
+                      None if no_gate else MockGate(), label="MOCK (offline)")
+    if backend == "claude-code":
+        try:
+            model = model or CLAUDE_CODE_DM_MODEL
+            dm = ClaudeCodeDM(cruelty, model=model, claude_bin=claude_bin)
+            planner = None if no_planners else ClaudeCodePlanner(
+                narrative_model or CLAUDE_CODE_PLANNER_MODEL, floor_model or CLAUDE_CODE_PLANNER_MODEL,
+                claude_bin=claude_bin)
+        except SystemExit as e:                   # find_claude's message, for the CLI
+            raise ValueError(str(e)) from None
+        # The gate isn't a Claude model: it stays on OpenRouter, when there's a key for it.
+        gate = OpenRouterGate(gate_model, gate_threshold, api_key=api_key) if api_key and not no_gate else None
+        return Engine(dm, planner, gate, CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_LATE_GRACE_S,
+                      f"{model} via Claude Code ({dm.runner.bin})")
+    if not api_key:
+        raise ValueError("No OpenRouter API key: add one, or use Claude Code instead.")
+    model = model or OPENROUTER_DEFAULT_MODEL
+    planner = None if no_planners else OpenRouterPlanner(
+        narrative_model or NARRATIVE_DEFAULT_MODEL, floor_model or FLOOR_DEFAULT_MODEL, api_key=api_key)
+    gate = None if no_gate else OpenRouterGate(gate_model, gate_threshold, api_key=api_key)
+    return Engine(OpenRouterDM(cruelty, model=model, api_key=api_key), planner, gate, label=f"{model} via OpenRouter")
 
 
 def main() -> None:
@@ -519,7 +605,7 @@ def main() -> None:
     ap.add_argument("--mock", action="store_true", help="use the offline rule-based DM")
     ap.add_argument("--mock-latency", type=float, nargs=2, default=(0.25, 1.2), metavar=("MIN", "MAX"),
                     help="fake response time range for --mock, seconds")
-    ap.add_argument("--receipts", type=Path, default=Path(__file__).resolve().parent / "receipts",
+    ap.add_argument("--receipts", type=Path, default=appdata.receipts_dir(),
                     help="folder for the per-run receipt (every decision and LLM call, as JSON lines)")
     ap.add_argument("--no-receipts", action="store_true", help="keep the receipt in memory only (still shown in game)")
     ap.add_argument("--no-epitaph", action="store_true", help="no DM-written epitaph on the after-death stats screen")
@@ -529,44 +615,19 @@ def main() -> None:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    concurrency, late_grace = 6, 0.0
-    if args.mock:
-        dm = MockDM(args.cruelty, latency=tuple(args.mock_latency))
-        planner = None if args.no_planners else MockPlanner()
-        gate = None if args.no_gate else MockGate()
-        log.info("Dungeon Master: MOCK (offline)")
-    elif args.backend == "claude-code":
-        model = args.model or CLAUDE_CODE_DM_MODEL
-        dm = ClaudeCodeDM(args.cruelty, model=model, claude_bin=args.claude_bin)
-        planner = None if args.no_planners else ClaudeCodePlanner(
-            args.narrative_model or CLAUDE_CODE_PLANNER_MODEL, args.floor_model or CLAUDE_CODE_PLANNER_MODEL,
-            claude_bin=args.claude_bin)
-        # The gate isn't a Claude model: it stays on OpenRouter, when there's a key for it.
-        gate = None
-        if not args.no_gate:
-            if os.environ.get("OPENROUTER_API_KEY"):
-                gate = OpenRouterGate(args.gate_model, args.gate_threshold)
-            else:
-                log.info("Re-ask gate: off (no OPENROUTER_API_KEY), every re-ask goes to the DM")
-        concurrency, late_grace = CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_LATE_GRACE_S
-        log.info("Dungeon Master: %s via Claude Code (%s)  cruelty=%d", model, dm.runner.bin, args.cruelty)
-    else:
-        if not os.environ.get("OPENROUTER_API_KEY"):
-            raise SystemExit("Set OPENROUTER_API_KEY (or run with --mock or --backend claude-code).")
-        model = args.model or OPENROUTER_DEFAULT_MODEL
-        dm = OpenRouterDM(args.cruelty, model=model)
-        planner = None if args.no_planners else OpenRouterPlanner(
-            args.narrative_model or NARRATIVE_DEFAULT_MODEL, args.floor_model or FLOOR_DEFAULT_MODEL)
-        gate = None if args.no_gate else OpenRouterGate(args.gate_model, args.gate_threshold)
-        log.info("Dungeon Master: %s via OpenRouter  cruelty=%d", model, args.cruelty)
-    if gate:
-        log.info("Re-ask gate: %s", gate.model)
-    if planner:
-        log.info("Planners: narrative=%s  floor brief=%s", planner.narrative_model, planner.floor_model)
+    try:
+        engine = build_dm("mock" if args.mock else args.backend, os.environ.get("OPENROUTER_API_KEY", ""),
+                          cruelty=args.cruelty, model=args.model, narrative_model=args.narrative_model,
+                          floor_model=args.floor_model, gate_model=args.gate_model,
+                          gate_threshold=args.gate_threshold, no_gate=args.no_gate, no_planners=args.no_planners,
+                          claude_bin=args.claude_bin, mock_latency=tuple(args.mock_latency))
+    except ValueError as e:
+        raise SystemExit(f"{e} Set OPENROUTER_API_KEY, or run with --backend claude-code or --mock.")
+    engine.describe()
 
-    coord = Coordinator(dm, args.cruelty, planner, max_concurrency=concurrency,
+    coord = Coordinator(engine.dm, args.cruelty, engine.planner, max_concurrency=engine.concurrency,
                         receipt=Receipt(None if args.no_receipts else args.receipts),
-                        epitaph=not args.no_epitaph, gate=gate, late_grace_s=late_grace)
+                        epitaph=not args.no_epitaph, gate=engine.gate, late_grace_s=engine.late_grace)
 
     isaac_dirs = args.isaac_dir or bridge.isaac_installs()
     logs = args.log or bridge.default_logs()

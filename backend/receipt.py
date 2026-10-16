@@ -13,10 +13,11 @@ import hashlib
 import json
 import logging
 import re
+import sys
 import time
 from collections import Counter, OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger("llmdm")
 
@@ -25,9 +26,13 @@ PLAN_CHARS = 600        # how much of a planner's text the game gets
 
 
 class Receipt:
-    def __init__(self, directory: Path | None = None, keep: int = GAME_KEEP) -> None:
+    def __init__(self, directory: Path | None = None, keep: int = GAME_KEEP, keep_full: bool = False) -> None:
         self.dir = directory
         self.keep = keep
+        self.keep_full = keep_full                # also hold every whole entry and prompt (the app's views)
+        # Told ("run", {run, fresh, path}), ("entry", entry) and ("update", {seq, status}): the app mirrors the run.
+        self.listener: Callable[[str, dict], None] | None = None
+        self.source: Path | None = None           # the file load() read
         self.start_run(None, fresh=True)
 
     # ------------------------------------------------------------------ runs
@@ -40,8 +45,11 @@ class Receipt:
         self.decisions: dict[int, tuple[str, dict]] = {}      # seq -> (kind, clamped decision)
         self.usage = Counter()
         self.prompts: set[str] = set()                        # system prompt hashes already in the file
+        self.full: dict[int, dict] = {}                       # seq -> the whole entry (keep_full)
+        self.prompt_text: dict[str, str] = {}                 # hash -> system prompt (keep_full)
         self.path: Path | None = None
         if self.dir is None or run_id is None:
+            self._tell("run", {"run": run_id, "fresh": fresh, "path": None})
             return
         tag = re.sub(r"[^A-Za-z0-9]+", "", str(run_id)) or "run"
         old = list(self.dir.glob(f"*_run-{tag}.jsonl")) if not fresh and self.dir.exists() else []
@@ -54,6 +62,7 @@ class Receipt:
             while self.path.exists():                     # same seed restarted within the second
                 n += 1
                 self.path = self.dir / f"{stamp}-{n}_run-{tag}.jsonl"
+        self._tell("run", {"run": run_id, "fresh": not old, "path": self.path})
 
     def _replay(self, path: Path) -> None:
         try:
@@ -68,11 +77,13 @@ class Receipt:
                 continue
             if rec.get("type") == "prompt":
                 self.prompts.add(rec.get("hash"))
+                if self.keep_full:
+                    self.prompt_text[rec.get("hash")] = rec.get("text")
             elif rec.get("type") == "entry":
                 self._ingest(rec)
             elif rec.get("type") == "update":
                 self._apply_update(rec.get("ref"), rec.get("status"))
-        if self.seq:
+        if self.seq and self.source is None:
             log.info("receipt: resumed %s (%d entries)", path.name, self.seq)
 
     # --------------------------------------------------------------- writing
@@ -84,21 +95,34 @@ class Receipt:
         if llm and isinstance(llm.get("system"), list):
             llm["system"] = [self._prompt(text) for text in llm["system"]]
         self._write(entry)
-        return self._ingest(entry)
+        c = self._ingest(entry)
+        self._tell("entry", entry)
+        return c
 
     def update(self, seq: int | None, status: str) -> dict | None:
         """A later outcome for entry `seq` (applied, replaced). Returns its new compact form."""
         if seq is None or seq not in self.status:
             return None
         self._write({"type": "update", "ref": seq, "status": status, "ts": round(time.time(), 3)})
-        return self._apply_update(seq, status)
+        c = self._apply_update(seq, status)
+        self._tell("update", {"seq": seq, "status": status})
+        return c
 
     def _prompt(self, text: str) -> str:
         h = hashlib.sha1(text.encode()).hexdigest()[:12]
         if h not in self.prompts:
             self.prompts.add(h)
             self._write({"type": "prompt", "hash": h, "text": text})
+        if self.keep_full:
+            self.prompt_text[h] = text
         return h
+
+    def _tell(self, event: str, data: dict) -> None:
+        if self.listener is not None:
+            try:
+                self.listener(event, data)
+            except Exception as e:                # noqa: BLE001 - a viewer must never break the DM
+                log.warning("receipt listener failed: %s", e)
 
     def _write(self, rec: dict) -> None:
         if self.path is None:
@@ -111,10 +135,16 @@ class Receipt:
             log.warning("receipt: cannot write %s (%s) -> in-memory only", self.path, e)
             self.path = None
 
+    def ingest(self, entry: dict) -> dict:
+        """Take an entry recorded elsewhere (the running DM's receipt). Returns its compact form."""
+        return self._ingest(entry)
+
     def _ingest(self, entry: dict) -> dict:
         seq = int(entry["seq"])
         self.seq = max(self.seq, seq)
         self.status[seq] = entry["status"]
+        if self.keep_full:
+            self.full[seq] = entry
         if entry.get("decision"):
             self.decisions[seq] = (entry["what"], entry["decision"])
         llm = entry.get("llm")
@@ -127,10 +157,16 @@ class Receipt:
             self.recent.popitem(last=False)
         return c
 
+    def apply_update(self, seq, status) -> dict | None:
+        """A later outcome recorded elsewhere. Returns the entry's new compact form."""
+        return self._apply_update(seq, status)
+
     def _apply_update(self, seq, status) -> dict | None:
         if seq not in self.status or not status:
             return None
         self.status[seq] = status
+        if self.keep_full and seq in self.full:
+            self.full[seq]["status"] = status
         c = self.recent.get(seq)
         if c is not None:
             c["status"] = status
@@ -151,6 +187,53 @@ class Receipt:
         """Everything the game shows: recent entries (oldest first), run totals, where the file is."""
         return {"entries": list(self.recent.values()), "totals": self.totals(),
                 "file": self.path.name if self.path else None}
+
+    # ------------------------------------------------- with keep_full: the app
+    def run_summary(self) -> dict | None:
+        """The after-death / victory screen, if the run got that far (with its epitaph, once written)."""
+        summary = None
+        for seq in sorted(self.full):
+            e = self.full[seq]
+            if e.get("what") == "run_summary" and isinstance(e.get("summary"), dict):
+                summary = dict(e["summary"])
+            elif e.get("what") == "epitaph" and e.get("status") == "written" and summary is not None:
+                summary["epitaph"] = e.get("result")
+        return summary
+
+    def plans(self) -> tuple[str | None, str | None]:
+        """The latest run narrative and floor brief written into this receipt."""
+        narrative = brief = None
+        for seq in sorted(self.full):
+            e = self.full[seq]
+            if e.get("status") == "written" and isinstance(e.get("text"), str):
+                if e.get("what") == "narrative":
+                    narrative = e["text"]
+                elif e.get("what") == "floor_brief":
+                    brief = e["text"]
+        return narrative, brief
+
+
+# ------------------------------------------------------------------ files
+FILE_RE = re.compile(r"^(\d{8})-(\d{6})(?:-\d+)?_run-(.+)\.jsonl$")
+
+
+def load(path: Path) -> Receipt:
+    """A whole receipt file, read only (the app's History)."""
+    r = Receipt(None, keep=sys.maxsize, keep_full=True)
+    r.source = path
+    r._replay(path)
+    r.run_id = next((e["run"] for e in r.full.values() if e.get("run")), None)
+    return r
+
+
+def file_info(path: Path) -> dict:
+    """What a receipt's file name says: when its run started, and the seed."""
+    m = FILE_RE.match(path.name)
+    try:
+        started = time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S") if m else time.localtime(path.stat().st_mtime)
+    except (ValueError, OSError):
+        started = time.localtime(0)
+    return {"path": path, "started": time.strftime("%Y-%m-%d %H:%M", started), "seed": m.group(3) if m else path.stem}
 
 
 # ------------------------------------------------------------------ for the game

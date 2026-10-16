@@ -538,3 +538,39 @@ def test_planners_are_told_what_the_player_really_holds():
     line = loadout(held)
     assert "Tainted Isaac" in line and "active item: The D6" in line and "unlocked" not in line
     assert "unknown" in loadout({})
+
+
+def test_reconfigure_swaps_models_mid_run_and_keeps_the_run():
+    """The app's Settings: a new DM takes over with the same run, plans, cruelty and receipt."""
+    from receipt import Receipt
+    from server import Engine
+    import tempfile
+
+    old_dm, planner = CampaignDM(1), ScriptedPlanner()
+    coord = Coordinator(old_dm, cruelty=6, planner=planner, receipt=Receipt(Path(tempfile.mkdtemp())))
+    new_dm = CampaignDM(1)
+    new_dm.cruelties = []
+    new_dm.set_cruelty = new_dm.cruelties.append
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True,
+                            "cruelty": 8}, send)
+        await coord.handle(floor_req(1, 1, "Basement I"), send)
+        await asyncio.sleep(0.05)
+        path = coord.receipt.path
+        coord.reconfigure(Engine(new_dm, ScriptedPlanner(), None, concurrency=2, late_grace=1.5, label="new"))
+        await coord.handle(floor_req(2, 1, "Basement I"), send)
+        await asyncio.sleep(0.05)
+        return path
+
+    path = asyncio.run(go())
+    assert len(old_dm.seen) == 1 and len(new_dm.seen) == 1        # the second decision went to the new DM
+    assert new_dm.cruelties == [8]                                 # told the run's cruelty, not the default
+    assert "NARRATIVE for Isaac" in new_dm.campaigns[0] and "BRIEF for Basement I" in new_dm.campaigns[0]
+    assert coord.late_grace_s == 1.5 and coord.gate is None
+    assert coord.receipt.path == path and coord.memory.run_id == "R1"
+    assert [m["ok"] for m in sent if m["t"] == "res"] == [True, True]

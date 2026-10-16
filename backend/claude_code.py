@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,8 @@ CLAUDE_CODE_CONCURRENCY = 3
 CLAUDE_CODE_LATE_GRACE_S = 20.0
 
 _PROMPT_DIR = Path(tempfile.gettempdir()) / "llmdm_claude_code"
+# The app has no console: without this, Windows opens one for every claude.exe it starts.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def find_claude(explicit: str | None = None) -> str:
@@ -89,7 +92,7 @@ class ClaudeCodeRunner:
         # Run outside the repo so no project CLAUDE.md or settings ride along.
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=tempfile.gettempdir(), stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, creationflags=_NO_WINDOW)
         try:
             out, err = await asyncio.wait_for(proc.communicate(user.encode("utf-8")), timeout or self.timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError):
