@@ -69,7 +69,7 @@ end
 
 local holds = {}         -- key -> hold (see Loading.hold), while the game waits on that decision
 local holdFrames = 0     -- frames the current freeze has lasted (for the run clock)
-local frozen = {}        -- ptr hash -> entity this freeze stopped (FLAG_FREEZE), freed when it ends
+local frozen = {}        -- ptr hash -> {e, ...} for what this freeze stopped (FLAG_FREEZE), freed when it ends
 
 function Loading.active() return on or next(holds) ~= nil end
 
@@ -191,17 +191,34 @@ function Loading.holding(key) return holds[key] ~= nil end
 
 local function hashOf(e) return GetPtrHash and GetPtrHash(e) or e end
 
+-- FLAG_FREEZE alone can't be trusted: it is a status effect with no countdown, and the game may
+-- clear it (enemies just spawned into a new room walked straight through it), so it is put back
+-- every frame. Enemies are really stopped by Loading.holdNpc; projectiles have no pre-update
+-- hook in the vanilla API, so they are pinned in place here.
 local function freezeWorld()
   pcall(function() Isaac.GetPlayer(0):SetMinDamageCooldown(30) end)
   pcall(function() game:Darken(1, 2) end)
   local flag = EntityFlag and EntityFlag.FLAG_FREEZE
   if not flag then return end
   for _, e in ipairs(Isaac.GetRoomEntities()) do
-    if e.Type == EntityType.ENTITY_PROJECTILE or e:IsActiveEnemy(false) then
+    local shot = e.Type == EntityType.ENTITY_PROJECTILE and e:ToProjectile()
+    if shot or e:IsActiveEnemy(false) then
       local h = hashOf(e)
-      if not frozen[h] and not e:HasEntityFlags(flag) then   -- already frozen by the game: not ours to free
-        frozen[h] = e
+      local f = frozen[h]
+      if not f and not e:HasEntityFlags(flag) then   -- already frozen by the game: not ours to free
+        f = { e = e }
+        if shot then
+          f.pos, f.vel = Vector(e.Position.X, e.Position.Y), Vector(e.Velocity.X, e.Velocity.Y)
+          f.height, f.fall = shot.Height, shot.FallingSpeed
+        end
+        frozen[h] = f
+      end
+      if f then
         pcall(function() e:AddEntityFlags(flag) end)
+        if shot then
+          e.Position, e.Velocity = f.pos, Vector(0, 0)
+          shot.Height, shot.FallingSpeed = f.height, 0
+        end
       end
     end
   end
@@ -209,8 +226,13 @@ end
 
 local function thaw()
   local flag = EntityFlag and EntityFlag.FLAG_FREEZE
-  for _, e in pairs(frozen) do
-    pcall(function() if e:Exists() then e:ClearEntityFlags(flag) end end)
+  for _, f in pairs(frozen) do
+    pcall(function()
+      local e = f.e
+      if not e:Exists() then return end
+      e:ClearEntityFlags(flag)
+      if f.vel then e.Velocity, e:ToProjectile().FallingSpeed = f.vel, f.fall end
+    end)
   end
   frozen = {}
   State.addPausedFrames(holdFrames)     -- the freeze isn't part of the run's time either
@@ -262,6 +284,15 @@ function Loading.updateHolds()
   else
     thaw()
   end
+end
+
+--- MC_PRE_NPC_UPDATE: while the game is held, no enemy thinks or moves. Returning true skips its
+--- AI, but not its physics, so its velocity is zeroed too. This also covers enemies that spawn
+--- mid-hold, and a room's first frames, before freezeWorld has run once.
+function Loading.holdNpc(_, npc)
+  if not next(holds) then return nil end
+  npc.Velocity = Vector(0, 0)
+  return true
 end
 
 --- A new run: whatever the last one was waiting on is gone.
