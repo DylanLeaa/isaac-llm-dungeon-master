@@ -186,7 +186,7 @@ class RunView(ttk.Frame):
         cards.pack(fill="x")
         self.cards = {k: Card(cards, c) for k, c in (
             ("bill", "LLM bill"), ("tokens", "tokens in/cached/out"), ("applied", "decisions used"),
-            ("replaced", "paid for, not used"), ("fallback", "left to vanilla"), ("problems", "timeouts / errors"))}
+            ("replaced", "paid for, not used"), ("fallback", "DM gave up"), ("problems", "timeouts / errors"))}
         self.card_cols = 0
         cards.bind("<Configure>", lambda e: self._lay_cards(cards, 6 if e.width >= 860 else 3))
         self._lay_cards(cards, 6)
@@ -312,7 +312,7 @@ class RunView(ttk.Frame):
         sections = [("THE DM", rows)]
         if summary:
             sections = [(s["title"], s["rows"]) for s in summary.get("sections", [])]
-        on_cards = ("LLM bill", "Left to vanilla")
+        on_cards = ("LLM bill", "DM gave up")
         sections = [(name, [row for row in rows if row[0] not in on_cards]) for name, rows in sections]
         col = 0
         for name, sec_rows in sections:

@@ -79,7 +79,7 @@ function Receipt.totalLines()
     "cost " .. money(t.cost) .. ", " .. pct .. "% input cached",
     "tokens in " .. k(inTok) .. ", out " .. k(t.out),
     "applied " .. int(t.applied) .. "  replaced " .. int(t.replaced),
-    "superseded " .. int(t.superseded) .. "  vanilla " .. int(t.fallback),
+    "superseded " .. int(t.superseded) .. "  gave up " .. int(t.fallback),
     "timeout " .. int(t.timeout) .. "  error " .. int(t.error),
   }
 end

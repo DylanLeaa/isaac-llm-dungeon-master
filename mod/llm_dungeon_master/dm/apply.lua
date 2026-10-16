@@ -120,13 +120,14 @@ function Apply.update()
   gridQueue = {}
 end
 
-local function layoutPickups(mode, rng)
+-- The room's own pickups: spawned with it, so younger than 5 frames plus however late the layout is.
+local function layoutPickups(mode, rng, late)
   if mode == nil or mode == "keep" then return end
   local list = {}
   for _, e in ipairs(Isaac.FindByType(EntityType.ENTITY_PICKUP)) do
     local p = e:ToPickup()
     if p and p.Variant ~= PickupVariant.PICKUP_COLLECTIBLE and p.Price == 0
-        and not p:IsShopItem() and p.FrameCount < 5 then
+        and not p:IsShopItem() and p.FrameCount < 5 + late then
       list[#list + 1] = p
     end
   end
@@ -205,12 +206,13 @@ local function enemies(decision, rng)
   end
 end
 
-function Apply.roomLayout(decision)
+--- late: frames since the player walked in, when the layout lands after (the game held for it).
+function Apply.roomLayout(decision, late)
   local room = game:GetRoom()
   local rng = RNG()
   local seed = room:GetSpawnSeed()
   rng:SetSeed(seed ~= 0 and seed or 1, 35)
-  pcall(layoutPickups, decision.layout_pickups, rng)
+  pcall(layoutPickups, decision.layout_pickups, rng, late or 0)
   pcall(rocks, decision, rng)
   pcall(enemies, decision, rng)
   for _, name in ipairs(decision.bonus_pickups or {}) do
@@ -233,6 +235,16 @@ function Apply.curses(decision, curses)
     if bit then mask = mask | bit end
   end
   return math.floor(mask)
+end
+
+--- The same plan, on a floor that already exists (its plan landed after it was generated).
+function Apply.cursesNow(decision)
+  local level = game:GetLevel()
+  local cur = math.floor(level:GetCurses())
+  local want = Apply.curses(decision, cur)
+  local off, on = cur & ~want, want & ~cur
+  if off ~= 0 then pcall(function() level:RemoveCurses(off) end) end
+  if on ~= 0 then pcall(function() level:AddCurse(on, false) end) end
 end
 
 function Apply.init(taunt) Taunt = taunt end

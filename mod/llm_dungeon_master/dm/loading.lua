@@ -6,13 +6,21 @@
 -- floor's first asks are held on the backend until it lands. Second, every decision the floor
 -- opened with has an answer (the start room's neighbour layouts, the floor's item pools, the
 -- consumables plan). Without this screen those first asks would land after the player walked
--- through the door, and vanilla RNG would decide.
+-- through the door, and the game would freeze on a hold (below) right away.
 --
 -- On a new floor the mod sends "prepare" with a snapshot and the floor number; the backend
 -- answers "ready" for that floor. Meanwhile input is blocked, the player can't be hurt, the HUD is
 -- hidden and the run clock is stopped. The wait can't be skipped. The screen also ends on its own if the
 -- backend can't be reached (CONNECT) or takes too long (TIMEOUT): a DM that never answers must not
 -- lock the player out of the game. Nothing here ever blocks the game after it ends.
+--
+-- Holds: mid-run, the game sometimes needs a decision the DM hasn't answered yet (a room's
+-- layout as the player walks in, the reward as the last enemy dies, a pedestal's item, a pill's
+-- effect). It never decides without the DM: it freezes on this screen (input blocked, enemies
+-- frozen, the player can't be hurt) until the answer lands, then the caller applies it. If the
+-- backend says it has no answer, the hold asks again (HOLD_RETRIES). It only gives up if the
+-- backend is gone (CONNECT) or the answer never comes (HOLD_TIMEOUT); the caller then leaves the
+-- game as it is.
 local Loading = {}
 
 local game = Game()
@@ -58,7 +66,11 @@ local function hud(visible)
   pcall(function() game:GetHUD():SetVisible(visible) end)
 end
 
-function Loading.active() return on end
+local holds = {}         -- key -> hold (see Loading.hold), while the game waits on that decision
+local holdFrames = 0     -- frames the current freeze has lasted (for the run clock)
+local frozen = {}        -- ptr hash -> entity this freeze stopped (FLAG_FREEZE), freed when it ends
+
+function Loading.active() return on or next(holds) ~= nil end
 
 local function begin(n)
   floor, sent, verdict, keysDone, keysTotal = n, false, nil, 0, 0
@@ -72,6 +84,7 @@ end
 
 --- A new run (or a continue) has started: its first floor waits for the run narrative too.
 function Loading.start()
+  Loading.dropHolds()
   on, runStart, loadedFloor, readyAt = false, true, 0, nil
   noticeAt = Isaac.GetTime() + cfg.LOADING_CONNECT_MS
   begin(0)
@@ -142,9 +155,112 @@ function Loading.update()
   pcall(function() game:Darken(1, 2) end)
 end
 
+-- ------------------------------------------------------------------ holds
+local FRAME_MS = 1000 / 30
+
+--- Freeze the game until the DM answers `key`. spec:
+---   label   what the screen says the DM is deciding ("your reward")
+---   ask()   (re)sends the request; called now if nothing is on its way, and on each retry
+---   apply(res)  the answer is in (res = Bridge.peek(key)); take or mark it applied here
+---   giveUp()    optional: no answer is coming; leave the game as it is
+---   stale   optional: a result id already seen and not good enough (wait for a newer one)
+--- One hold per key: holding a key that is already held keeps the first spec, so callers keep
+--- what the answer is for (the pedestals, the pickups) in their own state.
+function Loading.hold(key, spec)
+  if holds[key] or not key then return end
+  local res = Bridge.peek(key)
+  if res and res.id ~= spec.stale then return spec.apply(res) end   -- landed after all
+  holds[key] = { spec = spec, frames = 0, offline = 0, retries = 0 }
+  if not Bridge.isPending(key) then spec.ask() end
+  Isaac.DebugString("[LLMDM] holding the game for " .. key)
+end
+
+function Loading.holding(key) return holds[key] ~= nil end
+
+local function hashOf(e) return GetPtrHash and GetPtrHash(e) or e end
+
+local function freezeWorld()
+  pcall(function() Isaac.GetPlayer(0):SetMinDamageCooldown(30) end)
+  pcall(function() game:Darken(1, 2) end)
+  local flag = EntityFlag and EntityFlag.FLAG_FREEZE
+  if not flag then return end
+  for _, e in ipairs(Isaac.GetRoomEntities()) do
+    if e.Type == EntityType.ENTITY_PROJECTILE or e:IsActiveEnemy(false) then
+      local h = hashOf(e)
+      if not frozen[h] and not e:HasEntityFlags(flag) then   -- already frozen by the game: not ours to free
+        frozen[h] = e
+        pcall(function() e:AddEntityFlags(flag) end)
+      end
+    end
+  end
+end
+
+local function thaw()
+  local flag = EntityFlag and EntityFlag.FLAG_FREEZE
+  for _, e in pairs(frozen) do
+    pcall(function() if e:Exists() then e:ClearEntityFlags(flag) end end)
+  end
+  frozen = {}
+  State.addPausedFrames(holdFrames)     -- the freeze isn't part of the run's time either
+  holdFrames = 0
+end
+
+-- One hold, one frame. A hold that's over is dropped before its callback runs, so the callback
+-- may hold the same key again.
+local function step(key, h)
+  local res = Bridge.peek(key)
+  if res and res.id ~= h.spec.stale then
+    Isaac.DebugString("[LLMDM] " .. key .. " answered after a " .. math.floor(h.frames * FRAME_MS) .. "ms hold")
+    holds[key] = nil
+    return h.spec.apply(res)
+  end
+  h.frames = h.frames + 1
+  local why
+  if not Bridge.ready() then
+    h.offline = h.offline + 1
+    if h.offline * FRAME_MS > cfg.LOADING_CONNECT_MS then why = "backend gone" end
+  elseif not Bridge.isPending(key) then           -- answered "no decision", or never answered
+    h.offline = 0
+    if h.retries < (cfg.HOLD_RETRIES or 2) then
+      h.retries = h.retries + 1
+      h.spec.ask()
+    else
+      why = "no answer after " .. h.retries .. " re-asks"
+    end
+  end
+  if not why and h.frames * FRAME_MS > (cfg.HOLD_TIMEOUT_MS or 45000) then why = "timed out" end
+  if not why then return end
+  Isaac.DebugString("[LLMDM] gave up holding for " .. key .. ": " .. why)
+  holds[key] = nil
+  Taunt.show("I lost my train of thought. Carry on.")
+  if h.spec.giveUp then h.spec.giveUp(why) end
+end
+
+--- MC_POST_UPDATE: resolve holds whose answers are in, keep the world frozen for the rest.
+function Loading.updateHolds()
+  if not next(holds) then return end
+  local keys = {}                     -- an answer's apply may start another hold: don't walk a moving table
+  for key in pairs(holds) do keys[#keys + 1] = key end
+  for _, key in ipairs(keys) do
+    if holds[key] then step(key, holds[key]) end
+  end
+  if next(holds) then
+    if not on then holdFrames = holdFrames + 1 end   -- the floor screen counts its own frames
+    freezeWorld()
+  else
+    thaw()
+  end
+end
+
+--- A new run: whatever the last one was waiting on is gone.
+function Loading.dropHolds()
+  holds = {}
+  frozen, holdFrames = {}, 0
+end
+
 --- MC_INPUT_ACTION: nothing the player presses reaches the game while the screen is up.
 function Loading.blockInput(_, _, hook, action)
-  if not on then return nil end
+  if not on and not next(holds) then return nil end
   if action == ButtonAction.ACTION_PAUSE then return nil end   -- they can always leave
   if hook == InputHook.GET_ACTION_VALUE then return 0 end
   return false
@@ -160,8 +276,20 @@ local function draw(s, x, y, color, boxW)
 end
 
 --- MC_POST_RENDER.
+local function renderHold()
+  local key, h = next(holds)
+  if not key then return end
+  local most = h
+  for _, o in pairs(holds) do if o.frames > most.frames then most = o end end
+  local w, ht = Isaac.GetScreenWidth(), Isaac.GetScreenHeight()
+  local t = Isaac.GetTime()
+  draw("The DM is deciding " .. (most.spec.label or "something") .. string.rep(".", 1 + math.floor(t / 400) % 3),
+       0, ht / 2 - 14, RED, w)
+  draw(string.format("%ds", math.floor(most.frames * FRAME_MS / 1000)), 0, ht / 2 + 4, WHITE, w)
+end
+
 function Loading.render()
-  if not on then return end
+  if not on then return renderHold() end
   local t = clock
   local w, h = Isaac.GetScreenWidth(), Isaac.GetScreenHeight()
   local secs = math.floor((t - startedAt) / 1000)

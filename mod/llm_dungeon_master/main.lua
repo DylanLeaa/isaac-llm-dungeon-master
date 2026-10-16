@@ -18,8 +18,8 @@ local Loading = include("dm.loading")
 
 Taunt.enabled = cfg.SHOW_TAUNTS
 Apply.init(Taunt)
-Cons.init(cfg, Bridge, State, Taunt)
-Sched.init(cfg, Bridge, State, Apply, Taunt, Cons)
+Cons.init(cfg, Bridge, State, Taunt, Loading)
+Sched.init(cfg, Bridge, State, Apply, Taunt, Cons, Loading)
 
 local game = Game()
 
@@ -96,6 +96,7 @@ local lastQueued
 mod:AddCallback(ModCallbacks.MC_POST_UPDATE, safe("update", function()
   Apply.update()
   Sched.update()
+  Loading.updateHolds()     -- after the scheduler, which may have started one
   -- Item pickup detection (for the DM's memory).
   local p = Isaac.GetPlayer(0)
   local q = p.QueuedItem and p.QueuedItem.Item
@@ -120,6 +121,15 @@ mod:AddCallback(ModCallbacks.MC_POST_RENDER, safe("render", function()
 end))
 
 mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, Loading.blockInput)
+mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, safe("block_pill", function(_, ent, hook, action)
+  return Cons.blockPill(ent, hook, action)
+end))
+
+-- Pickups the game filled without the DM's answer, to be swapped once it lands.
+mod:AddCallback(ModCallbacks.MC_POST_PICKUP_INIT, safe("pickup_init", function(_, pickup)
+  Sched.onPickupInit(pickup)
+  Cons.onPickupInit(pickup)
+end))
 
 mod:AddCallback(ModCallbacks.MC_PRE_SPAWN_CLEAN_AWARD, safe("clean_award", function(_, rng, pos)
   return Sched.onCleanAward(rng, pos)

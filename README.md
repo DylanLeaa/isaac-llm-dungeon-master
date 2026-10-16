@@ -29,16 +29,23 @@ and a voice. Both go into Haiku's system prompt, so every decision serves the pl
 ## The timing model (asking late, but not too late)
 
 Every decision is requested ahead of the moment the game needs it, with the freshest
-snapshot available, and the game **never waits**: if the answer isn't there in time, vanilla RNG
-decides that one event.
+snapshot available. When the answer isn't there in time, the game **never decides without the DM**:
+it freezes on the loading screen (input blocked, enemies frozen, you can't be hurt) until the answer
+lands, asking right then if it never asked. Rooms are dressed and rewards dropped late. Item pedestals
+and cards/trinkets, which the game fills on the spot, are swapped for the DM's picks once they come.
+A pill the plan doesn't cover won't go down until it does. A floor's curses change once its plan lands.
+If the backend answers "no decision", it is asked again (`HOLD_RETRIES`). The freeze only ends without
+the DM if the backend is gone (`LOADING_CONNECT_MS`) or `HOLD_TIMEOUT_MS` passes. Then the game is left as
+it is (a skipped room-clear award stays skipped), and the receipt counts it under "DM gave up". With no
+backend at all, the run is plain vanilla.
 
 | Decision | Asked when | Refreshed when | Used at |
 |---|---|---|---|
-| `room_layout` (enemies, champions, rocks, pickups) | you enter a room bordering an unvisited normal room | your HP / K-B-C / items change while you linger | `MC_POST_NEW_ROOM` of that room (or ≤20 frames later if the answer is late) |
-| `room_clear` (the drop; normal, miniboss and curse rooms. In boss rooms it is a bonus on top of the game's own award) | **estimated time-to-clear** (remaining enemy HP ÷ your recent DPS) < `1.4 × p90 latency + 400ms`, or the room is nearly dead | you get hit or pick something up and there's still time for a new answer | `MC_PRE_SPAWN_CLEAN_AWARD` |
-| `item_choice` (ranked real candidates from the pool) | floor start, and again when you stand next to a treasure/shop/boss/devil/ultra secret/… room; chest and beggar pools when one shows up in your room | — | `MC_PRE_GET_COLLECTIBLE` (also catches D6 rerolls) |
-| `consumables` (next cards/runes, next trinkets, an effect per pill colour in play) | floor start | a pill colour the plan doesn't cover appears (held or on the floor), or the card/trinket queues run dry | `MC_GET_CARD`, `MC_GET_TRINKET`, `MC_GET_PILL_EFFECT` |
-| `floor_plan` (curses, treasure distance) | you enter the boss room | boss dies | `MC_POST_CURSE_EVAL` of the next floor |
+| `room_layout` (enemies, champions, rocks, pickups) | you enter a room bordering an unvisited normal room | your HP / K-B-C / items change while you linger | `MC_POST_NEW_ROOM` of that room (held until the answer lands) |
+| `room_clear` (the drop; normal, miniboss and curse rooms. In boss rooms it is a bonus on top of the game's own award) | **estimated time-to-clear** (remaining enemy HP ÷ your recent DPS) < `1.4 × p90 latency + 400ms`, or the room is nearly dead | you get hit or pick something up and there's still time for a new answer | `MC_PRE_SPAWN_CLEAN_AWARD` (late: the game's award is skipped, held, and the DM's dropped after) |
+| `item_choice` (ranked real candidates from the pool) | floor start, and again when you stand next to a treasure/shop/boss/devil/ultra secret/… room; chest and beggar pools when one shows up in your room | — | `MC_PRE_GET_COLLECTIBLE` (also catches D6 rerolls; late: the pedestal is swapped once the ranking lands) |
+| `consumables` (next cards/runes, next trinkets, an effect per pill colour in play) | floor start | a pill colour the plan doesn't cover appears (held or on the floor), or the card/trinket queues run dry | `MC_GET_CARD`, `MC_GET_TRINKET` (late: the pickup is swapped), `MC_GET_PILL_EFFECT` (the pill button holds until it's covered) |
+| `floor_plan` (curses, treasure distance) | you enter the boss room | boss dies | `MC_POST_CURSE_EVAL` of the next floor (late: curses changed once the plan lands) |
 
 The planners start when the first request of a new run, or of a new floor (`stage` and
 `stage_type` from the snapshot), reaches the backend. A new run opens on a **loading screen**: the mod
@@ -79,7 +86,7 @@ Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the
 *The app (what players run).* `LLM Dungeon Master.exe` opens a window instead of a console. In
 **Settings**, paste an OpenRouter key or switch on **Use Claude Code**, then press **Save and apply**.
 Changes apply to the running DM straight away, mid-run included. The window has four tabs:
-- **Current run**: the receipt summary (LLM bill, tokens, decisions used / unused / left to vanilla,
+- **Current run**: the receipt summary (LLM bill, tokens, decisions used / unused / the DM gave up on,
   what the DM did to you, its scheme, last taunt and epitaph), every entry live, the selected entry
   in full, and the run narrative and floor brief.
 - **History**: every past run's receipt in the same view.
@@ -169,7 +176,7 @@ console commands disable achievements for that run.
 
 Every engine action is written to a per-run receipt: each decision with its request (snapshot,
 context, memory digest), the model's raw tool call, the clamped result and the guardrails that
-fired. It also gets the planners' narrative and briefs, fallbacks to vanilla, timeouts, errors,
+fired. It also gets the planners' narrative and briefs, holds the DM gave up on, timeouts, errors,
 superseded calls and cruelty changes. Each LLM call keeps its model, provider, generation id,
 finish reason, raw response message, tokens and cost.
 
@@ -181,7 +188,7 @@ finish reason, raw response message, tokens and cost.
   file, even after a backend restart.
 - **In the app**: the Current run and History tabs (see Setup).
 - **In game**: Mod Config Menu → **DM Settings → Receipt** shows run totals (actions, LLM calls,
-  cost, tokens, cache hit rate, applied/replaced/vanilla/timeouts/errors), an entry browser
+  cost, tokens, cache hit rate, applied/replaced/gave up/timeouts/errors), an entry browser
   (left/right steps back through the last 40 actions: model, latency, tokens, cost, intent,
   result, taunt, guardrails, errors) and the latest ten at a glance. The cruelty slider is on
   the **General** tab. If lines get cut off, lower `RECEIPT_WIDTH` in `dm/config.lua`.
@@ -199,7 +206,7 @@ then the DM's epitaph and its con. The note positions are measured constants at 
 - **You**: floor reached, run time, rooms cleared, damage taken, items, pills eaten and
   what hit you last. These come from the mod, so they appear at once, even with the backend offline.
 - **The DM**: rooms it dressed, extra enemies, keys/bombs/coins/hearts it dropped, troll bombs,
-  curses, bad pills, events left to vanilla and the LLM bill. Only decisions the game actually
+  curses, bad pills, decisions it gave up on and the LLM bill. Only decisions the game actually
   used count. They are tallied from the receipt, so a continued run still counts in full.
 - The run's title from the Opus narrative, the DM's last taunt, the long con it was running
   (its private `scheme`, revealed at last) and an **epitaph** Haiku writes for the run. The
