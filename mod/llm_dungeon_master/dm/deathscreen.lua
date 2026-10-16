@@ -7,7 +7,22 @@
 -- later, the DM's epitaph.
 local Death = {}
 
-local cfg, Bridge, State, Cons, Settings, wrap
+local cfg, Bridge, State, Cons, Settings
+
+--- Split text into lines of at most `width` chars, breaking on spaces where possible.
+local function wrap(text, width, out)
+  out = out or {}
+  text = tostring(text):gsub("%s+", " ")
+  while #text > width do
+    local cut = width
+    local space = text:sub(1, width + 1):match(".*() ")
+    if space and space > width / 2 then cut = space - 1 end
+    out[#out + 1] = text:sub(1, cut)
+    text = text:sub(cut + 1):gsub("^ ", "")
+  end
+  if #text > 0 then out[#out + 1] = text end
+  return out
+end
 
 -- {run, outcome, character, title, sections = {{title, rows = {{label, value}}}}, scheme, taunt,
 --  epitaph, epitaph_pending, dm_pending}
@@ -233,8 +248,8 @@ function Death.render()
   drawColumn(right, sw - EDGE - w, w, RESTART_Y * k)
 end
 
-function Death.init(config, bridge, state, cons, settings, wrapFn)
-  cfg, Bridge, State, Cons, Settings, wrap = config, bridge, state, cons, settings, wrapFn
+function Death.init(config, bridge, state, cons, settings)
+  cfg, Bridge, State, Cons, Settings = config, bridge, state, cons, settings
   local saved = Settings.load().last_run
   if type(saved) == "table" and type(saved.sections) == "table" then
     saved.epitaph_pending, saved.dm_pending = nil, nil   -- whatever was on its way is not coming

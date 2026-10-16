@@ -356,6 +356,71 @@ def _pill_enum(effect: str) -> str:
     return "PILLEFFECT_" + effect.upper()
 
 
+def clamp_diff(kind: str, raw: Any, out: Any) -> list[str]:
+    """What clamp() changed: "asked -> got" for every field the model didn't get as asked.
+
+    Fields the model left out (their defaults) don't count. Text fields (intent, taunt, scheme)
+    are only tidied, so they never do either.
+    """
+    if not isinstance(raw, dict) or not isinstance(out, dict):
+        return []
+    diffs: list[str] = []
+
+    def num(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    def counted(items: Any, name: str) -> str:
+        bits = [f'{int(num(i.get("count"), 1))}x {i.get(name)}' for i in items or [] if isinstance(i, dict)]
+        return ", ".join(bits) or "none"
+
+    def listed(items: Any) -> str:
+        return ", ".join(str(i) for i in items or []) or "none"
+
+    def check(label: str, asked: str, got: str) -> None:
+        if asked != got:
+            diffs.append(f"{label} {asked} -> {got}")
+
+    if kind == "room_layout":
+        if "champion_chance" in raw:
+            check("champion chance", f'{round(100 * num(raw["champion_chance"]))}%',
+                  f'{round(100 * num(out.get("champion_chance")))}%')
+        if raw.get("champion_color") not in (None, "random"):
+            check("champion color", str(raw["champion_color"]), str(out.get("champion_color")))
+        if "extra_enemies" in raw:
+            check("extra enemies", counted(raw["extra_enemies"], "enemy"), counted(out.get("extra_enemies"), "key"))
+        if "tinted_rocks" in raw:
+            check("tinted rocks", str(int(num(raw["tinted_rocks"]))), str(out.get("tinted_rocks")))
+        if raw.get("hide_tinted_rocks"):
+            check("hide tinted rocks", "yes", "yes" if out.get("hide_tinted_rocks") else "no")
+        if raw.get("layout_pickups") not in (None, "keep"):
+            check("layout pickups", str(raw["layout_pickups"]), str(out.get("layout_pickups")))
+        if "bonus_pickups" in raw:
+            check("bonus pickups", listed(raw["bonus_pickups"]), listed(out.get("bonus_pickups")))
+    elif kind == "room_clear":
+        check("rewards", counted(raw.get("rewards"), "reward"), counted(out.get("rewards"), "reward"))
+    elif kind == "item_choice":
+        valid = {str(i) for i in out.get("order") or []}
+        ignored = [str(i) for i in raw.get("order") or [] if str(i).strip() not in valid]
+        if ignored:
+            diffs.append("ignored ids not in the pool: " + ", ".join(ignored))
+    elif kind == "floor_plan":
+        check("curses", listed(raw.get("add_curses")), listed(out.get("add_curses")))
+        if raw.get("treasure_distance") not in (None, "any"):
+            check("treasure", str(raw["treasure_distance"]), str(out.get("treasure_distance")))
+    elif kind == "consumables":
+        check("cards", listed(raw.get("cards")), listed(c["key"] for c in out.get("cards") or []))
+        check("trinkets", listed(raw.get("trinkets")), listed(out.get("trinkets")))
+        asked = {str(p.get("color")): p.get("effect") for p in raw.get("pills") or [] if isinstance(p, dict)}
+        got = {str(p["color"]): p["effect"] for p in out.get("pills") or []}
+        for color, effect in asked.items():
+            if got.get(color) != effect:
+                diffs.append(f"pill {color} {effect} -> {got.get(color, 'dropped')}")
+    return diffs
+
+
 def summarize_categories(rewards: list[dict]) -> dict[str, int]:
     """Count rewards by resource family (used to update drought counters)."""
     fam = {"keys": 0, "bombs": 0, "coins": 0, "hearts": 0, "traps": 0}

@@ -87,7 +87,8 @@ Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the
 **Settings**, paste an OpenRouter key or switch on **Use Claude Code**, then press **Save and apply**.
 Changes apply to the running DM straight away, mid-run included. The window has four tabs:
 - **Current run**: the receipt summary (LLM bill, tokens, decisions used / unused / the DM gave up on,
-  what the DM did to you, its scheme, last taunt and epitaph), every entry live, the selected entry
+  what the DM did to you, its scheme, last taunt and epitaph), every entry live with its intent and
+  effect, the selected entry
   in full, and the run narrative and floor brief.
 - **History**: every past run's receipt in the same view.
 - **Settings**: the key and the Claude Code switch, plus the files the backend found.
@@ -180,18 +181,27 @@ fired. It also gets the planners' narrative and briefs, holds the DM gave up on,
 superseded calls and cruelty changes. Each LLM call keeps its model, provider, generation id,
 finish reason, raw response message, tokens and cost.
 
+In the app, each decision reads across as:
+- **Asked because**: why the game asked (`player is next to this room`, `almost clear`,
+  `refresh: player state changed while lingering`).
+- **Intent**: what the model said it is trying to do to the player (its `intent` field).
+- **Result**: what it decided, after the guardrails (`1x key`, `+2 gaper; champions 30% red`). When the
+  guardrails changed what the model asked for, the difference follows:
+  `[clamped: champion chance 60% -> 18%; extra enemies 3x gaper -> 1x gaper]`.
+- **Effect**: what that actually did in the game, as the mod saw it when it applied the decision:
+  `+1 bomb dropped`, `-1 key, -1 heart -> +2 pennies (layout pickups)`, `+2 champions (red, 30% of 5)`,
+  `+curse of darkness`, `item offered: Tech X (q4)`, `pill blue_blue = speed down`. Rankings and
+  consumables plans are used a bit at a time, so they gain a line per use (each pedestal, card, trinket
+  or pill). A decision that was never used has no effect.
+
 - **On disk**: `<started>_run-<seed>.jsonl` in `backend/receipts/` (from source) or
   `%APPDATA%\LLM Dungeon Master\receipts\` (the exe), one JSON object per line
   (`--receipts DIR` moves it, `--no-receipts` keeps it in memory only). System prompts are
   stored once per file and referenced by hash. Later outcomes (`applied`, or `replaced` when a
-  re-ask made an answer unused) are appended as `update` lines. Continuing a run resumes its
-  file, even after a backend restart.
-- **In the app**: the Current run and History tabs (see Setup).
-- **In game**: Mod Config Menu → **DM Settings → Receipt** shows run totals (actions, LLM calls,
-  cost, tokens, cache hit rate, applied/replaced/gave up/timeouts/errors), an entry browser
-  (left/right steps back through the last 40 actions: model, latency, tokens, cost, intent,
-  result, taunt, guardrails, errors) and the latest ten at a glance. The cruelty slider is on
-  the **General** tab. If lines get cut off, lower `RECEIPT_WIDTH` in `dm/config.lua`.
+  re-ask made an answer unused) are appended as `update` lines, and what an applied decision did as
+  `effect` lines. Continuing a run resumes its file, even after a backend restart.
+- **In the app**: the Current run and History tabs (see Setup). The game itself no longer shows the
+  receipt.
 
 ## The after-death stats screen
 
@@ -214,7 +224,8 @@ then the DM's epitaph and its con. The note positions are measured constants at 
 
 `SHOW_DEATH_SCREEN = false` in `dm/config.lua` turns
 the overlay off. The last finished run, including a victory, is kept in the save file under
-Mod Config Menu → **DM Settings → Last run**. The backend also logs it and adds `run_summary` and
+Mod Config Menu → **DM Settings → Last run** (if lines get cut off there, lower `MENU_WIDTH` in
+`dm/config.lua`). The backend also logs it and adds `run_summary` and
 `epitaph` entries to the receipt.
 
 ## What's tested, and what isn't
@@ -228,10 +239,10 @@ Mod Config Menu → **DM Settings → Last run**. The backend also logs it and a
   against the mock backend: prefetch → room dressed on entry → clear decision requested mid-fight
   and ready at the last kill → DM-picked treasure item → card/rune/trinket draws and a locked pill
   colour → golden-chest pool ranked on sight → boss-room floor plan and bonus clear → curse mask
-  → the DM Settings → Receipt menu filled from the backend, and the receipt file on disk → death:
+  → the receipt file on disk, with what each used decision did → death:
   the stats screen, the DM's side and its epitaph in DM Settings → Last run.
-- `tests/test_receipt.py` — the receipt: call records, applied/replaced updates, errors, planners,
-  resuming a continued run.
+- `tests/test_receipt.py` — the receipt: call records, applied/replaced updates, effects, errors,
+  planners, resuming a continued run.
 - `tests/test_epilogue.py` — the after-death stats: only applied decisions count, the epitaph
   follows the stats and a failed one never leaves the screen waiting.
 

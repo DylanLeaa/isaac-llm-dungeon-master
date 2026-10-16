@@ -42,7 +42,9 @@ from server import Coordinator, Engine, build_dm
 log = logging.getLogger("llmdm")
 
 DEFAULT_CRUELTY = 6           # until the game's DM Settings menu says otherwise
-GAME_TIMEOUT_S = 6.0          # the mod pings every 2 s: this long without a message and it's gone
+# The mod pings every 2 s, but only while the game renders: a floor's stage transition (a chapter's
+# nightmare most of all) goes quiet for a while. This long without a message and the game is gone.
+GAME_TIMEOUT_S = 15.0
 LOG_LINES = 3000
 KEYS_URL = "https://openrouter.ai/keys"
 # Text colours, set on the widget: a colour in a derived ttk style doesn't always survive the theme.
@@ -163,12 +165,18 @@ class Card(ttk.Frame):
             self.caption.configure(text=caption)
 
 
+# A decision's Effect column before the game reports one, by status.
+NO_EFFECT = {"ok": "not used yet", "replaced": "never used"}
+
+
 # ====================================================================== one run's receipt
 class RunView(ttk.Frame):
     """A run's receipt: summary on top, every entry below, the selected one in full."""
 
-    COLUMNS = (("time", "Time", 70), ("what", "What", 95), ("key", "Key", 120), ("status", "Status", 85),
-               ("result", "Result", 380), ("ms", "ms", 60), ("cost", "Cost", 70))
+    COLUMNS = (("time", "Time", 65), ("what", "What", 90), ("key", "Key", 105), ("status", "Status", 75),
+               ("reason", "Asked because", 150), ("intent", "Intent", 230), ("result", "Result", 220),
+               ("effect", "Effect", 240), ("ms", "ms", 55), ("cost", "Cost", 65))
+    WIDE = ("intent", "result", "effect")
 
     def __init__(self, master, empty: str) -> None:
         super().__init__(master, padding=(12, 10))
@@ -207,7 +215,7 @@ class RunView(ttk.Frame):
                                  selectmode="browse")
         for key, label, width in self.COLUMNS:
             self.tree.heading(key, text=label)
-            self.tree.column(key, width=width, stretch=key == "result", anchor="e" if key in ("ms", "cost") else "w")
+            self.tree.column(key, width=width, stretch=key in self.WIDE, anchor="e" if key in ("ms", "cost") else "w")
         for status, colour in STATUS_TAGS.items():
             self.tree.tag_configure(status, foreground=colour)
         bar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
@@ -259,12 +267,23 @@ class RunView(ttk.Frame):
             self.tree.insert("", 0, iid=str(seq), values=self._row(seq), tags=(self.r.full[seq].get("status"),))
 
     def _row(self, seq: int) -> tuple:
-        c = receipts.compact(self.r.full[seq])
-        result = c.get("result") or c.get("error") or c.get("intent") or ""
+        e = self.r.full[seq]
+        c = receipts.compact(e)
+        intent = c.get("intent") or ""
         if c.get("taunt"):
-            result = f'{result}  "{c["taunt"]}"' if result else f'"{c["taunt"]}"'
+            intent = f'{intent}  "{c["taunt"]}"' if intent else f'"{c["taunt"]}"'
+        # What was decided (after the guardrails, with what they changed), or what happened.
+        result = c.get("result") or c.get("error") or ""
+        if c.get("clamped"):
+            result = f'{result}  [clamped: {"; ".join(c["clamped"])}]'
+        # What a decision did in the game, once the game says.
+        if e.get("effect"):
+            effect = "; ".join(e["effect"])
+        else:
+            effect = NO_EFFECT.get(c["status"], "no effect reported") if c.get("intent") else ""
         cost = f'${c["cost"]:.4f}' if c.get("cost") else ""
-        return (c["time"], c["what"], c.get("key", ""), c["status"], result, c.get("ms", ""), cost)
+        return (c["time"], c["what"], c.get("key", ""), c["status"], c.get("reason", ""), intent, result, effect,
+                c.get("ms", ""), cost)
 
     def _show_selected(self) -> None:
         sel = self.tree.selection()
@@ -360,7 +379,7 @@ class App:
         self.receipts_dir: Path = args.receipts
         self.isaac_dirs = args.isaac_dir or bridge.isaac_installs()
         self.logs = args.log or bridge.default_logs()
-        self.current = Receipt(None, keep=sys.maxsize, keep_full=True)
+        self.current = Receipt(None, keep_full=True)
         self.dirty = False
         self.history_rows: dict[str, Path] = {}
 
@@ -452,12 +471,15 @@ class App:
         elif not dm.alive():
             self._set_status("#ff6b5b", f"The DM stopped: {dm.error or 'unknown error'}")
         elif dm.game_connected():
+            if self.current.run_id is None and dm.receipt.run_id is not None:
+                # Back after a silence that looked like the game had gone: the run is still the DM's.
+                self._new_run({"run": dm.receipt.run_id, "fresh": False, "path": dm.receipt.path})
             run = self.current.run_id
             self._set_status("#4cc96b", "Game connected" + (f"  |  run {run}" if run else ""))
         else:
             self._set_status("#8a8a8a", "Waiting for the game: start Isaac with the mod enabled")
             if self.current.full or self.current.run_id:    # no game, no current run
-                self.current = Receipt(None, keep=sys.maxsize, keep_full=True)
+                self.current = Receipt(None, keep_full=True)
                 self.run_view.show(None)
         if dm is not None:
             self.dm_label.configure(text="DM: " + dm.engine.label.split(" (")[0])
@@ -487,6 +509,9 @@ class App:
                 elif event == "update":
                     if self.current.apply_update(data["seq"], data["status"]) and self.run_view.r:
                         self.run_view.updated(int(data["seq"]))
+                elif event == "effect":
+                    if self.current.apply_effect(data["seq"], data["effect"]) and self.run_view.r:
+                        self.run_view.updated(int(data["seq"]))
         except queue.Empty:
             pass
         if changed:
@@ -498,8 +523,8 @@ class App:
         if path and not data.get("fresh") and Path(path).exists():
             self.current = receipts.load(Path(path))      # a continued run: everything so far
         else:
-            self.current = Receipt(None, keep=sys.maxsize, keep_full=True)
-            self.current.run_id = data.get("run")
+            self.current = Receipt(None, keep_full=True)
+        self.current.run_id = self.current.run_id or data.get("run")
         self.current.path = None                          # never written from here
         self.current.source = Path(path) if path else None
         self.run_view.show(self.current)

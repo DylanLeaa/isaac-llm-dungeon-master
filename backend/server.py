@@ -129,10 +129,10 @@ class Coordinator:
         self.session: str | None = None
         self.mismatched = None                    # the last session whose hello had the wrong protocol
         self.last_seen = 0.0                      # monotonic time of the game's last message
-        self.send: Send | None = None             # the game's connection, for pushing receipt entries
         # Everything the engine does this run, with the LLM calls behind it (in memory only if no dir).
         self.receipt = receipt or Receipt()
         self.receipt_seq: dict[str, int] = {}     # key -> receipt entry of the answer the game holds
+        self.used_seq: dict[str, int] = {}        # key -> receipt entry of the answer the game last used
         self.bg: set[asyncio.Task] = set()
         self.inflight: dict[str, tuple[int, asyncio.Task]] = {}
         self.sem = PrioritySemaphore(max_concurrency)
@@ -192,7 +192,7 @@ class Coordinator:
                 await send({"t": "welcome", "session": msg.get("session"), "proto": bridge.PROTO})
                 return
             self.summary()
-            self.session, self.send = str(msg.get("session")), send
+            self.session = str(msg.get("session"))
             if msg.get("run") != self.memory.run_id or msg.get("new_run"):
                 self.memory.reset(msg.get("run"))
                 self.campaign.reset()
@@ -200,14 +200,16 @@ class Coordinator:
                     task.cancel()                 # asked in the old run: don't spend DM slots on it
                 self.inflight.clear()
                 self.receipt.start_run(msg.get("run"), fresh=bool(msg.get("new_run")))
+                if not msg.get("new_run"):        # a continue: its plans are in its receipt, don't rewrite them
+                    self.campaign.restore(*self.receipt.saved_plans())
                 self.receipt_seq.clear()
+                self.used_seq.clear()
                 self.last_req.clear()
                 if self.receipt.path:
                     log.info("receipt -> %s", self.receipt.path)
             self._set_cruelty(msg.get("cruelty"))
             log.info("game connected  session=%s run=%s cruelty=%s", self.session, msg.get("run"), self.cruelty)
             await send({"t": "welcome", "session": self.session, "proto": bridge.PROTO, "cruelty": self.cruelty})
-            await send({"t": "receipt_sync", "session": self.session, **self.receipt.snapshot()})
         elif t == "settings":
             # Changed from the in-game DM Settings menu; takes effect for the next decision.
             self._set_cruelty(msg.get("cruelty"))
@@ -221,7 +223,15 @@ class Coordinator:
             if entry:
                 self.stats[entry["kind"]]["applied"] += 1
             self.memory.on_applied(str(msg.get("key")))
-            self._push_receipt(self.receipt.update(self.receipt_seq.pop(str(msg.get("key")), None), "applied"))
+            seq = self.receipt_seq.pop(str(msg.get("key")), None)
+            if seq is not None:
+                self.used_seq[str(msg.get("key"))] = seq
+            self.receipt.update(seq, "applied")
+        elif t == "effect":
+            # What a used answer actually did in the game. It follows the answer's "applied".
+            key = str(msg.get("key"))
+            if self.receipt.add_effect(self.used_seq.get(key, self.receipt_seq.get(key)), msg.get("effect")):
+                log.info("%-26s effect: %s", key, "; ".join(map(str, msg.get("effect") or [])))
         elif t == "event" and msg.get("name") == "fallback":
             # The game froze waiting for this decision and gave up on it (the DM never answered, even
             # after re-asks): the game went ahead without it. Not news for the DM.
@@ -253,19 +263,8 @@ class Coordinator:
 
     # ------------------------------------------------------------------ receipt
     def _record(self, what: str, status: str, **fields) -> int:
-        """Add an entry to the receipt and show it in the game's menu. Returns its seq."""
-        entry = self.receipt.add(what, status, session=self.session, **fields)
-        self._push_receipt(entry)
-        return entry["seq"]
-
-    def _push_receipt(self, entry: dict | None) -> None:
-        if entry is None or self.send is None:
-            return
-        # A copy: the receipt updates its entries in place (applied / replaced) before this is sent.
-        msg = {"t": "receipt", "session": self.session, "entry": dict(entry), "totals": self.receipt.totals()}
-        task = asyncio.create_task(self._send_quietly(self.send, msg))
-        self.bg.add(task)
-        task.add_done_callback(self.bg.discard)
+        """Add an entry to the receipt. Returns its seq."""
+        return self.receipt.add(what, status, session=self.session, **fields)
 
     @staticmethod
     async def _send_quietly(send: Send, msg: dict) -> None:
@@ -432,7 +431,7 @@ class Coordinator:
         old_seq = self.receipt_seq.get(key)
         if self.memory.note_issued(key, kind, decision):
             self.stats[kind]["replaced"] += 1    # paid for an answer the game never used
-            self._push_receipt(self.receipt.update(old_seq, "replaced"))
+            self.receipt.update(old_seq, "replaced")
         self.receipt_seq[key] = self._record(kind, "ok", ms=ms, llm=call, raw=raw, decision=decision,
                                              **({"late": True} if late else {}), **rec)
         self.last_req[key] = {"state": state, "ctx": asked_ctx, "events": digest["recent_events"],
@@ -621,7 +620,7 @@ def main() -> None:
                     help="fake response time range for --mock, seconds")
     ap.add_argument("--receipts", type=Path, default=appdata.receipts_dir(),
                     help="folder for the per-run receipt (every decision and LLM call, as JSON lines)")
-    ap.add_argument("--no-receipts", action="store_true", help="keep the receipt in memory only (still shown in game)")
+    ap.add_argument("--no-receipts", action="store_true", help="keep the receipt in memory only")
     ap.add_argument("--no-epitaph", action="store_true", help="no DM-written epitaph on the after-death stats screen")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()

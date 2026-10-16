@@ -1,5 +1,7 @@
 -- Turns (already clamped) DM decisions into game changes.
 -- Every enum is looked up by name at runtime so a missing enum just skips that piece.
+-- Each apply returns its effect: short lines saying what it actually did ("+1 bomb dropped",
+-- "+2 champions (red)"), for the receipt.
 local Apply = {}
 
 local game = Game()
@@ -47,6 +49,43 @@ local REWARDS = {
 -- layout_pickups mode -> what every layout pickup becomes
 local MORPH = { to_pennies = "penny", to_bombs = "bomb", to_keys = "key", to_hearts = "half_heart" }
 
+-- ------------------------------------------------------------------ effects
+local function plural(name, n)
+  if n == 1 then return name end
+  if name:match("[^aeiou]y$") then return name:sub(1, -2) .. "ies" end
+  if name:match("[sx]$") or name:match("ch$") then return name .. "es" end
+  return name .. "s"
+end
+
+--- "+2 keys", "-1 heart": `n` of `name` (a catalog key like "soul_heart" is fine).
+local function count(sign, n, name)
+  return sign .. n .. " " .. plural((name:gsub("_", " ")), n)
+end
+Apply.count = count
+
+-- names (in order, repeats allowed) -> "-1 key, -2 hearts"
+local function tally(sign, names)
+  local n, order, out = {}, {}, {}
+  for _, s in ipairs(names) do
+    if not n[s] then order[#order + 1], n[s] = s, 0 end
+    n[s] = n[s] + 1
+  end
+  for _, s in ipairs(order) do out[#out + 1] = count(sign, n[s], s) end
+  return table.concat(out, ", ")
+end
+
+local PICKUP_NAMES = { TAROTCARD = "card", LIL_BATTERY = "battery", GRAB_BAG = "sack", LOCKEDCHEST = "golden chest",
+                       REDCHEST = "red chest", SPIKEDCHEST = "spiked chest", MIMICCHEST = "mimic chest" }
+local function pickupName(p)
+  for k, v in pairs(PickupVariant or {}) do
+    if v == p.Variant then
+      local short = k:gsub("^PICKUP_", "")
+      return PICKUP_NAMES[short] or (short:gsub("_", " "):lower())
+    end
+  end
+  return "pickup"
+end
+
 local function resolve(name)
   local r = REWARDS[name]
   if not r then return nil end
@@ -76,25 +115,33 @@ local function spawnTrollBomb(pos)
   if not v then return end
   if not farFromPlayer(pos, 90) then pos = randomFreePos(140) end
   Isaac.Spawn(EntityType.ENTITY_BOMB, v, 0, pos, ZERO, nil)
+  return true
 end
 
+--- True if it spawned (false when this game version lacks the pickup).
 function Apply.spawnReward(name, pos)
   local kind, variant, subtype = resolve(name)
-  if kind == "trollbomb" then return spawnTrollBomb(pos) end
-  if kind ~= "pickup" then return end
+  if kind == "trollbomb" then return spawnTrollBomb(pos) or false end
+  if kind ~= "pickup" then return false end
   local room = game:GetRoom()
   local at = room:FindFreePickupSpawnPosition(pos, 0, true)
   Isaac.Spawn(EntityType.ENTITY_PICKUP, variant, subtype, at, ZERO, nil)
+  return true
 end
 
 -- --------------------------------------------------------------- room clear
 function Apply.roomClear(decision, pos)
+  local effect = {}
   for _, r in ipairs(decision.rewards or {}) do
+    local n = 0
     for _ = 1, math.max(1, math.min(4, tonumber(r.count) or 1)) do
-      Apply.spawnReward(r.reward, pos)
+      if Apply.spawnReward(r.reward, pos) then n = n + 1 end
     end
+    if n > 0 then effect[#effect + 1] = count("+", n, r.reward) .. " dropped" end
   end
   Taunt.show(decision.taunt)
+  if #effect == 0 then effect[1] = "nothing dropped" end
+  return effect
 end
 
 -- -------------------------------------------------------------- room layout
@@ -131,46 +178,57 @@ local function layoutPickups(mode, rng, late)
       list[#list + 1] = p
     end
   end
+  if #list == 0 then return "no layout pickups to change (" .. mode .. ")" end
+  local names = {}
+  for i, p in ipairs(list) do names[i] = pickupName(p) end
   if mode == "remove" then
     for _, p in ipairs(list) do p:Remove() end
+    return tally("-", names) .. " (layout pickups removed)"
   elseif MORPH[mode] then
     local _, variant, subtype = resolve(MORPH[mode])
     if variant then
       for _, p in ipairs(list) do p:Morph(EntityType.ENTITY_PICKUP, variant, subtype, true) end
+      return tally("-", names) .. " -> " .. count("+", #list, MORPH[mode]) .. " (layout pickups)"
     end
-  elseif mode == "troll_bombs" and #list > 0 then
+  elseif mode == "troll_bombs" then
     -- Swap the pickup furthest from the door the player came in through.
     table.sort(list, function(a, b)
       local pp = Isaac.GetPlayer(0).Position
       return a.Position:Distance(pp) > b.Position:Distance(pp)
     end)
     local victim = list[1]
-    local pos = victim.Position
+    local pos, name = victim.Position, pickupName(victim)
     victim:Remove()
     spawnTrollBomb(pos)
+    return count("-", 1, name) .. " -> +1 troll bomb (layout pickup)"
   end
 end
 
 local function rocks(decision, rng)
   local room = game:GetRoom()
   local ROCK, TINTED = GridEntityType.GRID_ROCK, GridEntityType.GRID_ROCKT
-  local plain = {}
+  local plain, hidden, out = {}, 0, {}
   for i = 0, room:GetGridSize() - 1 do
     local g = room:GetGridEntity(i)
     if g then
       local t = g:GetType()
       if t == TINTED and decision.hide_tinted_rocks then
         queueGridSwap(i, ROCK)
+        hidden = hidden + 1
       elseif t == ROCK then
         plain[#plain + 1] = i
       end
     end
   end
-  local n = math.min(tonumber(decision.tinted_rocks) or 0, #plain)
+  local want = tonumber(decision.tinted_rocks) or 0
+  local n = math.min(want, #plain)
   for _ = 1, n do
     local pick = table.remove(plain, rng:RandomInt(#plain) + 1)
     queueGridSwap(pick, TINTED)
   end
+  if want > 0 then out[#out + 1] = count("+", n, "tinted_rock") .. (n < want and " (not enough rocks)" or "") end
+  if hidden > 0 then out[#out + 1] = count("", hidden, "tinted_rock") .. " hidden" end
+  return out
 end
 
 local function enemies(decision, rng)
@@ -184,26 +242,37 @@ local function enemies(decision, rng)
       npcs[#npcs + 1] = npc
     end
   end
-  if alive == 0 or room:IsClear() then return end   -- never close doors on an empty room
-
   local chance = tonumber(decision.champion_chance) or 0
+  local extras = decision.extra_enemies or {}
+  if alive == 0 or room:IsClear() then                -- never close doors on an empty room
+    if chance > 0 or #extras > 0 then return { "no enemies: champions and extra enemies skipped" } end
+    return {}
+  end
+
+  local out = {}
   local color = decision.champion_enum and E("ChampionColor", decision.champion_enum) or -1
   if chance > 0 then
+    local made = 0
     for _, npc in ipairs(npcs) do
       if not npc:IsBoss() and not npc:IsChampion() and rng:RandomFloat() < chance then
-        pcall(function() npc:MakeChampion(rng:Next(), color, false) end)
+        if pcall(function() npc:MakeChampion(rng:Next(), color, false) end) then made = made + 1 end
       end
     end
+    out[#out + 1] = count("+", made, "champion") .. " (" .. tostring(decision.champion_color or "random") .. ", "
+                    .. math.floor(chance * 100 + 0.5) .. "% of " .. alive .. ")"
   end
 
-  for _, spec in ipairs(decision.extra_enemies or {}) do
+  for _, spec in ipairs(extras) do
     local etype = EntityType[spec.etype or ""]
     if etype then
-      for _ = 1, math.max(1, math.min(3, tonumber(spec.count) or 1)) do
+      local n = math.max(1, math.min(3, tonumber(spec.count) or 1))
+      for _ = 1, n do
         Isaac.Spawn(etype, tonumber(spec.variant) or 0, 0, randomFreePos(160), ZERO, nil)
       end
+      out[#out + 1] = count("+", n, spec.key or spec.etype) .. " spawned"
     end
   end
+  return out
 end
 
 --- late: frames since the player walked in, when the layout lands after (the game held for it).
@@ -212,13 +281,21 @@ function Apply.roomLayout(decision, late)
   local rng = RNG()
   local seed = room:GetSpawnSeed()
   rng:SetSeed(seed ~= 0 and seed or 1, 35)
-  pcall(layoutPickups, decision.layout_pickups, rng, late or 0)
-  pcall(rocks, decision, rng)
-  pcall(enemies, decision, rng)
+  local effect = {}
+  local function add(ok, lines)
+    if not ok then return end
+    if type(lines) == "string" then lines = { lines } end
+    for _, line in ipairs(lines or {}) do effect[#effect + 1] = line end
+  end
+  add(pcall(layoutPickups, decision.layout_pickups, rng, late or 0))
+  add(pcall(rocks, decision, rng))
+  add(pcall(enemies, decision, rng))
   for _, name in ipairs(decision.bonus_pickups or {}) do
-    Apply.spawnReward(name, randomFreePos(100))
+    if Apply.spawnReward(name, randomFreePos(100)) then effect[#effect + 1] = count("+", 1, name) .. " placed" end
   end
   Taunt.show(decision.taunt)
+  if #effect == 0 then effect[1] = "no change" end
+  return effect
 end
 
 -- -------------------------------------------------------------- floor curses
@@ -237,7 +314,31 @@ function Apply.curses(decision, curses)
   return math.floor(mask)
 end
 
---- The same plan, on a floor that already exists (its plan landed after it was generated).
+local function curseName(bit)
+  for k, v in pairs(LevelCurse or {}) do
+    if v == bit then return (k:gsub("^CURSE_OF_THE_", ""):gsub("^CURSE_OF_", ""):gsub("_", " "):lower()) end
+  end
+  for name, b in pairs(CURSE_FALLBACK) do if b == bit then return name end end
+  return "curse " .. bit
+end
+
+--- What changing the curse mask from `before` (the game's roll) to `after` did.
+function Apply.curseEffect(before, after)
+  local out = {}
+  before, after = math.floor(before or 0), math.floor(after or 0)
+  for i = 0, 30 do
+    local bit = 1 << i
+    if after & bit ~= 0 and before & bit == 0 then
+      out[#out + 1] = "+curse of " .. curseName(bit)
+    elseif before & bit ~= 0 and after & bit == 0 then
+      out[#out + 1] = "-curse of " .. curseName(bit) .. " (the game's, stripped)"
+    end
+  end
+  if #out == 0 then out[1] = before == 0 and "no curses" or "curses unchanged" end
+  return out
+end
+
+--- The same plan, on a floor that already exists (its plan landed after it was generated). Returns its effect.
 function Apply.cursesNow(decision)
   local level = game:GetLevel()
   local cur = math.floor(level:GetCurses())
@@ -245,6 +346,7 @@ function Apply.cursesNow(decision)
   local off, on = cur & ~want, want & ~cur
   if off ~= 0 then pcall(function() level:RemoveCurses(off) end) end
   if on ~= 0 then pcall(function() level:AddCurse(on, false) end) end
+  return Apply.curseEffect(cur, want)
 end
 
 function Apply.init(taunt) Taunt = taunt end
