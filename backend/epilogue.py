@@ -12,7 +12,7 @@ import re
 from collections import Counter
 from typing import Any
 
-from catalog import PILLS
+from catalog import BOMBS, COINS, HEARTS, KEYS, PILLS
 from schemas import _clean_text, summarize_categories
 
 EPITAPH_CHARS = 120
@@ -33,9 +33,40 @@ def _game_rows(rows: Any) -> list[list[str]]:
     return out[:MAX_ROWS]
 
 
-def dm_side(applied: list[tuple[str, dict]], totals: dict, pills: Any) -> tuple[list[list[str]], str | None, str | None]:
-    """Rows for the DM's column, plus its latest scheme and taunt among the decisions the game used."""
+LOSS_RE = re.compile(r"(?<![\w+-])-(\d+) ([a-z' ]+?)(?= \(| ->|,|$)")
+FAMILIES = (("keys", KEYS | {"key"}), ("bombs", BOMBS), ("coins", COINS | {"coin"}), ("hearts", HEARTS | {"heart"}))
+
+
+def _singular(name: str) -> str:
+    """The effect lines' plural back to a catalog key: "soul hearts" -> "soul_heart"."""
+    name = name.strip().replace(" ", "_")
+    if name.endswith("ies"):
+        return name[:-3] + "y"
+    return name[:-1] if name.endswith("s") else name
+
+
+def losses(effects: Any) -> Counter:
+    """What the DM took away, by family, from the game's effect lines ("-1 key (would have dropped...)")."""
+    lost = Counter()
+    for line in effects if isinstance(effects, list) else []:
+        for n, name in LOSS_RE.findall(str(line).lower()):
+            key = _singular(name)
+            for fam, names in FAMILIES:
+                if key in names:
+                    lost[fam] += int(n)
+    return lost
+
+
+def _net(gained: int, lost: int) -> str:
+    return f"+{gained} -{lost}" if lost else str(gained)
+
+
+def dm_side(applied: list[tuple[str, dict]], totals: dict, pills: Any,
+            effects: Any = None) -> tuple[list[list[str]], str | None, str | None]:
+    """Rows for the DM's column, plus its latest scheme and taunt among the decisions the game used.
+    Pickups it gave count from its decisions; pickups it took away from what the game saw it do."""
     c, curses, scheme, taunt = Counter(), [], None, None
+    lost = losses(effects)
     for kind, d in applied:
         if kind == "room_layout":
             c["rooms"] += 1
@@ -56,8 +87,8 @@ def dm_side(applied: list[tuple[str, dict]], totals: dict, pills: Any) -> tuple[
     rows = [
         ["Rooms dressed", str(c["rooms"])],
         ["Extra enemies", str(c["enemies"])],
-        ["Keys / bombs", f'{c["keys"]} / {c["bombs"]}'],
-        ["Coins / hearts", f'{c["coins"]} / {c["hearts"]}'],
+        ["Keys / bombs", f'{_net(c["keys"], lost["keys"])} / {_net(c["bombs"], lost["bombs"])}'],
+        ["Coins / hearts", f'{_net(c["coins"], lost["coins"])} / {_net(c["hearts"], lost["hearts"])}'],
         ["Troll bombs", str(c["troll"])],
         ["Curses", ", ".join(curses) or "none"],
         ["Bad pills", str(bad)],
@@ -69,7 +100,7 @@ def dm_side(applied: list[tuple[str, dict]], totals: dict, pills: Any) -> tuple[
 
 def build(outcome: str, game: dict, receipt, run_id: Any, narrative: str | None) -> dict:
     """The whole screen, as sent to the game (without the epitaph, which comes later)."""
-    rows, scheme, taunt = dm_side(receipt.applied(), receipt.totals(), game.get("pills"))
+    rows, scheme, taunt = dm_side(receipt.applied(), receipt.totals(), game.get("pills"), receipt.effect_lines())
     return {
         "run": game.get("run", run_id),
         "outcome": outcome,
