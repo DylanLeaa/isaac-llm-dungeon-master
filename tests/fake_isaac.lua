@@ -22,7 +22,7 @@ GridEntityType = { GRID_ROCK = 2, GRID_ROCKT = 4 }
 EntityType = { ENTITY_PLAYER = 1, ENTITY_BOMB = 4, ENTITY_PICKUP = 5, ENTITY_GAPER = 10, ENTITY_BOOMFLY = 25,
   ENTITY_HOST = 27, ENTITY_ATTACKFLY = 18, ENTITY_KNIGHT = 41, ENTITY_DIP = 217 }
 setmetatable(EntityType, { __index = function(_, k) if tostring(k):match("^ENTITY_") then return 900 end end })
-EntityFlag = { FLAG_FRIENDLY = 1 << 29 }
+EntityFlag = { FLAG_FREEZE = 1 << 1, FLAG_FRIENDLY = 1 << 29 }
 ActiveSlot = { SLOT_PRIMARY = 0, SLOT_POCKET = 2 }
 PlayerType = { PLAYER_ISAAC = 0, PLAYER_MAGDALENE = 1, PLAYER_ISAAC_B = 21 }
 ItemType = { ITEM_PASSIVE = 1, ITEM_ACTIVE = 3 }
@@ -43,7 +43,7 @@ LevelCurse = { CURSE_NONE = 0, CURSE_OF_DARKNESS = 1, CURSE_OF_LABYRINTH = 2, CU
 ModCallbacks = { MC_POST_UPDATE = 1, MC_POST_RENDER = 2, MC_INPUT_ACTION = 13, MC_USE_PILL = 10, MC_ENTITY_TAKE_DMG = 11,
   MC_POST_CURSE_EVAL = 12, MC_POST_GAME_STARTED = 15, MC_POST_GAME_END = 16, MC_PRE_GAME_EXIT = 17, MC_POST_NEW_LEVEL = 18,
   MC_POST_NEW_ROOM = 19, MC_GET_CARD = 20, MC_GET_TRINKET = 47, MC_PRE_GET_COLLECTIBLE = 62,
-  MC_GET_PILL_EFFECT = 65, MC_PRE_SPAWN_CLEAN_AWARD = 70 }
+  MC_GET_PILL_EFFECT = 65, MC_PRE_SPAWN_CLEAN_AWARD = 70, MC_POST_PICKUP_INIT = 34 }
 PillColor = enum({ "PILL_NULL", "PILL_BLUE_BLUE", "PILL_WHITE_BLUE", "PILL_ORANGE_ORANGE", "PILL_WHITE_WHITE",
   "PILL_REDDOTS_RED", "PILL_PINK_RED", "PILL_BLUE_CADETBLUE", "PILL_YELLOW_ORANGE", "PILL_ORANGEDOTS_WHITE",
   "PILL_WHITE_AZURE", "PILL_BLACK_YELLOW", "PILL_WHITE_BLACK", "PILL_WHITE_YELLOW", "PILL_GOLD" })
@@ -64,11 +64,11 @@ PillEffect = enum({ "PILLEFFECT_BAD_GAS", "PILLEFFECT_BAD_TRIP", "PILLEFFECT_BAL
 Card = setmetatable({ CARD_TOWER = 17, RUNE_HAGALAZ = 32 }, { __index = function(_, k)
   if tostring(k):match("^CARD_") or tostring(k):match("^RUNE_") then return 50 end end })
 InputHook = { IS_ACTION_PRESSED = 0, IS_ACTION_TRIGGERED = 1, GET_ACTION_VALUE = 2 }
-ButtonAction = { ACTION_PAUSE = 1, ACTION_MENUCONFIRM = 2, ACTION_MAP = 3 }
+ButtonAction = { ACTION_PAUSE = 1, ACTION_MENUCONFIRM = 2, ACTION_MAP = 3, ACTION_PILLCARD = 10 }
 Keyboard = { KEY_ENTER = 257 }
 Input = { skip = false }
 function Input.IsButtonTriggered() return Input.skip end
-function Input.IsActionTriggered() return false end
+function Input.IsActionTriggered(action) return action == ButtonAction.ACTION_PILLCARD and W.pillPressed or false end
 ChampionColor = { CHAMPION_RED = 0, CHAMPION_DARK_RED = 12, CHAMPION_TINY = 18 }
 
 -- ---------------------------------------------------------------- vectors
@@ -131,12 +131,16 @@ function player:GetCard() return 0 end
 function player:GetCollectibleCount() return 0 end
 function player:HasCollectible() return false end
 function player:ToPlayer() return self end
+player.ControllerIndex = 0
 
 local function makeEnemy(hp)
-  local e = { HitPoints = hp, Type = 10, Variant = 0, champion = false }
+  local e = { HitPoints = hp, Type = 10, Variant = 0, champion = false, flags = 0 }
   function e:IsActiveEnemy() return self.HitPoints > 0 end
   function e:IsVulnerableEnemy() return true end
-  function e:HasEntityFlags() return false end
+  function e:HasEntityFlags(f) return self.flags & f ~= 0 end
+  function e:AddEntityFlags(f) self.flags = self.flags | f end
+  function e:ClearEntityFlags(f) self.flags = self.flags & ~f end
+  function e:Exists() return true end
   function e:ToNPC() return self end
   function e:IsBoss() return false end
   function e:IsChampion() return self.champion end
@@ -150,6 +154,8 @@ function W.makePickup(t, v, s)
   local e = { Type = t, Variant = v, SubType = s }
   function e:IsActiveEnemy() return false end
   function e:ToNPC() return nil end
+  function e:Exists() return not self.removed end
+  function e:Morph(t2, v2, s2) self.Type, self.Variant, self.SubType = t2, v2, s2; self.morphed = true end
   return e
 end
 
@@ -191,6 +197,10 @@ function level:GetStage() return W.stage end
 function level:GetStageType() return 0 end
 function level:GetName() return STAGE_NAMES[W.stage] or ("stage " .. W.stage) end
 function level:GetCurseName() return "" end
+W.curses = 0
+function level:GetCurses() return W.curses end
+function level:AddCurse(c) W.curses = W.curses | c end
+function level:RemoveCurses(c) W.curses = W.curses & ~c end
 function level:GetRooms()
   local list = {}
   for _, d in pairs(W.rooms) do list[#list + 1] = d end

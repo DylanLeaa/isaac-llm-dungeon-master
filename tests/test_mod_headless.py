@@ -39,16 +39,19 @@ def fake_game(tmp):
 def main():
     tmp = tempfile.mkdtemp()
     game = fake_game(tmp)
+    # The backend logs to a file: a pipe nobody reads until the end fills up and stalls it mid-run.
+    out = open(Path(tmp) / "backend.log", "w")
     srv = subprocess.Popen([sys.executable, "server.py", "--mock", *game["args"],
                             "--mock-latency", "0.3", "0.9", "--receipts", str(Path(tmp) / "receipts")],
-                           cwd=ROOT / "backend", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                           cwd=ROOT / "backend", stdout=out, stderr=subprocess.STDOUT, text=True)
     time.sleep(1.0)
     try:
         run(tmp, game)
     finally:
         srv.terminate()
-        log = srv.communicate(timeout=5)[0]
-        print("\n--- backend log ---\n" + log)
+        srv.wait(timeout=5)
+        out.close()
+        print("\n--- backend log ---\n" + (Path(tmp) / "backend.log").read_text())
 
 
 def run(tmp, game):
@@ -253,6 +256,57 @@ def run(tmp, game):
     print(f"11. curse mask for floor 2 = {mask}")
     assert mask == 1
 
+    # --- holds: whatever the DM hasn't answered yet, the game freezes for instead of deciding ---
+    Hold, Cons = modules["dm.loading"], modules["dm.consumables"]
+    FREEZE = g.EntityFlag.FLAG_FREEZE
+    W.rooms[87] = lua.table_from({"SafeGridIndex": 87, "GridIndex": 87, "VisitedCount": 0, "AwardSeed": 1,
+                                  "Data": lua.table_from({"Type": g.RoomType.ROOM_DEFAULT, "Shape": 1, "Difficulty": 1})})
+    W.adj[87] = lua.table_from([86])
+    imp = W.makeEnemy(5)
+    W.enemies = lua.table_from([imp])
+    W.enter(87)                                    # never prefetched (not next to anywhere the player stood)
+    assert Hold.active() and Hold.holding("layout:1:87"), "walking into an undressed room holds the game"
+    assert Bridge.isPending("layout:1:87"), "...and asks for the room right then"
+    assert Hold.blockInput(None, None, g.InputHook.IS_ACTION_PRESSED, 7) is False
+    tick()
+    assert imp.flags & FREEZE, "enemies stand still while the game waits"
+    wait(lambda: not Hold.active(), 8, "the late room layout")
+    assert Bridge.peek("layout:1:87") is None and not imp.flags & FREEZE, "layout taken, enemies free again"
+    print("12. undressed room: game held until its layout came in, then dressed it")
+
+    imp.HitPoints = 0                              # one shot: no time to prefetch the reward
+    tick()
+    assert not Bridge.isPending("clear:1:87")
+    ret = W.fire(MC.MC_PRE_SPAWN_CLEAN_AWARD, g.RNG(), g.Vector(320, 280))
+    assert ret is True and Hold.holding("clear:1:87"), "the game's award is skipped and the game waits"
+    assert Bridge.isPending("clear:1:87"), "the reward is asked for the moment the room clears"
+    wait(lambda: not Hold.active(), 8, "the late room-clear reward")
+    assert Bridge.peek("clear:1:87") is None, "the late reward was taken"
+    print("13. instant clear: award held until the DM's reward came in")
+
+    devil = g.ItemPoolType.POOL_DEVIL              # never ranked
+    assert W.fire(MC.MC_PRE_GET_COLLECTIBLE, devil, True, 5) is None
+    pedestal = W.makePickup(g.EntityType.ENTITY_PICKUP, g.PickupVariant.PICKUP_COLLECTIBLE, 2)
+    W.fire(MC.MC_POST_PICKUP_INIT, pedestal)
+    tick()
+    assert Hold.holding(f"items:1:{devil}"), "a pedestal from an unranked pool holds the game"
+    wait(lambda: not Hold.active(), 8, "the late devil pool ranking")
+    order = list(to_py(Bridge.peek(f"items:1:{devil}").decision)["order"])
+    assert pedestal.morphed and pedestal.SubType == order[0], (pedestal.SubType, order)
+    print(f"14. unranked pedestal: held, then swapped to the DM's pick {pedestal.SubType}")
+
+    W.heldPill = 7                                 # a colour no plan has covered
+    assert Cons.blockPill(g.Isaac.GetPlayer(0), g.InputHook.IS_ACTION_PRESSED, g.ButtonAction.ACTION_PILLCARD) is False
+    W.pillPressed = True
+    assert Cons.blockPill(g.Isaac.GetPlayer(0), g.InputHook.IS_ACTION_TRIGGERED, g.ButtonAction.ACTION_PILLCARD) is False
+    W.pillPressed = False
+    assert Hold.holding("cons:1"), "pressing the pill button holds the game for the plan"
+    wait(lambda: not Hold.active(), 8, "a plan covering the pill")
+    assert any(int(p["color"]) == 7 for p in plan()["pills"])
+    assert Cons.blockPill(g.Isaac.GetPlayer(0), g.InputHook.IS_ACTION_PRESSED, g.ButtonAction.ACTION_PILLCARD) is None
+    W.heldPill = 5
+    print("15. uncovered pill: button held until the plan covered it, then free")
+
     # --- DM Settings > Receipt: what the engine did, browsable in the menu --------
     receipt = [e.s for e in menu if e.sub == "Receipt"]
     picker = next(s for s in receipt if s.Type == 3)
@@ -262,7 +316,7 @@ def run(tmp, game):
 
     wait(lambda: any("room_clear applied" in line for line in screen()), 5, "receipt entries in the menu")
     lines = screen()
-    print("12. DM Settings > Receipt:\n      " + "\n      ".join(l for l in lines if l))
+    print("16. DM Settings > Receipt:\n      " + "\n      ".join(l for l in lines if l))
     assert any(" actions, " in l for l in lines), "totals shown"
     assert any(l.startswith("saved as ") for l in lines), "the receipt file is named"
     newest = picker.Display()
@@ -308,8 +362,19 @@ def run(tmp, game):
     early = [r["key"] for r in recs[:brief2] if r.get("type") == "entry" and str(r.get("key", "")).startswith(
         ("layout:2:", "items:2:", "cons:2"))]
     assert not early, f"floor 2 decisions made before its brief: {early}"
-    print("13. floor 2: loading screen held until its brief and opening decisions were in"
+    print("17. floor 2: loading screen held until its brief and opening decisions were in"
           " (layout:2:85, items:2:0, cons:2), none made before the brief")
+
+    # --- the next floor is generated before its plan lands: its curses change once it does ---
+    W.enter(86)
+    assert Bridge.isPending("floor:2:next")
+    W.curses = 0
+    assert W.fire(MC.MC_POST_CURSE_EVAL, 0) is None, "nothing to apply yet"
+    tick()
+    assert Hold.holding("floor:2:next"), "the new floor holds for its plan"
+    wait(lambda: not Hold.active(), 8, "the late floor plan")
+    assert W.curses == 1, W.curses
+    print("18. late floor plan: held, then the floor's curses were changed to the DM's")
 
     # --- death: the player's stats at once, then the DM's side and its epitaph ------
     gaper = lua.table_from({"Entity": lua.table_from({"Type": g.EntityType.ENTITY_GAPER, "Variant": 0})})
@@ -322,14 +387,14 @@ def run(tmp, game):
 
     text = last()
     assert text.startswith("HERE LIES ISAAC") and "Reached: Basement II" in text and "Last hit by: gaper" in text
-    assert "Rooms cleared: 2" in text and "Pills eaten: 2" in text and "tallying" in text, text
+    assert "Rooms cleared: 3" in text and "Pills eaten: 2" in text and "tallying" in text, text
     death = [m for m in sent(game) if m.get("t") == "event" and m.get("name") == "death"]
     assert death and death[0]["data"]["run"] == "TEST 1234" and death[0]["data"]["rows"][0] == ["Reached", "Basement II"]
     wait(lambda: "Extra enemies" in last(), 5, "the DM's side of the stats")
     wait(lambda: "The dice were mine" in last(), 5, "the DM's epitaph")
     tick(3)                                   # the overlay draws without errors
     assert "The dice were mine" in json.loads(W.saved)["last_run"]["epitaph"], "kept for the next session"
-    print("14. death -> DM Settings > Last run:\n      " + last().replace(" | ", "\n      "))
+    print("19. death -> DM Settings > Last run:\n      " + last().replace(" | ", "\n      "))
 
     errors = [p for p in printed if "error" in p.lower()]
     assert not errors, errors

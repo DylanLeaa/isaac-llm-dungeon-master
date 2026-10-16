@@ -71,7 +71,7 @@ def test_death_gets_dm_stats_then_epitaph(tmp_path):
     assert dm_rows["Keys / bombs"] == "1 / 0", "only the applied answer counts"
     assert dm_rows["Coins / hearts"] == "2 / 0"
     assert dm_rows["Bad pills"] == "1", "the DM's bad pills, not vanilla's"
-    assert dm_rows["Left to vanilla"] == "1"
+    assert dm_rows["DM gave up"] == "1"
     assert dm_rows["LLM bill"] == "2 calls $0.00"
     assert first["taunt"] == "Door's that way." and first["scheme"] == "starve bombs, flood keys"
 

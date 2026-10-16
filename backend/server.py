@@ -223,12 +223,13 @@ class Coordinator:
             self.memory.on_applied(str(msg.get("key")))
             self._push_receipt(self.receipt.update(self.receipt_seq.pop(str(msg.get("key")), None), "applied"))
         elif t == "event" and msg.get("name") == "fallback":
-            # The game needed a decision and had none: vanilla RNG decided. Not news for the DM.
+            # The game froze waiting for this decision and gave up on it (the DM never answered, even
+            # after re-asks): the game went ahead without it. Not news for the DM.
             data = msg.get("data") or {}
             self.stats[str(data.get("kind"))]["fallback"] += 1
-            why = "no answer in time" if data.get("asked") else "never asked: prefetch fired too late"
-            log.info("%-11s %-14s %s -> vanilla", data.get("kind"), data.get("key"), why)
-            self._record(str(data.get("kind")), "fallback", key=data.get("key"), result=f"vanilla RNG ({why})")
+            why = "no answer while the game waited" if data.get("asked") else "never asked"
+            log.info("%-11s %-14s %s -> game went ahead without the DM", data.get("kind"), data.get("key"), why)
+            self._record(str(data.get("kind")), "fallback", key=data.get("key"), result=f"DM gave up ({why})")
         elif t == "event" and msg.get("name") in ("death", "victory"):
             self.memory.on_game_event(str(msg.get("name")), msg.get("data") or {})
             await self._run_over(str(msg["name"]), msg.get("data") or {}, send)
@@ -413,7 +414,7 @@ class Coordinator:
             return
         except asyncio.TimeoutError:
             self.stats[kind]["timeout"] += 1
-            log.warning("%-11s %-14s TIMEOUT after %.0fms -> game falls back to vanilla", kind, key, _ms(t0))
+            log.warning("%-11s %-14s TIMEOUT after %.0fms -> the game re-asks if it is waiting", kind, key, _ms(t0))
             self._record(kind, "timeout", ms=_ms(t0), **rec)
             await send({**base, "ok": False, "reason": "timeout"})
             return

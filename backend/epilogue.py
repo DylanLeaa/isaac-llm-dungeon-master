@@ -59,7 +59,7 @@ def dm_side(applied: list[tuple[str, dict]], totals: dict, pills: Any) -> tuple[
         ["Troll bombs", str(c["troll"])],
         ["Curses", ", ".join(curses) or "none"],
         ["Bad pills", str(bad)],
-        ["Left to vanilla", str(totals.get("fallback", 0))],
+        ["DM gave up", str(totals.get("fallback", 0))],
         ["LLM bill", f'{totals.get("calls", 0)} calls ${totals.get("cost", 0):.2f}'],
     ]
     return rows, scheme, taunt

@@ -15,11 +15,15 @@
 --   item_choice  also asked for chest/beggar pools the moment one of those shows up in a room.
 --   consumables  see consumables.lua (floor start, then when a new pill colour is in play).
 --
--- If an answer isn't there when the game needs it, vanilla RNG decides (and nobody waits).
+-- If an answer isn't there when the game needs it, the game freezes on a hold (loading.lua) until it
+-- is, asking right then if it never asked. Rooms are dressed and rewards dropped late; item
+-- pedestals, which the game fills on the spot, are swapped for the DM's picks when the ranking
+-- lands; a floor's curses are changed once its plan does. Only with no backend at all does the
+-- game decide on its own.
 local Sched = {}
 
 local game = Game()
-local cfg, Bridge, State, Apply, Taunt, Cons
+local cfg, Bridge, State, Apply, Taunt, Cons, Loading
 
 local floorNo = 0
 local levelSig
@@ -27,8 +31,13 @@ local room = nil         -- per-room tracker
 local itemQueues = {}    -- pool -> {resultId, ids}
 local itemSigs = {}      -- pool -> signature of the last item_choice request (candidates + build)
 local layoutSends = {}   -- layout key -> {hash, n}: what we last asked about that room, and how often
-local fallbackSent = {}  -- key -> true: vanilla fallback already reported
+local fallbackSent = {}  -- key -> true: a hold on it gave up and the game decided (reported once)
 local floorPlanAsked = false
+local floorPlanFor       -- {stage, stage_type}: the floor the last floor_plan was asked from
+local latePlan           -- floor_plan key the new floor's curses wait on (held on the next update)
+local drawn              -- {pool, frame, stale}: an item drawn with no DM answer; its pedestal comes next
+local swaps = {}         -- pool -> pedestals to turn into the DM's picks once its ranking lands
+local toHold = {}        -- pool -> stale result id (or false): hold on it next update, not mid-draw
 local floorPlanUsed      -- last floor plan applied (re-used if we reseed)
 local reseeds = 0
 Sched.peeking = false
@@ -60,7 +69,7 @@ local function leadMs() return cfg.LEAD_FACTOR * Bridge.latencyP90() + cfg.LEAD_
 
 local function eligibleLayoutRoom(t) return t == RoomType.ROOM_DEFAULT end
 
--- Tell the backend the game needed a decision and vanilla made it (once per key).
+-- Tell the backend a hold gave up: the game needed a decision and the DM never gave one (once per key).
 local function reportFallback(kind, key, asked)
   if fallbackSent[key] then return end
   fallbackSent[key] = true
@@ -95,7 +104,7 @@ local function requestLayout(desc, reason)
   return key
 end
 
-local function requestClear(reason, etaMs)
+local function requestClear(reason, etaMs, deadlineMs)
   local key = fkey("clear", room.idx)
   local hp, n = alive()
   Bridge.request("room_clear", key, State.snapshot(), {
@@ -103,7 +112,7 @@ local function requestClear(reason, etaMs)
     enemies_left = n, enemy_hp_left = math.floor(hp),
     est_ms_until_clear = math.floor(math.min(etaMs or 0, 60000)),
     seconds_in_room = math.floor((Isaac.GetTime() - room.enteredAt) / 100) / 10,
-  }, math.floor(math.max(1500, math.min(etaMs or 4000, 10000)) + 2000))
+  }, deadlineMs or math.floor(math.max(1500, math.min(etaMs or 4000, 10000)) + 2000))
   room.clearReqAt = Isaac.GetTime()
   room.clearReqHash = State.materialHash()
   room.clearSends = room.clearSends + 1
@@ -128,7 +137,7 @@ local function peekCandidates(pool)
   return out
 end
 
-local function requestItems(pool, roomTypeName, reason)
+local function requestItems(pool, roomTypeName, reason, force)
   local cands = peekCandidates(pool)
   if #cands == 0 then return end
   -- Candidates come from a fixed seed, so walking past the same room again would resend the
@@ -136,7 +145,7 @@ local function requestItems(pool, roomTypeName, reason)
   local key, ids = fkey("items", pool), {}
   for i, c in ipairs(cands) do ids[i] = tostring(c.id) end
   local sig = table.concat(ids, ",") .. "|" .. Isaac.GetPlayer(0):GetCollectibleCount()
-  if itemSigs[pool] == sig and (Bridge.isPending(key) or Bridge.peek(key)) then return end
+  if not force and itemSigs[pool] == sig and (Bridge.isPending(key) or Bridge.peek(key)) then return end
   itemSigs[pool] = sig
   Bridge.request("item_choice", key, State.snapshot(), {
     reason = reason, pool = pool, room_type = roomTypeName, candidates = cands,
@@ -158,13 +167,146 @@ local function requestSourcePools()
   end
 end
 
-local function requestFloorPlan(reason)
+local function requestFloorPlan(reason, key)
   local level = game:GetLevel()
-  floorPlanAsked = true
-  Bridge.request("floor_plan", fkey("floor", "next"), State.snapshot(), {
-    reason = reason, current_stage = level:GetStage(), current_stage_type = level:GetStageType(),
+  if not key then                       -- a fresh ask from this floor's boss room
+    floorPlanAsked = true
+    floorPlanFor = { level:GetStage(), level:GetStageType() }
+  end
+  Bridge.request("floor_plan", key or fkey("floor", "next"), State.snapshot(), {
+    reason = reason, current_stage = floorPlanFor[1], current_stage_type = floorPlanFor[2],
     allowed_layout_rerolls = cfg.ALLOW_LAYOUT_RESEED and cfg.MAX_RESEEDS or 0,
   }, 12000)
+end
+
+-- ------------------------------------------------------------------- holds
+-- The player walked into a room the DM hasn't dressed yet.
+local function holdLayout(key, desc)
+  local idx, entered = room.idx, game:GetFrameCount()
+  Loading.hold(key, {
+    label = "this room",
+    ask = function() requestLayout(desc, "the player walked in before the DM had dressed this room") end,
+    apply = function()
+      local res = Bridge.take(key)
+      if not res or curIdx() ~= idx then return end
+      Apply.roomLayout(res.decision, game:GetFrameCount() - entered)
+      if room and room.idx == idx then room.layoutApplied = true end
+    end,
+    giveUp = function() reportFallback("room_layout", key, true) end,
+  })
+end
+
+-- The room is clear and the DM's reward isn't in: the game's award was skipped (or, for a bonus,
+-- spawned without it), so drop the DM's where the game would have once it lands.
+local function holdClear(key, pos)
+  local idx, at = room.idx, Vector(pos.X, pos.Y)
+  Loading.hold(key, {
+    label = CLEAR_MODE[room.type] == "bonus" and "what else you get" or "your reward",
+    ask = function()
+      if room and room.idx == idx then requestClear("the room was cleared before the DM answered", 0, 10000) end
+    end,
+    apply = function()
+      local res = Bridge.take(key)
+      if res and curIdx() == idx then Apply.roomClear(res.decision, at) end
+    end,
+    giveUp = function() reportFallback("room_clear", key, true) end,
+  })
+end
+
+-- This pool's ranking as a queue of picks, rebuilt when a newer ranking lands.
+local function queueFor(pool)
+  local res = Bridge.peek(fkey("items", pool))
+  local q = itemQueues[pool]
+  if res and (not q or q.resultId ~= res.id) then
+    local ids = {}
+    for i, id in ipairs(res.decision.order or {}) do ids[i] = id end
+    q = { resultId = res.id, ids = ids, used = false, taunt = res.decision.taunt }
+    itemQueues[pool] = q
+  end
+  return q
+end
+
+-- The DM's next pick from this pool that the player can still get, or nil (and the queue, if any).
+local function nextItem(pool, decrease)
+  local q = queueFor(pool)
+  if not q then return nil, nil end
+  local player = Isaac.GetPlayer(0)
+  while #q.ids > 0 do
+    local id = table.remove(q.ids, 1)
+    if id and id > 0 and State.itemInfo(id) and not player:HasCollectible(id, true) then
+      if decrease then game:GetItemPool():RemoveCollectible(id) end
+      if not q.used then
+        q.used = true
+        Bridge.markApplied(fkey("items", pool))
+        Taunt.show(q.taunt)
+      end
+      return id, q
+    end
+  end
+  return nil, q
+end
+
+local function swapPedestals(pool, idx)
+  local list = swaps[pool] or {}
+  swaps[pool] = nil
+  if curIdx() ~= idx then return end
+  for _, p in ipairs(list) do
+    if p:Exists() and p.SubType ~= 0 then          -- 0: already taken
+      local id = nextItem(pool, true)
+      if not id then break end
+      p:Morph(EntityType.ENTITY_PICKUP, PickupVariant.PICKUP_COLLECTIBLE, id, true, true, true)
+    end
+  end
+end
+
+-- Pedestals came out of a pool the DM had no (usable) ranking for: hold until it has one.
+local function holdItems(pool, stale)
+  local key, idx = fkey("items", pool), curIdx()
+  Loading.hold(key, {
+    label = "what's on the pedestal", stale = stale,
+    ask = function()
+      requestItems(pool, State.roomTypeName(room.type), "the game needs an item from this pool right now", true)
+    end,
+    apply = function() swapPedestals(pool, idx) end,
+    giveUp = function()
+      swaps[pool] = nil
+      reportFallback("item_choice", key, true)
+    end,
+  })
+end
+
+-- Optional: reroll the layout until the DM's treasure-distance wish is met. True if it rerolled.
+local function maybeReseed()
+  if cfg.ALLOW_LAYOUT_RESEED and floorPlanUsed and floorPlanUsed.treasure_distance ~= "any" then
+    local dist = State.level().treasure_distance_from_start
+    local want = floorPlanUsed.treasure_distance
+    local ok = dist == nil or (want == "far" and dist >= 4) or (want == "near" and dist <= 2)
+    if not ok and reseeds < cfg.MAX_RESEEDS then
+      reseeds = reseeds + 1
+      levelSig = nil                 -- the reseeded floor counts as a new floor
+      Isaac.ExecuteCommand("reseed")
+      return true
+    end
+  end
+  reseeds = 0
+  return false
+end
+
+-- The floor was generated before its plan landed: change its curses once it does.
+local function holdFloorPlan(key)
+  Loading.hold(key, {
+    label = "this floor's curses",
+    ask = function() requestFloorPlan("the player is already on this floor; its curses wait on you", key) end,
+    apply = function()
+      local res = Bridge.take(key)
+      if not res then return end
+      floorPlanUsed = res.decision
+      Taunt.show(res.decision.taunt)
+      Apply.cursesNow(res.decision)
+      maybeReseed()
+    end,
+    giveUp = function() reportFallback("floor_plan", key, true) end,
+  })
 end
 
 -- --------------------------------------------------------- room transitions
@@ -208,6 +350,7 @@ local function checkLevelChange()
   levelSig = sig
   floorNo = floorNo + 1
   itemQueues, itemSigs, layoutSends, fallbackSent = {}, {}, {}, {}
+  drawn, swaps, toHold = nil, {}, {}
   Bridge.forget("layout:" .. (floorNo - 1))
   Bridge.forget("clear:" .. (floorNo - 1))
   Bridge.forget("items:" .. (floorNo - 1))
@@ -229,12 +372,16 @@ function Sched.onNewRoom()
     lastProbe = 0, lastNeighbourRefresh = Isaac.GetTime(), poolsAsked = {}, lastSourceScan = 0,
   }
 
-  -- 1. Dress this room if the DM already decided how.
+  -- 1. Dress this room: now if the DM already decided how, else once it has (the game waits).
   if room.firstVisit and cfg.CONTROL_ROOM_LAYOUT then
-    local res = Bridge.take(fkey("layout", room.idx))
+    local key = fkey("layout", room.idx)
+    local res = Bridge.take(key)
     if res then
       Apply.roomLayout(res.decision)
       room.layoutApplied = true
+    elseif Bridge.ready() and eligibleLayoutRoom(room.type)
+        and room.idx ~= game:GetLevel():GetStartingRoomIndex() then   -- the start room is never dressed
+      holdLayout(key, desc)
     end
   end
 
@@ -274,19 +421,8 @@ function Sched.onNewLevel()
   Bridge.event("new_level", { stage = game:GetLevel():GetStage(), name = game:GetLevel():GetName() })
   -- Base item rankings for the pools this floor actually has.
   requestFloorItems()
-  -- Optional: reroll layout until the DM's treasure-distance wish is met.
-  if cfg.ALLOW_LAYOUT_RESEED and floorPlanUsed and floorPlanUsed.treasure_distance ~= "any" then
-    local dist = State.level().treasure_distance_from_start
-    local want = floorPlanUsed.treasure_distance
-    local ok = dist == nil or (want == "far" and dist >= 4) or (want == "near" and dist <= 2)
-    if not ok and reseeds < cfg.MAX_RESEEDS then
-      reseeds = reseeds + 1
-      levelSig = nil                 -- the reseeded floor counts as a new floor
-      Isaac.ExecuteCommand("reseed")
-      return
-    end
-  end
-  reseeds = 0
+  if latePlan then return end        -- any reroll waits for the plan (holdFloorPlan)
+  maybeReseed()
 end
 
 -- ------------------------------------------------------------- per-frame work
@@ -302,18 +438,13 @@ function Sched.update()
     requestFloorItems()
   end
 
-  -- Late layout: the answer arrived just after the player walked in.
-  if room.firstVisit and not room.layoutApplied and cfg.CONTROL_ROOM_LAYOUT then
-    if game:GetFrameCount() - room.enteredFrame <= cfg.LATE_LAYOUT_GRACE_FRAMES then
-      local res = Bridge.take(fkey("layout", room.idx))
-      if res then
-        Apply.roomLayout(res.decision)
-        room.layoutApplied = true
-      end
-    elseif layoutSends[fkey("layout", room.idx)] then
-      reportFallback("room_layout", fkey("layout", room.idx), true)
-    end
+  -- Decisions the game had to go ahead without, inside its own callbacks: wait on them now.
+  if latePlan then
+    holdFloorPlan(latePlan)
+    latePlan = nil
   end
+  for pool, stale in pairs(toHold) do holdItems(pool, stale or nil) end
+  toHold = {}
 
   Cons.update()
 
@@ -383,12 +514,15 @@ function Sched.onCleanAward(rng, pos)
   if not eligibleClearRoom(game:GetRoom():GetType()) then return nil end
   local secs, hits = State.onRoomCleared()
   Bridge.event("room_cleared", { room = room.idx, seconds = secs, hits = hits })
-  local res = Bridge.take(fkey("clear", room.idx))
-  if not res then                                     -- DM too slow: vanilla decides
-    reportFallback("room_clear", fkey("clear", room.idx), room.clearSends > 0)
-    return nil
+  local key = fkey("clear", room.idx)
+  local res = Bridge.take(key)
+  if res then
+    Apply.roomClear(res.decision, pos)
+  elseif Bridge.ready() then
+    holdClear(key, pos)                               -- not in yet: the game waits, the DM's drop comes after
+  else
+    return nil                                        -- no backend: the game's own award
   end
-  Apply.roomClear(res.decision, pos)
   if CLEAR_MODE[room.type] == "bonus" then return nil end   -- the game still spawns its own award
   -- Documented API bug: returning true stops the award seed advancing.
   local level = game:GetLevel()
@@ -400,41 +534,36 @@ end
 --- MC_PRE_GET_COLLECTIBLE. Returns a CollectibleType or nil.
 function Sched.onGetCollectible(pool, decrease, seed)
   if Sched.peeking or not cfg.CONTROL_ITEMS or game:IsGreedMode() then return nil end
-  local key = fkey("items", pool)
-  local res = Bridge.peek(key)
-  local q = itemQueues[pool]
-  if res and (not q or q.resultId ~= res.id) then
-    local ids = {}
-    for i, id in ipairs(res.decision.order or {}) do ids[i] = id end
-    q = { resultId = res.id, ids = ids, used = false, taunt = res.decision.taunt }
-    itemQueues[pool] = q
-  end
-  if not q then
-    if CONTROLLED_POOL[pool] and itemSigs[pool] then reportFallback("item_choice", key, true) end
-    return nil
-  end
-  local player = Isaac.GetPlayer(0)
-  while #q.ids > 0 do
-    local id = table.remove(q.ids, 1)
-    if id and id > 0 and State.itemInfo(id) and not player:HasCollectible(id, true) then
-      if decrease then game:GetItemPool():RemoveCollectible(id) end
-      if not q.used then
-        q.used = true
-        Bridge.markApplied(key)
-        Taunt.show(q.taunt)
-      end
-      return id
-    end
+  local id, q = nextItem(pool, decrease)
+  if id then return id end
+  -- No ranking, or it ran out: the game fills the pedestal now and the DM's pick replaces it once
+  -- it lands (Sched.onPickupInit finds the pedestal, the next update holds the game).
+  if CONTROLLED_POOL[pool] and Bridge.ready() then
+    drawn = { pool = pool, frame = game:GetFrameCount(), stale = q and q.resultId }
   end
   return nil
+end
+
+--- MC_POST_PICKUP_INIT: the pedestal an unanswered draw just filled.
+function Sched.onPickupInit(pickup)
+  if not drawn or pickup.Variant ~= PickupVariant.PICKUP_COLLECTIBLE then return end
+  if drawn.frame == game:GetFrameCount() then
+    local list = swaps[drawn.pool] or {}
+    list[#list + 1] = pickup
+    swaps[drawn.pool] = list
+    toHold[drawn.pool] = drawn.stale or false
+  end
+  drawn = nil
 end
 
 --- MC_POST_CURSE_EVAL. Returns a new curse mask or nil.
 function Sched.onCurseEval(curses)
   if not cfg.CONTROL_FLOOR or game:IsGreedMode() then return nil end
-  local res = Bridge.take(fkey("floor", "next"))
+  local key = fkey("floor", "next")
+  local res = Bridge.take(key)
   local plan = res and res.decision or (reseeds > 0 and floorPlanUsed) or nil
-  if not plan and floorPlanAsked then reportFallback("floor_plan", fkey("floor", "next"), true) end
+  -- Asked but not in: the floor is generated now, and its curses change once the plan lands.
+  if not plan and floorPlanAsked and Bridge.ready() then latePlan = key end
   floorPlanAsked = false
   if not plan then return nil end
   floorPlanUsed = plan
@@ -445,12 +574,13 @@ end
 function Sched.resetRun()
   floorNo, levelSig, room, itemQueues, floorPlanUsed, reseeds = 0, nil, nil, {}, nil, 0
   itemSigs, layoutSends, fallbackSent, floorPlanAsked = {}, {}, {}, false
+  floorPlanFor, latePlan, drawn, swaps, toHold = nil, nil, nil, {}, {}
   floorItemsRequestedFor = -1
   Cons.resetRun()
 end
 
-function Sched.init(config, bridge, state, apply, taunt, cons)
-  cfg, Bridge, State, Apply, Taunt, Cons = config, bridge, state, apply, taunt, cons
+function Sched.init(config, bridge, state, apply, taunt, cons, loading)
+  cfg, Bridge, State, Apply, Taunt, Cons, Loading = config, bridge, state, apply, taunt, cons, loading
   POOL_FOR_ROOM = {}
   CONTROLLED_POOL = {}
   local function map(rt, pool)

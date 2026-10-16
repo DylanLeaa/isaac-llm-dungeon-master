@@ -34,8 +34,6 @@ return {
   -- Hard cap on room_layout requests per room per floor (first ask + refreshes). A room the
   -- player keeps walking past is only re-asked when their state changed since the last ask.
   MAX_LAYOUT_SENDS = 3,
-  -- How long after entering a room a late room_layout decision may still be applied.
-  LATE_LAYOUT_GRACE_FRAMES = 20,
   ITEM_CANDIDATES = 6,
   TRINKET_CANDIDATES = 8,
   -- consumables requests per floor (floor start + re-asks for new pill colours / empty queues)
@@ -52,6 +50,12 @@ return {
   LOADING_CONNECT_MS = 3000,
   LOADING_TIMEOUT_MS = 90000,
   LOADING_FLOOR_TIMEOUT_MS = 60000,
+  -- When the game needs a decision the DM hasn't answered yet (a room as you walk in, the reward
+  -- as the last enemy dies, a pedestal, a pill), it freezes on the same screen until it has. If the
+  -- backend answers "no decision" it is asked again, HOLD_RETRIES times. The freeze ends without the
+  -- DM only if the backend is gone (LOADING_CONNECT_MS) or HOLD_TIMEOUT_MS passes.
+  HOLD_RETRIES = 2,
+  HOLD_TIMEOUT_MS = 45000,
 
   SHOW_TAUNTS = true,
   -- After-death stats (yours and the DM's, plus its epitaph) over the game-over screen; the map
