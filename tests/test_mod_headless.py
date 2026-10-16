@@ -307,29 +307,20 @@ def run(tmp, game):
     W.heldPill = 5
     print("15. uncovered pill: button held until the plan covered it, then free")
 
-    # --- DM Settings > Receipt: what the engine did, browsable in the menu --------
-    receipt = [e.s for e in menu if e.sub == "Receipt"]
-    picker = next(s for s in receipt if s.Type == 3)
-
-    def screen():
-        return [s.Display() if callable(s.Display) else (s.Display or "") for s in receipt]
-
-    wait(lambda: any("room_clear applied" in line for line in screen()), 5, "receipt entries in the menu")
-    lines = screen()
-    print("16. DM Settings > Receipt:\n      " + "\n      ".join(l for l in lines if l))
-    assert any(" actions, " in l for l in lines), "totals shown"
-    assert any(l.startswith("saved as ") for l in lines), "the receipt file is named"
-    newest = picker.Display()
-    picker.OnChange(2)
-    assert picker.Display() != newest and picker.CurrentSetting() == 2, "the picker browses older entries"
+    # --- the receipt: on disk for the app, no longer in the game's menu ----------------
+    assert not [e for e in menu if e.sub == "Receipt"], "the receipt lives in the app, not the menu"
     files = list((Path(tmp) / "receipts").glob("*.jsonl"))
     assert len(files) == 1, files
     recs = [json.loads(l) for l in files[0].read_text().splitlines()]
     calls = [r for r in recs if r["type"] == "entry" and (r.get("llm") or {}).get("model") == "mock"]
     assert calls and all("request" in r for r in calls if r["what"] not in ("narrative", "floor_brief", "gate"))
     assert any(r["type"] == "update" and r["status"] == "applied" for r in recs)
+    effects = [line for r in recs if r["type"] == "effect" for line in r["effect"]]
+    assert any(line.endswith(" dropped") for line in effects), effects      # what each used decision did
+    assert any(line.startswith("item offered: ") for line in effects), effects
     assert any(r.get("what") == "cruelty" and r.get("result") == "6 -> 3" for r in recs)
-    print(f"    receipt file {files[0].name}: {len(recs)} records, {len(calls)} LLM calls")
+    print(f"16. receipt file {files[0].name}: {len(recs)} records, {len(calls)} LLM calls, "
+          f"{len(effects)} effect lines")
 
     # --- floor 2: a loading screen again, held until the brief and the opening decisions are in ---
     W.stage = 2

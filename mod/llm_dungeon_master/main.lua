@@ -11,7 +11,6 @@ local Taunt  = include("dm.taunt")
 local Apply  = include("dm.apply")
 local Sched  = include("dm.scheduler")
 local Settings = include("dm.settings")
-local Receipt = include("dm.receipt")
 local Cons   = include("dm.consumables")
 local Death  = include("dm.deathscreen")
 local Loading = include("dm.loading")
@@ -39,11 +38,10 @@ local function safe(name, fn)
   end
 end
 
--- Saved DM Settings (cruelty) go out with the first hello; the backend's receipt fills the menu.
+-- Saved DM Settings (cruelty) go out with the first hello.
 SaveFile.init(mod)
-Settings.init(SaveFile, cfg, Bridge, Receipt, Death)
-Bridge.setReceiptHandler(Receipt.handle)
-Death.init(cfg, Bridge, State, Cons, Settings, Receipt.wrap)
+Settings.init(SaveFile, cfg, Bridge, Death)
+Death.init(cfg, Bridge, State, Cons, Settings)
 Bridge.setSummaryHandler(Death.handle)
 Loading.init(cfg, Bridge, State, Taunt, Sched)
 Bridge.setReadyHandler(Loading.handle)

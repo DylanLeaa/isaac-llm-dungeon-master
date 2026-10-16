@@ -162,6 +162,7 @@ local function nextCard(p, playing, runes, onlyRunes)
     elseif cardFits(c.cat, playing, runes, onlyRunes) then
       table.remove(p.cards, i)
       handOut(p)
+      Bridge.effect(key(), { "card handed out: " .. c.key:gsub("_", " ") })
       Bridge.event("card_drawn", { name = c.key })
       return id
     else
@@ -182,6 +183,7 @@ local function nextTrinket(p, golden)
     if info and not player:HasTrinket(id) then
       pcall(function() game:GetItemPool():RemoveTrinket(id) end)
       handOut(p)
+      Bridge.effect(key(), { "trinket handed out: " .. info.name .. (golden and " (golden)" or "") })
       Bridge.event("trinket_drawn", { name = info.name })
       if golden then id = id | GOLDEN end
       return id
@@ -329,6 +331,9 @@ function Cons.onUsePill(effect)
     entry = { by = "dm", effect = q.entry.effect, enum = q.entry.enum, phd = q.entry.phd,
               false_phd = q.entry.false_phd }
     if plan then handOut(plan) end
+    local did = State.enumName(PillEffect, effect, "^PILLEFFECT_")
+    Bridge.effect(key(), { "pill " .. look(q.color) .. " = " .. did:gsub("_", " ")
+                           .. (did ~= q.entry.effect and " (planned " .. q.entry.effect:gsub("_", " ") .. ")" or "") })
   else
     entry = { by = "vanilla", effect = State.enumName(PillEffect, effect, "^PILLEFFECT_") }
   end

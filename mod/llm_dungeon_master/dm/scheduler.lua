@@ -39,6 +39,7 @@ local drawn              -- {pool, frame, stale}: an item drawn with no DM answe
 local swaps = {}         -- pool -> pedestals to turn into the DM's picks once its ranking lands
 local toHold = {}        -- pool -> stale result id (or false): hold on it next update, not mid-draw
 local floorPlanUsed      -- last floor plan applied (re-used if we reseed)
+local floorPlanKey       -- its key, for what its rerolls did
 local reseeds = 0
 Sched.peeking = false
 
@@ -188,8 +189,9 @@ local function holdLayout(key, desc)
     ask = function() requestLayout(desc, "the player walked in before the DM had dressed this room") end,
     apply = function()
       local res = Bridge.take(key)
-      if not res or curIdx() ~= idx then return end
-      Apply.roomLayout(res.decision, game:GetFrameCount() - entered)
+      if not res then return end
+      if curIdx() ~= idx then return Bridge.effect(key, { "not applied: the player left the room" }) end
+      Bridge.effect(key, Apply.roomLayout(res.decision, game:GetFrameCount() - entered))
       if room and room.idx == idx then room.layoutApplied = true end
     end,
     giveUp = function() reportFallback("room_layout", key, true) end,
@@ -207,7 +209,9 @@ local function holdClear(key, pos)
     end,
     apply = function()
       local res = Bridge.take(key)
-      if res and curIdx() == idx then Apply.roomClear(res.decision, at) end
+      if not res then return end
+      if curIdx() ~= idx then return Bridge.effect(key, { "not applied: the player left the room" }) end
+      Bridge.effect(key, Apply.roomClear(res.decision, at))
     end,
     giveUp = function() reportFallback("room_clear", key, true) end,
   })
@@ -240,6 +244,8 @@ local function nextItem(pool, decrease)
         Bridge.markApplied(fkey("items", pool))
         Taunt.show(q.taunt)
       end
+      local info = State.itemInfo(id)
+      Bridge.effect(fkey("items", pool), { "item offered: " .. info.name .. " (q" .. info.quality .. ")" })
       return id, q
     end
   end
@@ -275,6 +281,14 @@ local function holdItems(pool, stale)
   })
 end
 
+-- A floor plan's effect: its curse changes, and whether its treasure-distance wish can act at all.
+local function floorEffect(plan, curses)
+  if plan.treasure_distance and plan.treasure_distance ~= "any" and not cfg.ALLOW_LAYOUT_RESEED then
+    curses[#curses + 1] = "treasure room " .. plan.treasure_distance .. ": ignored (layout rerolls are off)"
+  end
+  return curses
+end
+
 -- Optional: reroll the layout until the DM's treasure-distance wish is met. True if it rerolled.
 local function maybeReseed()
   if cfg.ALLOW_LAYOUT_RESEED and floorPlanUsed and floorPlanUsed.treasure_distance ~= "any" then
@@ -283,6 +297,7 @@ local function maybeReseed()
     local ok = dist == nil or (want == "far" and dist >= 4) or (want == "near" and dist <= 2)
     if not ok and reseeds < cfg.MAX_RESEEDS then
       reseeds = reseeds + 1
+      Bridge.effect(floorPlanKey, { "floor rerolled: treasure room " .. tostring(dist) .. " rooms away, wanted " .. want })
       levelSig = nil                 -- the reseeded floor counts as a new floor
       Isaac.ExecuteCommand("reseed")
       return true
@@ -300,9 +315,9 @@ local function holdFloorPlan(key)
     apply = function()
       local res = Bridge.take(key)
       if not res then return end
-      floorPlanUsed = res.decision
+      floorPlanUsed, floorPlanKey = res.decision, key
       Taunt.show(res.decision.taunt)
-      Apply.cursesNow(res.decision)
+      Bridge.effect(key, floorEffect(res.decision, Apply.cursesNow(res.decision)))
       maybeReseed()
     end,
     giveUp = function() reportFallback("floor_plan", key, true) end,
@@ -377,7 +392,7 @@ function Sched.onNewRoom()
     local key = fkey("layout", room.idx)
     local res = Bridge.take(key)
     if res then
-      Apply.roomLayout(res.decision)
+      Bridge.effect(key, Apply.roomLayout(res.decision))
       room.layoutApplied = true
     elseif Bridge.ready() and eligibleLayoutRoom(room.type)
         and room.idx ~= game:GetLevel():GetStartingRoomIndex() then   -- the start room is never dressed
@@ -517,7 +532,7 @@ function Sched.onCleanAward(rng, pos)
   local key = fkey("clear", room.idx)
   local res = Bridge.take(key)
   if res then
-    Apply.roomClear(res.decision, pos)
+    Bridge.effect(key, Apply.roomClear(res.decision, pos))
   elseif Bridge.ready() then
     holdClear(key, pos)                               -- not in yet: the game waits, the DM's drop comes after
   else
@@ -567,12 +582,17 @@ function Sched.onCurseEval(curses)
   floorPlanAsked = false
   if not plan then return nil end
   floorPlanUsed = plan
-  if res then Taunt.show(plan.taunt) end
-  return Apply.curses(plan, curses)
+  local mask = Apply.curses(plan, curses)
+  if res then
+    floorPlanKey = key
+    Taunt.show(plan.taunt)
+    Bridge.effect(key, floorEffect(plan, Apply.curseEffect(curses, mask)))
+  end
+  return mask
 end
 
 function Sched.resetRun()
-  floorNo, levelSig, room, itemQueues, floorPlanUsed, reseeds = 0, nil, nil, {}, nil, 0
+  floorNo, levelSig, room, itemQueues, floorPlanUsed, floorPlanKey, reseeds = 0, nil, nil, {}, nil, nil, 0
   itemSigs, layoutSends, fallbackSent, floorPlanAsked = {}, {}, {}, false
   floorPlanFor, latePlan, drawn, swaps, toHold = nil, nil, nil, {}, {}
   floorItemsRequestedFor = -1

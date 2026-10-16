@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
-from schemas import clamp  # noqa: E402
+from schemas import clamp, clamp_diff  # noqa: E402
 
 
 def st(hp_red=6, soul=0, keys=1, bombs=1, coins=5, locked=0, bomb_targets=0):
@@ -102,3 +102,27 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
             print("PASS", name)
+
+
+def test_clamp_diff_names_what_the_model_did_not_get():
+    raw = {"champion_chance": 5, "extra_enemies": [{"enemy": "boom_fly", "count": 3}, {"enemy": "mega_satan", "count": 3}],
+           "tinted_rocks": 9, "layout_pickups": "troll_bombs", "bonus_pickups": ["troll_bomb", "dime"], "taunt": ""}
+    out = clamp("room_layout", raw, st(hp_red=1), {}, cruelty=10, counters={})
+    diffs = clamp_diff("room_layout", raw, out)
+    assert "champion chance 500% -> 10%" in diffs
+    assert "extra enemies 3x boom_fly, 3x mega_satan -> 1x boom_fly" in diffs
+    assert "tinted rocks 9 -> 2" in diffs and "layout pickups troll_bombs -> to_pennies" in diffs
+    assert "bonus pickups troll_bomb, dime -> dime" in diffs
+
+    # Taken as asked, or left to its defaults: nothing to say.
+    asked = {"champion_chance": 0.1, "extra_enemies": [{"enemy": "gaper", "count": 1}], "tinted_rocks": 0,
+             "layout_pickups": "keep", "taunt": "hi"}
+    assert clamp_diff("room_layout", asked, clamp("room_layout", asked, st(), {}, cruelty=6, counters={})) == []
+
+    raw = {"rewards": [], "taunt": ""}                                  # the drought breaker adds a key
+    out = clamp("room_clear", raw, st(keys=0, locked=1), {}, cruelty=6, counters={"clears_since_key": 7})
+    assert clamp_diff("room_clear", raw, out) == ["rewards none -> 1x key"]
+
+    raw = {"order": [9, "2", 999], "taunt": ""}
+    out = clamp("item_choice", raw, st(), {"candidates": [{"id": 2}, {"id": 9}]}, cruelty=6, counters={})
+    assert clamp_diff("item_choice", raw, out) == ["ignored ids not in the pool: 999"]

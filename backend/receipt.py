@@ -4,8 +4,10 @@ Stored per run as JSON lines in receipts/<started>_run-<seed>.jsonl:
   {"type": "prompt", "hash": ..., "text": ...}       a system prompt, written once per file
   {"type": "entry", "seq": n, ...}                   one engine action (request, LLM call, result)
   {"type": "update", "ref": n, "status": ...}        what later happened to it (applied / replaced)
-A continued run picks up its latest file again. The game gets a compact copy of each entry and
-shows it under Mod Config Menu > DM Settings > Receipt.
+  {"type": "effect", "ref": n, "effect": [...]}      what it actually did in the game, as the mod saw it
+                                                     ("+1 bomb dropped"); a decision used gradually
+                                                     (item rankings, consumables) adds one per use
+A continued run picks up its latest file again. The app shows it (Current run and History).
 """
 from __future__ import annotations
 
@@ -13,24 +15,26 @@ import hashlib
 import json
 import logging
 import re
-import sys
 import time
-from collections import Counter, OrderedDict
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
+from schemas import clamp_diff
+
 log = logging.getLogger("llmdm")
 
-GAME_KEEP = 40          # entries the game keeps (the menu browses these)
-PLAN_CHARS = 600        # how much of a planner's text the game gets
+PLAN_CHARS = 600        # how much of a planner's text goes in its entry's result
+EFFECT_CHARS = 120      # per effect line
+BRIEF_KEY_RE = re.compile(r"^(.*) \((-?\d+)\.(-?\d+)\)$")   # a floor brief's key: "Basement I (1.0)"
 
 
 class Receipt:
-    def __init__(self, directory: Path | None = None, keep: int = GAME_KEEP, keep_full: bool = False) -> None:
+    def __init__(self, directory: Path | None = None, keep_full: bool = False) -> None:
         self.dir = directory
-        self.keep = keep
         self.keep_full = keep_full                # also hold every whole entry and prompt (the app's views)
-        # Told ("run", {run, fresh, path}), ("entry", entry) and ("update", {seq, status}): the app mirrors the run.
+        # Told ("run", {run, fresh, path}), ("entry", entry), ("update", {seq, status}) and
+        # ("effect", {seq, effect}): the app mirrors the run.
         self.listener: Callable[[str, dict], None] | None = None
         self.source: Path | None = None           # the file load() read
         self.start_run(None, fresh=True)
@@ -40,13 +44,14 @@ class Receipt:
         """A new run starts a new file; a continued one (fresh=False) resumes its latest file."""
         self.run_id = run_id
         self.seq = 0
-        self.recent: OrderedDict[int, dict] = OrderedDict()   # seq -> compact entry, newest last
         self.status: dict[int, str] = {}                      # every entry's current status
         self.decisions: dict[int, tuple[str, dict]] = {}      # seq -> (kind, clamped decision)
         self.usage = Counter()
         self.prompts: set[str] = set()                        # system prompt hashes already in the file
         self.full: dict[int, dict] = {}                       # seq -> the whole entry (keep_full)
         self.prompt_text: dict[str, str] = {}                 # hash -> system prompt (keep_full)
+        self.saved_narrative: str | None = None                # the run's latest plans, for a continue
+        self.saved_brief: tuple[tuple, str, str] | None = None # (floor signature, floor name, text)
         self.path: Path | None = None
         if self.dir is None or run_id is None:
             self._tell("run", {"run": run_id, "fresh": fresh, "path": None})
@@ -83,30 +88,42 @@ class Receipt:
                 self._ingest(rec)
             elif rec.get("type") == "update":
                 self._apply_update(rec.get("ref"), rec.get("status"))
+            elif rec.get("type") == "effect":
+                self._apply_effect(rec.get("ref"), rec.get("effect"))
         if self.seq and self.source is None:
             log.info("receipt: resumed %s (%d entries)", path.name, self.seq)
 
     # --------------------------------------------------------------- writing
-    def add(self, what: str, status: str, **fields) -> dict:
-        """Record one engine action. Returns the compact entry the game is sent."""
+    def add(self, what: str, status: str, **fields) -> int:
+        """Record one engine action. Returns its seq."""
         entry = {"type": "entry", "seq": self.seq + 1, "ts": round(time.time(), 3),
                  "run": self.run_id, "what": what, "status": status, **fields}
         llm = entry.get("llm")
         if llm and isinstance(llm.get("system"), list):
             llm["system"] = [self._prompt(text) for text in llm["system"]]
         self._write(entry)
-        c = self._ingest(entry)
+        self._ingest(entry)
         self._tell("entry", entry)
-        return c
+        return entry["seq"]
 
-    def update(self, seq: int | None, status: str) -> dict | None:
-        """A later outcome for entry `seq` (applied, replaced). Returns its new compact form."""
+    def update(self, seq: int | None, status: str) -> bool:
+        """A later outcome for entry `seq` (applied, replaced). False if there is no such entry."""
         if seq is None or seq not in self.status:
-            return None
+            return False
         self._write({"type": "update", "ref": seq, "status": status, "ts": round(time.time(), 3)})
-        c = self._apply_update(seq, status)
+        self._apply_update(seq, status)
         self._tell("update", {"seq": seq, "status": status})
-        return c
+        return True
+
+    def add_effect(self, seq: int | None, lines: Any) -> bool:
+        """What entry `seq` actually did in the game (added to what it did before). False if not recorded."""
+        lines = clean_effect(lines)
+        if seq is None or seq not in self.status or not lines:
+            return False
+        self._write({"type": "effect", "ref": seq, "effect": lines, "ts": round(time.time(), 3)})
+        self._apply_effect(seq, lines)
+        self._tell("effect", {"seq": seq, "effect": lines})
+        return True
 
     def _prompt(self, text: str) -> str:
         h = hashlib.sha1(text.encode()).hexdigest()[:12]
@@ -135,11 +152,11 @@ class Receipt:
             log.warning("receipt: cannot write %s (%s) -> in-memory only", self.path, e)
             self.path = None
 
-    def ingest(self, entry: dict) -> dict:
-        """Take an entry recorded elsewhere (the running DM's receipt). Returns its compact form."""
-        return self._ingest(entry)
+    def ingest(self, entry: dict) -> None:
+        """Take an entry recorded elsewhere (the running DM's receipt)."""
+        self._ingest(entry)
 
-    def _ingest(self, entry: dict) -> dict:
+    def _ingest(self, entry: dict) -> None:
         seq = int(entry["seq"])
         self.seq = max(self.seq, seq)
         self.status[seq] = entry["status"]
@@ -147,30 +164,51 @@ class Receipt:
             self.full[seq] = entry
         if entry.get("decision"):
             self.decisions[seq] = (entry["what"], entry["decision"])
+        if entry["status"] == "written" and isinstance(entry.get("text"), str):
+            self._keep_plan(entry)
         llm = entry.get("llm")
         if llm:
             self.usage["calls"] += 1
             self.usage.update({k: (llm.get("usage") or {}).get(k, 0) for k in ("in", "cached", "out", "cost")})
-        c = compact(entry)
-        self.recent[seq] = c
-        while len(self.recent) > self.keep:
-            self.recent.popitem(last=False)
-        return c
 
-    def apply_update(self, seq, status) -> dict | None:
-        """A later outcome recorded elsewhere. Returns the entry's new compact form."""
+    def _keep_plan(self, entry: dict) -> None:
+        if entry["what"] == "narrative":
+            self.saved_narrative = entry["text"]
+        elif entry["what"] == "floor_brief":
+            floor, name = entry.get("floor"), entry.get("floor_name")
+            if not (isinstance(floor, list) and len(floor) == 2):
+                m = BRIEF_KEY_RE.match(str(entry.get("key") or ""))   # written before "floor" was
+                if not m:
+                    return
+                floor, name = [int(m[2]), int(m[3])], m[1]
+            self.saved_brief = (tuple(floor), name, entry["text"])
+
+    def saved_plans(self) -> tuple[str | None, tuple[tuple, str, str] | None]:
+        """The latest run narrative and floor brief (with its floor) written into this run's file."""
+        return self.saved_narrative, self.saved_brief
+
+    def apply_update(self, seq, status) -> bool:
+        """A later outcome recorded elsewhere. False if there is no such entry."""
         return self._apply_update(seq, status)
 
-    def _apply_update(self, seq, status) -> dict | None:
+    def _apply_update(self, seq, status) -> bool:
         if seq not in self.status or not status:
-            return None
+            return False
         self.status[seq] = status
         if self.keep_full and seq in self.full:
             self.full[seq]["status"] = status
-        c = self.recent.get(seq)
-        if c is not None:
-            c["status"] = status
-        return c
+        return True
+
+    def apply_effect(self, seq, lines) -> bool:
+        """An effect recorded elsewhere. False if there is no such entry."""
+        return self._apply_effect(seq, lines)
+
+    def _apply_effect(self, seq, lines) -> bool:
+        if seq not in self.status or not isinstance(lines, list):
+            return False
+        if self.keep_full and seq in self.full:
+            self.full[seq]["effect"] = self.full[seq].get("effect", []) + lines
+        return True
 
     # --------------------------------------------------------------- reading
     def totals(self) -> dict:
@@ -182,11 +220,6 @@ class Receipt:
     def applied(self) -> list[tuple[str, dict]]:
         """Every decision the game actually used this run, oldest first, as (kind, decision)."""
         return [self.decisions[s] for s in sorted(self.decisions) if self.status.get(s) == "applied"]
-
-    def snapshot(self) -> dict:
-        """Everything the game shows: recent entries (oldest first), run totals, where the file is."""
-        return {"entries": list(self.recent.values()), "totals": self.totals(),
-                "file": self.path.name if self.path else None}
 
     # ------------------------------------------------- with keep_full: the app
     def run_summary(self) -> dict | None:
@@ -219,7 +252,7 @@ FILE_RE = re.compile(r"^(\d{8})-(\d{6})(?:-\d+)?_run-(.+)\.jsonl$")
 
 def load(path: Path) -> Receipt:
     """A whole receipt file, read only (the app's History)."""
-    r = Receipt(None, keep=sys.maxsize, keep_full=True)
+    r = Receipt(None, keep_full=True)
     r.source = path
     r._replay(path)
     r.run_id = next((e["run"] for e in r.full.values() if e.get("run")), None)
@@ -236,9 +269,9 @@ def file_info(path: Path) -> dict:
     return {"path": path, "started": time.strftime("%Y-%m-%d %H:%M", started), "seed": m.group(3) if m else path.stem}
 
 
-# ------------------------------------------------------------------ for the game
+# ------------------------------------------------------------------ for the app
 def compact(entry: dict) -> dict:
-    """An entry as the in-game menu shows it: short fields, no prompts or raw payloads."""
+    """An entry as the app's table shows it: short fields, no prompts or raw payloads."""
     llm = entry.get("llm") or {}
     u = llm.get("usage") or {}
     c = {"seq": entry["seq"], "time": time.strftime("%H:%M:%S", time.localtime(entry.get("ts", 0))),
@@ -261,7 +294,24 @@ def compact(entry: dict) -> dict:
         c["result"] = summarize(entry["what"], d, (entry.get("request") or {}).get("ctx") or {})
     if d.get("guardrails"):
         c["guardrails"] = d["guardrails"]
+    if d and entry.get("raw"):
+        diffs = clamp_diff(entry["what"], entry["raw"], d)
+        if diffs:
+            c["clamped"] = diffs
+    reason = ((entry.get("request") or {}).get("ctx") or {}).get("reason") or entry.get("reason")
+    if reason:
+        c["reason"] = str(reason)
+    if entry.get("effect"):
+        c["effect"] = list(entry["effect"])
     return c
+
+
+def clean_effect(lines: Any) -> list[str]:
+    """The mod's effect lines, as stored: short plain strings."""
+    if not isinstance(lines, list):
+        return []
+    out = [" ".join(str(line).split())[:EFFECT_CHARS] for line in lines if isinstance(line, (str, int, float))]
+    return [line for line in out if line]
 
 
 def summarize(kind: str, d: dict, ctx: dict) -> str:

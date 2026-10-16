@@ -34,7 +34,6 @@ local holding = false  -- a loading screen is up: requests wait on the floor bri
 local latencies = {}   -- ring buffer of recent round-trips (ms)
 local LAT_N = 24
 local lastHello = -1e9
-local onReceipt        -- optional callback(msg) for the backend's receipt / receipt_sync messages
 local onSummary        -- optional callback(msg) for the backend's run_summary (after-death stats)
 local onReady          -- optional callback(msg) for the backend's "ready" (the run narrative is in)
 local cruelty          -- nil = backend's --cruelty; set from config / the DM Settings menu
@@ -146,9 +145,6 @@ end
 
 function Bridge.getCruelty() return cruelty end
 
---- Where the backend's receipt entries for this session go (the DM Settings > Receipt menu).
-function Bridge.setReceiptHandler(fn) onReceipt = fn end
-
 --- Where the backend's after-death stats go. Not filtered by session: they can arrive after the
 --- next run has started, so the handler matches them to the run they describe.
 function Bridge.setSummaryHandler(fn) onSummary = fn end
@@ -195,6 +191,12 @@ end
 --- Mark a result as used without removing it (e.g. an item list that is consumed gradually).
 function Bridge.markApplied(key) send({ t = "applied", key = key }) end
 
+--- What a used result actually did, as short lines ("+1 bomb dropped"), for the receipt. A result
+--- used gradually reports each use as it happens.
+function Bridge.effect(key, lines)
+  if type(lines) == "table" and #lines > 0 then send({ t = "effect", key = key, effect = lines }) end
+end
+
 --- Drop every pending/result whose key starts with prefix.
 function Bridge.forget(prefix)
   for k in pairs(pending) do if k:sub(1, #prefix) == prefix then pending[k] = nil end end
@@ -225,10 +227,6 @@ local function handle(msg)
   end
   if msg.t == "run_summary" then
     if onSummary then onSummary(msg) end
-    return
-  end
-  if msg.t == "receipt" or msg.t == "receipt_sync" then
-    if msg.session == session and onReceipt then onReceipt(msg) end
     return
   end
   if msg.t ~= "res" or msg.session ~= session then return end

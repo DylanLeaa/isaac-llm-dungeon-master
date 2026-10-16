@@ -34,6 +34,7 @@ local startedAt, startFrame, readyAt
 local sent = false
 local verdict            -- the backend's "ready" status for this floor, once it arrives
 local noticeAt           -- when to tell the player the DM isn't playing this run, if it isn't
+local deferUntil         -- no backend seen yet: raise this floor's screen if one answers before then
 local keysDone, keysTotal = 0, 0
 local clock, lastTime = 0, nil  -- ms spent on screen while the game ran: a pause or tab-out doesn't count
 
@@ -75,8 +76,15 @@ function Loading.active() return on or next(holds) ~= nil end
 local function begin(n)
   floor, sent, verdict, keysDone, keysTotal = n, false, nil, 0, 0
   if on then return end                  -- a reseed mid-wait: same screen, new floor number
-  -- No backend has answered since the game started: likely none is running, so don't make them wait.
-  if cfg.LOADING_SCREEN == false or not Bridge.seen() then return end
+  if cfg.LOADING_SCREEN == false then return end
+  -- No backend has answered since the game started: likely none is running, so don't make them
+  -- wait. One started after the game may still answer this run's hello: if it does in time, the
+  -- screen goes up then (Loading.update).
+  if not Bridge.seen() then
+    deferUntil = Isaac.GetTime() + cfg.LOADING_CONNECT_MS
+    return
+  end
+  deferUntil = nil
   on, startedAt, startFrame, readyAt = true, tick(), game:GetFrameCount(), nil
   Bridge.holdPending(true)
   hud(false)
@@ -85,7 +93,7 @@ end
 --- A new run (or a continue) has started: its first floor waits for the run narrative too.
 function Loading.start()
   Loading.dropHolds()
-  on, runStart, loadedFloor, readyAt = false, true, 0, nil
+  on, runStart, loadedFloor, readyAt, deferUntil = false, true, 0, nil, nil
   noticeAt = Isaac.GetTime() + cfg.LOADING_CONNECT_MS
   begin(0)
 end
@@ -131,6 +139,10 @@ function Loading.update()
   if f > 0 and f ~= loadedFloor then
     loadedFloor = f
     begin(f)
+  end
+  if deferUntil and not on then
+    if Bridge.seen() then begin(floor)
+    elseif Isaac.GetTime() > deferUntil then deferUntil = nil end
   end
   if not on then return end
   local t = tick()

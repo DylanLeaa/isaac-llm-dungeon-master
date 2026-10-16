@@ -172,6 +172,23 @@ class Campaign:
         self._clear()
         self._push()
 
+    def restore(self, narrative: str | None, brief: tuple[tuple, str, str] | None) -> None:
+        """A continued run: take the plans already written for it (from its receipt) instead of paying
+        for them again. A floor other than the brief's still gets its own brief, written after it."""
+        if not self.planner:
+            return
+        if narrative:
+            self.narrative = narrative
+            self.stats["narrative"]["reused"] += 1
+        if brief:
+            sig, self.floor_name, self.brief = brief
+            self.floor_sig = tuple(sig)
+            self.stats["floor_brief"]["reused"] += 1
+        if narrative or brief:
+            log.info("continued run: reusing its %s", " and ".join(
+                what for what, have in (("narrative", narrative), (f"brief for {self.floor_name}", brief)) if have))
+        self._push()
+
     def _push(self) -> None:
         self.push(campaign_text(self.narrative, self.brief, self.floor_name) if self.planner else "")
 
@@ -179,7 +196,7 @@ class Campaign:
         """Called for every decision request; starts a planner when a run or floor begins."""
         if not self.planner or not state:
             return
-        if self.narrative_task is None:
+        if self.narrative_task is None and self.narrative is None:
             self.narrative_task = self._spawn(self._write_narrative(state, cruelty, self.run_token))
         sig = floor_signature(state)
         if sig is not None and sig != self.floor_sig:
@@ -294,7 +311,8 @@ class Campaign:
             self.record("floor_brief", "discarded", key=floor, ms=_ms(t0), llm=call, result=plan_excerpt(text),
                         text=text)
             return
-        self.record("floor_brief", "written", key=floor, ms=_ms(t0), llm=call, result=plan_excerpt(text), text=text)
+        self.record("floor_brief", "written", key=floor, ms=_ms(t0), llm=call, result=plan_excerpt(text), text=text,
+                    floor=list(sig), floor_name=self.floor_name)   # what a continue restores it by
         self._account("floor_brief", usage)
         self.brief = text
         log.info("floor_brief %s [%s]\n%s", self.floor_name, self.planner.floor_model, _indent(text))
