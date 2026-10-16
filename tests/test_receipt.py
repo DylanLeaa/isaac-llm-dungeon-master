@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from dm_agent import LLMCallError  # noqa: E402
 from receipt import Receipt  # noqa: E402
+from bridge import PROTO  # noqa: E402
 from server import Coordinator  # noqa: E402
 from test_coordinator import CampaignDM, ScriptedPlanner, clear_req, floor_req  # noqa: E402
 
@@ -45,7 +46,7 @@ def test_decisions_are_stored_with_their_call_and_pushed_to_the_game(tmp_path):
         sent.append(msg)
 
     async def go():
-        await coord.handle({"t": "hello", "session": "S", "run": "SEED 1", "new_run": True}, send)
+        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "SEED 1", "new_run": True}, send)
         for rid in (1, 2):                       # a re-ask: the first answer is replaced unused
             await coord.handle(clear_req(rid), send)
             await asyncio.sleep(0.02)
@@ -117,10 +118,10 @@ def test_continued_run_resumes_its_receipt_and_new_run_starts_fresh(tmp_path):
         asyncio.run(go())
 
     first = Coordinator(dm, cruelty=6, receipt=Receipt(tmp_path))
-    session(first, {"t": "hello", "session": "S1", "run": "R", "new_run": True})
+    session(first, {"t": "hello", "proto": PROTO, "session": "S1", "run": "R", "new_run": True})
     # Backend restarted, game continued the same run: same file, numbering and totals carry on.
     again = Coordinator(dm, cruelty=6, receipt=Receipt(tmp_path))
-    session(again, {"t": "hello", "session": "S2", "run": "R", "new_run": False})
+    session(again, {"t": "hello", "proto": PROTO, "session": "S2", "run": "R", "new_run": False})
     sync = [m for m in sent if m["t"] == "receipt_sync"][-1]
     assert again.receipt.path == first.receipt.path and [e["seq"] for e in sync["entries"]] == [1]
     assert again.receipt.totals()["calls"] == 2 and again.receipt.seq == 2

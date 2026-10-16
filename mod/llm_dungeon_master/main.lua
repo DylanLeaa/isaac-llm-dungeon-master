@@ -1,9 +1,10 @@
 -- LLM Dungeon Master
 -- Every "random" event worth trolling about is decided by an LLM (Claude Haiku 5.5)
--- running in a local backend. Requires the --luadebug launch option (sockets / io).
+-- running in a local backend, reached through the game's log and this mod's save file.
 local mod = RegisterMod("LLM Dungeon Master", 1)
 
 local cfg    = include("dm.config")
+local SaveFile = include("dm.savefile")
 local Bridge = include("dm.bridge")
 local State  = include("dm.state")
 local Taunt  = include("dm.taunt")
@@ -39,7 +40,8 @@ local function safe(name, fn)
 end
 
 -- Saved DM Settings (cruelty) go out with the first hello; the backend's receipt fills the menu.
-Settings.init(mod, cfg, Bridge, Receipt, Death)
+SaveFile.init(mod)
+Settings.init(SaveFile, cfg, Bridge, Receipt, Death)
 Bridge.setReceiptHandler(Receipt.handle)
 Death.init(cfg, Bridge, State, Cons, Settings, Receipt.wrap)
 Bridge.setSummaryHandler(Death.handle)
@@ -47,7 +49,7 @@ Loading.init(cfg, Bridge, State, Taunt, Sched)
 Bridge.setReadyHandler(Loading.handle)
 
 -- Connect as soon as the mod loads so the DM is warm by the time a run starts.
-Bridge.init(cfg, "menu")
+Bridge.init(cfg, SaveFile, "menu")
 
 local runSeed
 -- POST_NEW_LEVEL / POST_NEW_ROOM fire for a run's first room before POST_GAME_STARTED, while the
@@ -60,9 +62,10 @@ local function live() return started and game:GetFrameCount() > 0 end
 
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function(_, continued)
   Settings.registerMenu()   -- in case Mod Config Menu loaded after this mod
+  Settings.reload()
   local seed = game:GetSeeds():GetStartSeedString()
   runSeed = seed
-  Bridge.init(cfg, seed)
+  Bridge.init(cfg, SaveFile, seed)
   Bridge.setRun(seed, not continued)
   State.resetRun()
   Sched.resetRun()

@@ -232,7 +232,15 @@ local itemConfig = { GetCollectible = function(_, id) return ITEMS[id] end,
 
 Isaac = {
   GetTime = function() return W.now end,
-  DebugString = function(s) print("   [isaac] " .. s) end,
+  -- Like the game: a line in log.txt (W.logPath), where the backend reads the mod's messages.
+  DebugString = function(s)
+    if W.logPath then
+      local f = assert(io.open(W.logPath, "a"))
+      f:write("[INFO] - Lua Debug: ", s, "\n")
+      f:close()
+    end
+    if not s:find("^%[LLMDM:") then print("   [isaac] " .. s) end
+  end,
   GetPlayer = function() return player end,
   GetRoomEntities = function()
     local out = {}
@@ -259,9 +267,30 @@ Isaac = {
 
 function RegisterMod(name)
   local m = { Name = name }
-  function m:SaveData(s) W.saved = s end
-  function m:HasData() return W.saved ~= nil end
-  function m:LoadData() return W.saved end
+  -- The save file is real when W.savePath is set: the backend writes its messages into it.
+  local function readSave()
+    local f = io.open(W.savePath, "rb")
+    if not f then return nil end
+    local data = f:read("a")
+    f:close()
+    return data
+  end
+  function m:SaveData(s)
+    W.saved = s
+    if W.savePath then
+      local f = assert(io.open(W.savePath, "wb"))
+      f:write(s)
+      f:close()
+    end
+  end
+  function m:HasData()
+    if W.savePath then return readSave() ~= nil end
+    return W.saved ~= nil
+  end
+  function m:LoadData()
+    if W.savePath then return readSave() or "" end
+    return W.saved
+  end
   function m:AddCallback(id, fn) W.callbacks[id] = W.callbacks[id] or {}; table.insert(W.callbacks[id], fn) end
   return m
 end

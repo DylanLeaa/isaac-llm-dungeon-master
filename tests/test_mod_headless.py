@@ -15,23 +15,43 @@ from lupa.lua53 import LuaRuntime
 
 ROOT = Path(__file__).resolve().parents[1]
 MOD = ROOT / "mod" / "llm_dungeon_master"
+sys.path.insert(0, str(ROOT / "backend"))
+from bridge import LogTail  # noqa: E402
+
+
+def sent(game):
+    """Every message the mod has written to the game's log so far."""
+    tail = LogTail(game["log"])
+    tail.pos = 0
+    return tail.messages()
+
+
+def fake_game(tmp):
+    """A game folder the backend can find: log.txt (empty, as at launch) and the mod's save folder."""
+    tmp = Path(tmp)
+    save = tmp / "isaac" / "data" / "llm_dungeon_master" / "save1.dat"
+    save.parent.mkdir(parents=True)
+    (tmp / "log.txt").write_bytes(b"")
+    return {"log": tmp / "log.txt", "save": save,
+            "args": ["--log", str(tmp / "log.txt"), "--isaac-dir", str(tmp / "isaac")]}
 
 
 def main():
     tmp = tempfile.mkdtemp()
-    srv = subprocess.Popen([sys.executable, "server.py", "--mock", "--bridge", "file", "--bridge-dir", tmp,
+    game = fake_game(tmp)
+    srv = subprocess.Popen([sys.executable, "server.py", "--mock", *game["args"],
                             "--mock-latency", "0.3", "0.9", "--receipts", str(Path(tmp) / "receipts")],
                            cwd=ROOT / "backend", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     time.sleep(1.0)
     try:
-        run(tmp)
+        run(tmp, game)
     finally:
         srv.terminate()
         log = srv.communicate(timeout=5)[0]
         print("\n--- backend log ---\n" + log)
 
 
-def run(bridge_dir):
+def run(tmp, game):
     lua = LuaRuntime(unpack_returned_tuples=True)
     g = lua.globals()
     printed = []
@@ -52,12 +72,11 @@ def run(bridge_dir):
     def fake_require(name):
         if name == "json":
             return jsonmod
-        if name == "socket":
-            raise RuntimeError("no socket")
         return real_require(name)
 
     g.require = fake_require
     W = lua.execute(open(ROOT / "tests" / "fake_isaac.lua").read())
+    W.logPath, W.savePath = str(game["log"]), str(game["save"])
 
     modules = {}
 
@@ -65,9 +84,6 @@ def run(bridge_dir):
         if name not in modules:
             path = MOD / (name.replace(".", "/") + ".lua")
             mod = lua.execute(open(path).read())
-            if name == "dm.config":
-                mod.BRIDGE_DIR = bridge_dir
-                mod.TRANSPORT = "auto"
             modules[name] = mod
         return modules[name]
 
@@ -100,6 +116,8 @@ def run(bridge_dir):
         raise AssertionError("timed out waiting for " + what)
 
     # --- run start in room 84 ----------------------------------------------------
+    # The title screen: the backend answers the hello the mod sent when it loaded.
+    wait(Bridge.ready, 5, "backend welcome at the title screen")
     W.cur = 84
     W.rooms[84].VisitedCount = 1
     W.fire(MC.MC_POST_GAME_STARTED, False)
@@ -113,7 +131,7 @@ def run(bridge_dir):
     assert Loading.blockInput(None, None, g.InputHook.IS_ACTION_PRESSED, g.ButtonAction.ACTION_PAUSE) is None
     wait(lambda: not Loading.active(), 5, "the narrative (mock) to land and the loading screen to end")
     assert Loading.blockInput(None, None, g.InputHook.IS_ACTION_PRESSED, 7) is None, "input is back"
-    assert any(json.loads(l).get("t") == "prepare" for l in open(Path(bridge_dir) / "to_dm.jsonl") if l.strip())
+    assert any(m.get("t") == "prepare" for m in sent(game))
     print("   loading screen held input until the narrative was in, then released it")
 
     # --- DM Settings menu: cruelty slider, applied live and saved -----------------
@@ -125,8 +143,8 @@ def run(bridge_dir):
     assert entry.s.Display() == "Cruelty: backend default"
     entry.s.OnChange(3)
     tick(3)
-    to_dm = [json.loads(l) for l in open(Path(bridge_dir) / "to_dm.jsonl") if l.strip()]
-    assert {"t": "settings", "cruelty": 3} in to_dm, "cruelty change should reach the backend"
+    settings = [m for m in sent(game) if m.get("t") == "settings"]
+    assert settings and settings[-1]["cruelty"] == 3, "cruelty change should reach the backend"
     assert entry.s.Display() == "Cruelty: 3/10 (mischievous)" and json.loads(W.saved)["cruelty"] == 3
     print("   DM Settings -> cruelty 3 sent to backend and saved")
     wait(lambda: Bridge.peek("layout:1:85") and Bridge.peek("items:1:0"), 6, "neighbour prefetch")
@@ -250,7 +268,7 @@ def run(bridge_dir):
     newest = picker.Display()
     picker.OnChange(2)
     assert picker.Display() != newest and picker.CurrentSetting() == 2, "the picker browses older entries"
-    files = list((Path(bridge_dir) / "receipts").glob("*.jsonl"))
+    files = list((Path(tmp) / "receipts").glob("*.jsonl"))
     assert len(files) == 1, files
     recs = [json.loads(l) for l in files[0].read_text().splitlines()]
     calls = [r for r in recs if r["type"] == "entry" and (r.get("llm") or {}).get("model") == "mock"]
@@ -277,7 +295,7 @@ def run(bridge_dir):
     wait(lambda: not Loading.active(), 8, "floor 2's plans and opening decisions")
     opening = [k for k in ("layout:2:85", "items:2:0", "cons:2") if Bridge.settled(k)]
     assert opening == ["layout:2:85", "items:2:0", "cons:2"], opening
-    prepares = [json.loads(l) for l in open(Path(bridge_dir) / "to_dm.jsonl") if '"prepare"' in l]
+    prepares = [m for m in sent(game) if m.get("t") == "prepare"]
     assert prepares[-1]["floor"] == 2 and prepares[-1]["state"]["level"]["stage"] == 2
     # Empty slots are spelled out, so a planner can't fill them from the character's usual loadout.
     who = prepares[-1]["state"]["player"]
@@ -305,7 +323,7 @@ def run(bridge_dir):
     text = last()
     assert text.startswith("HERE LIES ISAAC") and "Reached: Basement II" in text and "Last hit by: gaper" in text
     assert "Rooms cleared: 2" in text and "Pills eaten: 2" in text and "tallying" in text, text
-    death = [json.loads(l) for l in open(Path(bridge_dir) / "to_dm.jsonl") if '"death"' in l]
+    death = [m for m in sent(game) if m.get("t") == "event" and m.get("name") == "death"]
     assert death and death[0]["data"]["run"] == "TEST 1234" and death[0]["data"]["rows"][0] == ["Reached", "Basement II"]
     wait(lambda: "Extra enemies" in last(), 5, "the DM's side of the stats")
     wait(lambda: "The dice were mine" in last(), 5, "the DM's epitaph")

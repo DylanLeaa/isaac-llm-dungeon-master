@@ -2,7 +2,7 @@
 <metadata>
     <name>LLM Dungeon Master</name>
     <directory>llm_dungeon_master</directory>
-    <description>Room-clear drops, pedestal items, room dressing and floor curses are decided by a trolling LLM Dungeon Master (Claude Haiku 5.5) running in a local backend. Requires the --luadebug launch option and the companion backend.</description>
+    <description>Room-clear drops, pedestal items, room dressing and floor curses are decided by a trolling LLM Dungeon Master (Claude Haiku 5.5) running in a local backend. Requires the companion backend running on the same PC; without it, the game plays as vanilla.</description>
     <version>0.1</version>
     <visibility>Private</visibility>
 </metadata>

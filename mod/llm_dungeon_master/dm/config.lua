@@ -1,12 +1,9 @@
 -- LLM Dungeon Master - settings. Edit and restart the run (or `luamod llm_dungeon_master`).
 return {
-  -- "tcp"  : LuaSocket to the backend (fastest).  "file" : two .jsonl files in BRIDGE_DIR.
-  -- "auto" : try tcp, fall back to file if the socket library can't be loaded.
-  TRANSPORT = "auto",
-  HOST = "127.0.0.1",
-  PORT = 7337,
-  -- Relative to the game's working directory (the install folder), or absolute.
-  BRIDGE_DIR = "llmdm_bridge",
+  -- The link to the backend: we write to the game's log.txt and read its answers from this mod's
+  -- save file every POLL_MS. Messages longer than LOG_CHUNK chars go over several log lines.
+  POLL_MS = 30,
+  LOG_CHUNK = 900,
 
   -- nil = use the backend's --cruelty. 0 (generous) .. 10 (merciless).
   -- Only the starting value: once changed in Mod Config Menu > DM Settings, the saved value wins.
