@@ -16,6 +16,7 @@ local Death  = include("dm.deathscreen")
 local Loading = include("dm.loading")
 local Catcher = include("dm.dropcatcher")
 local Payouts = include("dm.payouts")
+local Rocks  = include("dm.rockloot")
 local EffectHud = include("dm.effecthud")
 
 Taunt.enabled = cfg.SHOW_TAUNTS
@@ -24,7 +25,8 @@ EffectHud.init(cfg, Apply)
 Cons.init(cfg, Bridge, State, Taunt, Loading)
 Catcher.init(cfg, Apply)
 Catcher.setExempt(Payouts.near)
-Sched.init(cfg, Bridge, State, Apply, Taunt, Cons, Loading, Catcher, Payouts)
+Rocks.init(Apply, Bridge)
+Sched.init(cfg, Bridge, State, Apply, Taunt, Cons, Loading, Catcher, Payouts, Rocks)
 
 local game = Game()
 
@@ -103,6 +105,7 @@ mod:AddCallback(ModCallbacks.MC_POST_UPDATE, safe("update", function()
   Apply.update()
   Sched.update()
   Payouts.update()
+  Rocks.update()
   Catcher.update()
   Loading.updateHolds()     -- after the scheduler, which may have started one
   -- Item pickup detection (for the DM's memory).
@@ -136,9 +139,10 @@ mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, safe("block_pill", function(_, ent
 end))
 
 -- Pickups the game filled without the DM's answer, to be swapped once it lands.
--- Payouts first (a scheduled machine/chest cancels the game's), then the drop catcher.
+-- Payouts first (a scheduled machine/chest cancels the game's), then tinted rock loot, then the drop catcher.
 mod:AddCallback(ModCallbacks.MC_POST_PICKUP_INIT, safe("pickup_init", function(_, pickup)
   if Payouts.onPickupInit(pickup) then return end
+  if Rocks.onPickupInit(pickup) then return end
   if Catcher.onPickupInit(pickup, Bridge) then return end
   Sched.onPickupInit(pickup)
   Cons.onPickupInit(pickup)

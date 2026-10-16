@@ -44,6 +44,12 @@ TOOLS: dict[str, dict[str, Any]] = {
                                  "description": "Turn this many ordinary rocks into tinted rocks. Each one holds loot (usually a soul heart): a gift to anyone who has or will get a bomb."},
                 "hide_tinted_rocks": {"type": "boolean",
                                       "description": "Turn the room's existing tinted rocks back into plain rocks."},
+                "tinted_rock_loot": {"type": "array", "maxItems": 2,
+                                     "items": {"type": "string", "enum": [*REWARDS, "nothing"]},
+                                     "description": "What EVERY tinted rock in this room drops when bombed (its own "
+                                                    "and the ones you add), now or on a later visit, instead of the "
+                                                    "game's loot. Leave out or empty for the game's own (usually a "
+                                                    "soul heart). 'nothing' = an empty rock: a wasted bomb."},
                 "layout_pickups": {"type": "string", "enum": list(LAYOUT_PICKUP_MODES)},
                 "bonus_pickups": {"type": "array", "maxItems": 2,
                                   "items": {"type": "string", "enum": list(REWARDS)},
@@ -249,6 +255,23 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
                 room_trolls += 1
             bonus.append(r)
         out["bonus_pickups"] = bonus
+
+        # What every tinted rock in the room drops. Empty = the game's own loot.
+        asked = raw.get("tinted_rock_loot") if isinstance(raw.get("tinted_rock_loot"), list) else []
+        loot: list[str] = []
+        for r in [r for r in asked if isinstance(r, str) and r in REWARDS][:2]:
+            if r == "troll_bomb":
+                if troll_budget <= 0 or r in loot:
+                    notes.append("tinted rock troll_bomb dropped (budget/mercy)")
+                    continue
+                troll_budget -= 1
+            loot.append(r)
+        if not loot and "nothing" in asked:
+            if mercy or cruelty < 3:
+                notes.append("empty tinted rocks -> the game's loot (cruelty/mercy)")
+            else:
+                loot = ["nothing"]
+        out["tinted_rock_loot"] = loot
 
     elif kind == "room_clear":
         supp = _suppressed(ctx)
@@ -493,6 +516,8 @@ def clamp_diff(kind: str, raw: Any, out: Any) -> list[str]:
             check("tinted rocks", str(int(num(raw["tinted_rocks"]))), str(out.get("tinted_rocks")))
         if raw.get("hide_tinted_rocks"):
             check("hide tinted rocks", "yes", "yes" if out.get("hide_tinted_rocks") else "no")
+        if raw.get("tinted_rock_loot"):
+            check("tinted rock loot", listed(raw["tinted_rock_loot"]), listed(out.get("tinted_rock_loot")))
         if raw.get("layout_pickups") not in (None, "keep"):
             check("layout pickups", str(raw["layout_pickups"]), str(out.get("layout_pickups")))
         if "bonus_pickups" in raw:

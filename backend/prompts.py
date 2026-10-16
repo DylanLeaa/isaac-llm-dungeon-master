@@ -45,8 +45,10 @@ _ECONOMY = """WHAT PICKUPS ARE REALLY WORTH (vanilla is stingy; generosity is th
 - lucky_penny is not a coin joke: it is +1 luck for the rest of the run, a stat up. Luck
   improves everything the game still rolls itself (chest contents, machines, luck-based
   items). Vanilla hands out maybe one a run; treat each one like a small item.
-- Tinted rocks are loot, usually a soul heart. One bomb opens one, now or floors later, so
+- Tinted rocks are loot, usually a soul heart. One bomb opens one, now or on a later visit, so
   adding them is a gift unless the player truly can't get a bomb on this floor.
+  tinted_rock_loot decides what they hold instead: a soul heart is the vanilla gift, a key
+  or a golden chest is a bigger one, a penny or 'nothing' turns the bomb they spent into the joke.
 - A golden chest (locked_chest) can hold a pedestal item; with a key nearby it is a gift,
   not bait. Any chest or grab_bag is several pickups at once.
 - Coins add up: about 15 buys a shop item. Flooding coins is only a troll when there is
@@ -143,7 +145,7 @@ Always answer by calling the provided tool exactly once."""
 
 _LEVERS = """WHAT THE DUNGEON MASTER CONTROLS (a fast executor model makes each call, seconds before it happens)
 - room_layout: per unvisited normal room - extra enemies, champion chance/colour, tinted rocks
-  added or hidden, what happens to the layout's own pickups, up to 2 bait pickups.
+  added or hidden and what they hold, what happens to the layout's own pickups, up to 2 bait pickups.
 - room_clear: the room-clear drop (normal, miniboss, curse rooms; a bonus on top in boss rooms).
 - item_choice: ranks real candidates from each item pool (treasure, shop, boss, devil, angel,
   secret, chests, beggars...) - which pedestal item the player gets.
