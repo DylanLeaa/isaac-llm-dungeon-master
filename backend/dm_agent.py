@@ -185,6 +185,12 @@ class MockDM:
             return {"intent": "mock: give what they don't need",
                     "rewards": [] if r.random() < 0.3 else [{"reward": pick, "count": 1}],
                     "taunt": r.choice(["", "A penny for your thoughts.", "Earned it. Barely."])}
+        if kind == "payout_plan":
+            chest = ctx.get("source_class") == "chest"
+            return {"intent": "mock: a machine with moods",
+                    "schedule": [{"reward": n, "count": 1} for n in
+                                 (["half_heart", "bomb"] if chest else ["key", "nothing", "penny"])],
+                    "taunt": "", "scheme": "mock scheme"}
         if kind == "item_choice":
             cands = sorted(ctx.get("candidates", []), key=lambda c: c.get("quality", 2))
             return {"intent": "mock: lowest quality first", "order": [c["id"] for c in cands],

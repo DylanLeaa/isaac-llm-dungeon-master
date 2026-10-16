@@ -126,3 +126,36 @@ def test_clamp_diff_names_what_the_model_did_not_get():
     raw = {"order": [9, "2", 999], "taunt": ""}
     out = clamp("item_choice", raw, st(), {"candidates": [{"id": 2}, {"id": 9}]}, cruelty=6, counters={})
     assert clamp_diff("item_choice", raw, out) == ["ignored ids not in the pool: 999"]
+
+
+def test_swallowed_drops_raise_the_clear_cap():
+    raw = {"rewards": [{"reward": "penny", "count": 3}, {"reward": "nickel", "count": 3},
+                       {"reward": "key", "count": 3}], "taunt": ""}
+    plain = clamp("room_clear", raw, st(), {}, cruelty=5, counters={})
+    given = clamp("room_clear", raw, st(), {"suppressed_drops": {"half_heart": 2, "key": 1, "junk": "x"}},
+                  cruelty=5, counters={})
+    assert sum(r["count"] for r in plain["rewards"]) == 4 and "suppressed" not in plain
+    assert sum(r["count"] for r in given["rewards"]) == 7
+    assert given["suppressed"] == {"half_heart": 2, "key": 1}
+
+
+def test_payout_schedule_rules():
+    slot = {"source_class": "slot", "has_item_pool": False}
+    raw = {"schedule": [{"reward": "nothing"}] * 5 + [{"reward": "item"}, {"reward": "bogus"}], "taunt": ""}
+    gen = clamp("payout_plan", raw, st(), slot, cruelty=0, counters={})["schedule"]
+    assert [r["reward"] for r in gen] == ["penny"] * 5            # generous: it always pays; no item pool
+    cruel = clamp("payout_plan", raw, st(), slot, cruelty=10, counters={})["schedule"]
+    names = [r["reward"] for r in cruel]
+    assert names[:3] == ["nothing"] * 3 and names[3] == "penny"   # at most 1 + 10//4 stiffed uses in a row
+    mercy = clamp("payout_plan", {"schedule": [{"reward": "nothing"}, {"reward": "troll_bomb"}], "taunt": ""},
+                  st(hp_red=1), slot, cruelty=10, counters={})["schedule"]
+    assert mercy == [{"reward": "half_heart", "count": 1}]
+
+    chest = {"source_class": "chest", "has_item_pool": True}
+    out = clamp("payout_plan", {"schedule": [{"reward": "item"}, {"reward": "key", "count": 2},
+                                              {"reward": "bomb", "count": 2}, {"reward": "penny", "count": 2}],
+                                "taunt": ""}, st(), chest, cruelty=5, counters={})["schedule"]
+    assert sum(r["count"] for r in out if r["reward"] != "nothing") <= 4 and out[0]["reward"] == "item"
+    empty = clamp("payout_plan", {"schedule": [{"reward": "nothing"}], "taunt": ""}, st(), chest,
+                  cruelty=8, counters={})["schedule"]
+    assert empty == [{"reward": "nothing", "count": 1}]           # an empty chest: one joke, cruel runs only

@@ -10,9 +10,9 @@ import re
 from typing import Any
 
 from catalog import (BOMBS, CARDS, CHAMPION_COLORS, COINS, CURSES, ENEMIES, HEARTS, KEYS,
-                     LAYOUT_PICKUP_MODES, PILLS, REWARDS, TRAPS, TREASURE_DISTANCE)
+                     LAYOUT_PICKUP_MODES, PAYOUT_OUTCOMES, PILLS, REWARDS, TRAPS, TREASURE_DISTANCE)
 
-KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "consumables")
+KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "consumables", "payout_plan")
 
 _TAUNT = {"type": "string", "maxLength": 60,
           "description": "Shown on screen. <=60 chars, plain ASCII, empty string for silence."}
@@ -58,7 +58,9 @@ TOOLS: dict[str, dict[str, Any]] = {
         "name": "decide_room_clear",
         "description": "Decide the room-clear reward that drops when the last enemy dies. "
                        "When context.mode is 'bonus' (boss rooms) the game still drops its own reward "
-                       "and the boss item; yours is extra.",
+                       "and the boss item; yours is extra. context.suppressed_drops lists what the game would "
+                       "have dropped in this room (enemy deaths and natural spawns, which the engine "
+                       "swallowed): anything you do not put back in `rewards` is lost to the player.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -134,6 +136,28 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "taunt": _TAUNT, "scheme": _SCHEME,
             },
             "required": ["intent", "cards", "trinkets", "pills", "taunt"],
+        },
+    },
+    "payout_plan": {
+        "name": "decide_payout_plan",
+        "description": "Fix what ONE beggar/machine/bum or ONE chest pays out, decided when it appears. "
+                       "For a slot or beggar (context.source_class 'slot') `schedule` has one entry per "
+                       "paid use, in order: what the 1st, 2nd, 3rd... use yields; an entry may be "
+                       "'nothing' (it takes the payment and stiffs the player). For a chest "
+                       "(source_class 'chest') `schedule` is everything it holds when opened. 'item' means "
+                       "a pedestal item from the source's item pool (only if context.has_item_pool).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intent": _INTENT,
+                "schedule": {"type": "array", "maxItems": 6,
+                             "items": {"type": "object", "properties": {
+                                 "reward": {"type": "string", "enum": [*REWARDS, *PAYOUT_OUTCOMES]},
+                                 "count": {"type": "integer", "minimum": 1, "maximum": 2}},
+                                 "required": ["reward"]}},
+                "taunt": _TAUNT, "scheme": _SCHEME,
+            },
+            "required": ["intent", "schedule", "taunt"],
         },
     },
 }
@@ -227,7 +251,11 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         out["bonus_pickups"] = bonus
 
     elif kind == "room_clear":
-        cap = 2 if ctx.get("mode") == "bonus" else 4             # boss rooms keep their own reward too
+        supp = _suppressed(ctx)
+        # boss rooms keep their own reward too; swallowed drops may be put back on top of the budget
+        cap = (2 if ctx.get("mode") == "bonus" else 4) + min(sum(supp.values()), 3)
+        if supp:
+            out["suppressed"] = supp
         rewards, total = [], 0
         for r in (raw.get("rewards") or [])[:3]:
             name = r.get("reward")
@@ -263,6 +291,9 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
             rewards.append({"reward": "half_heart", "count": 1})
             notes.append("mercy: half heart")
         out["rewards"] = rewards
+
+    elif kind == "payout_plan":
+        out["schedule"] = _clamp_schedule(raw.get("schedule") or [], ctx, cruelty, mercy, troll_budget, notes)
 
     elif kind == "item_choice":
         cands = [int(c["id"]) for c in ctx.get("candidates", []) if "id" in c]
@@ -313,6 +344,73 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
 
     if notes:
         out["guardrails"] = notes
+    return out
+
+
+def _suppressed(ctx: dict) -> dict[str, int]:
+    """context.suppressed_drops as clean {name: count}: the pickups the engine swallowed in this room."""
+    raw = ctx.get("suppressed_drops")
+    out: dict[str, int] = {}
+    if isinstance(raw, dict):
+        for name, n in raw.items():
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                out[str(name)[:24]] = n
+    return out
+
+
+def _clamp_schedule(raw: list, ctx: dict, cruelty: int, mercy: bool, troll_budget: int,
+                    notes: list[str]) -> list[dict]:
+    """A beggar/machine's per-use payouts, or a chest's contents, held to the same rules as a clear."""
+    chest = ctx.get("source_class") == "chest"
+    has_item = bool(ctx.get("has_item_pool"))
+    limit = 4 if chest else 6
+    max_nothing = 0 if cruelty < 3 else 1 + cruelty // 4    # consecutive stiffed uses; 0 = it always pays
+    out, run, pickups = [], 0, 0
+    for r in raw[:limit] if isinstance(raw, list) else []:
+        if not isinstance(r, dict):
+            continue
+        name = r.get("reward")
+        if name == "item" and not has_item:
+            continue
+        if name not in REWARDS and name not in PAYOUT_OUTCOMES:
+            continue
+        try:
+            n = max(1, min(2, int(r.get("count") or 1)))
+        except (TypeError, ValueError):
+            n = 1
+        if name == "nothing":
+            if mercy:
+                name, n = "half_heart", 1
+                notes.append("mercy: nothing->half_heart")
+            elif chest and (cruelty < 5 or out):
+                continue                                    # an empty chest is a one-line joke, never a pattern
+            else:
+                run += 1
+                if run > max_nothing:
+                    notes.append("nothing->penny (it has to pay sometimes)")
+                    name, n, run = "penny", 1, 0
+        if name != "nothing":
+            run = 0
+        if name == "item":
+            n = 1
+        elif name == "troll_bomb":
+            n = min(n, troll_budget, 1)
+            troll_budget -= n
+            if n <= 0:
+                notes.append("troll_bomb dropped (budget/mercy)")
+                continue
+        elif name in ("golden_key", "golden_bomb", "eternal_heart"):
+            n = 1
+        if chest:
+            n = min(n, 4 - pickups)
+            if n <= 0:
+                break
+            pickups += n if name != "nothing" else 0
+        out.append({"reward": name, "count": n})
     return out
 
 
@@ -401,6 +499,8 @@ def clamp_diff(kind: str, raw: Any, out: Any) -> list[str]:
             check("bonus pickups", listed(raw["bonus_pickups"]), listed(out.get("bonus_pickups")))
     elif kind == "room_clear":
         check("rewards", counted(raw.get("rewards"), "reward"), counted(out.get("rewards"), "reward"))
+    elif kind == "payout_plan":
+        check("schedule", counted(raw.get("schedule"), "reward"), counted(out.get("schedule"), "reward"))
     elif kind == "item_choice":
         valid = {str(i) for i in out.get("order") or []}
         ignored = [str(i) for i in raw.get("order") or [] if str(i).strip() not in valid]

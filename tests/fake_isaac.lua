@@ -1,6 +1,6 @@
 -- Minimal fake of the Isaac Lua API: just enough surface for the mod to run headless.
 -- Records spawns so tests can assert on what the DM did.
-local W = { now = 0, frame = 0, callbacks = {}, spawned = {}, gridSpawned = {}, removedGrid = {} }
+local W = { now = 0, frame = 0, callbacks = {}, spawned = {}, gridSpawned = {}, removedGrid = {}, gridState = {} }
 FAKE = W
 
 local function enum(names, start)
@@ -19,7 +19,7 @@ ItemPoolType = enum({ "POOL_TREASURE", "POOL_SHOP", "POOL_BOSS", "POOL_DEVIL", "
 ItemPoolType.POOL_PLANETARIUM = 26
 ItemPoolType.POOL_ULTRA_SECRET = 24
 GridEntityType = { GRID_ROCK = 2, GRID_ROCKT = 4 }
-EntityType = { ENTITY_PLAYER = 1, ENTITY_BOMB = 4, ENTITY_PICKUP = 5, ENTITY_GAPER = 10, ENTITY_BOOMFLY = 25,
+EntityType = { ENTITY_PLAYER = 1, ENTITY_FAMILIAR = 3, ENTITY_SLOT = 6, ENTITY_BOMB = 4, ENTITY_PICKUP = 5, ENTITY_GAPER = 10, ENTITY_BOOMFLY = 25,
   ENTITY_HOST = 27, ENTITY_ATTACKFLY = 18, ENTITY_KNIGHT = 41, ENTITY_DIP = 217 }
 setmetatable(EntityType, { __index = function(_, k) if tostring(k):match("^ENTITY_") then return 900 end end })
 EntityFlag = { FLAG_FREEZE = 1 << 1, FLAG_FRIENDLY = 1 << 29 }
@@ -43,7 +43,7 @@ LevelCurse = { CURSE_NONE = 0, CURSE_OF_DARKNESS = 1, CURSE_OF_LABYRINTH = 2, CU
 ModCallbacks = { MC_POST_UPDATE = 1, MC_POST_RENDER = 2, MC_INPUT_ACTION = 13, MC_USE_PILL = 10, MC_ENTITY_TAKE_DMG = 11,
   MC_POST_CURSE_EVAL = 12, MC_POST_GAME_STARTED = 15, MC_POST_GAME_END = 16, MC_PRE_GAME_EXIT = 17, MC_POST_NEW_LEVEL = 18,
   MC_POST_NEW_ROOM = 19, MC_GET_CARD = 20, MC_GET_TRINKET = 47, MC_PRE_GET_COLLECTIBLE = 62,
-  MC_GET_PILL_EFFECT = 65, MC_PRE_NPC_UPDATE = 69, MC_PRE_SPAWN_CLEAN_AWARD = 70, MC_POST_PICKUP_INIT = 34 }
+  MC_GET_PILL_EFFECT = 65, MC_PRE_NPC_UPDATE = 69, MC_PRE_SPAWN_CLEAN_AWARD = 70, MC_POST_PICKUP_INIT = 34, MC_POST_PICKUP_UPDATE = 35, MC_POST_NPC_DEATH = 29 }
 PillColor = enum({ "PILL_NULL", "PILL_BLUE_BLUE", "PILL_WHITE_BLUE", "PILL_ORANGE_ORANGE", "PILL_WHITE_WHITE",
   "PILL_REDDOTS_RED", "PILL_PINK_RED", "PILL_BLUE_CADETBLUE", "PILL_YELLOW_ORANGE", "PILL_ORANGEDOTS_WHITE",
   "PILL_WHITE_AZURE", "PILL_BLACK_YELLOW", "PILL_WHITE_BLACK", "PILL_WHITE_YELLOW", "PILL_GOLD" })
@@ -116,7 +116,7 @@ function player:GetEternalHearts() return 0 end
 function player:GetGoldenHearts() return 0 end
 function player:GetBrokenHearts() return 0 end
 function player:GetRottenHearts() return 0 end
-function player:GetNumCoins() return 3 end
+function player:GetNumCoins() return W.coins or 3 end
 function player:GetNumBombs() return 1 end
 function player:GetNumKeys() return W.keys or 0 end
 function player:HasGoldenKey() return false end
@@ -134,7 +134,7 @@ function player:ToPlayer() return self end
 player.ControllerIndex = 0
 
 local function makeEnemy(hp)
-  local e = { HitPoints = hp, Type = 10, Variant = 0, champion = false, flags = 0 }
+  local e = { HitPoints = hp, Type = 10, Variant = 0, champion = false, flags = 0, Position = Vector(300, 300) }
   function e:IsActiveEnemy() return self.HitPoints > 0 end
   function e:IsVulnerableEnemy() return true end
   function e:HasEntityFlags(f) return self.flags & f ~= 0 end
@@ -150,8 +150,15 @@ end
 W.makeEnemy = makeEnemy
 
 -- Pickups (and slots) sit in W.pickups and show up in GetRoomEntities / FindByType.
-function W.makePickup(t, v, s)
-  local e = { Type = t, Variant = v, SubType = s }
+local nextSeed = 1000
+function W.makePickup(t, v, s, x, y)
+  nextSeed = nextSeed + 1
+  local e = { Type = t, Variant = v, SubType = s, Position = Vector(x or 300, y or 300), Price = 0,
+              InitSeed = nextSeed, FrameCount = 0 }
+  function e:IsShopItem() return false end
+  function e:ToPickup() return self end
+  function e:Remove() self.removed = true end
+  function e:GetSprite() return { IsPlaying = function() return false end } end
   function e:IsActiveEnemy() return false end
   function e:ToNPC() return nil end
   function e:Exists() return not self.removed end
@@ -169,7 +176,7 @@ function room:GetGridSize() return 135 end
 function room:GetGridEntity(i)
   local t = W.grid[i]
   if not t or W.cur ~= 85 then return nil end
-  return { State = 0, GetType = function() return t end }
+  return { State = W.gridState[i] or 0, Position = room:GetGridPosition(i), GetType = function() return t end }
 end
 function room:RemoveGridEntity(i) W.removedGrid[#W.removedGrid + 1] = i; W.grid[i] = nil end
 function room:GetGridPosition(i) return Vector(i * 40 % 520, math.floor(i / 13) * 40) end
@@ -188,7 +195,6 @@ function room:GetCenterPos() return Vector(320, 280) end
 local level = {}
 function level:GetCurrentRoomDesc() return W.rooms[W.cur] end
 function level:GetCurrentRoomIndex() return W.cur end
-function level:GetRoomDesc(i) return W.rooms[i] end
 function level:GetRoomByIdx(i) return W.rooms[i] end
 function level:GetStartingRoomIndex() return 84 end
 W.stage = 1

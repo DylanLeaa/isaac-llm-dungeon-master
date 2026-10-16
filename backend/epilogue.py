@@ -45,6 +45,8 @@ def dm_side(applied: list[tuple[str, dict]], totals: dict, pills: Any) -> tuple[
             rewards = d.get("rewards", [])
             c.update(summarize_categories(rewards))
             c["troll"] += sum(int(r.get("count", 1)) for r in rewards if r.get("reward") == "troll_bomb")
+        elif kind == "payout_plan":
+            c.update(summarize_categories(d.get("schedule", [])))
         elif kind == "floor_plan":
             curses += [x for x in d.get("add_curses", []) if x not in curses]
         scheme = d.get("scheme") or scheme

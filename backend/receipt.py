@@ -329,6 +329,8 @@ def summarize(kind: str, d: dict, ctx: dict) -> str:
         if d.get("bonus_pickups"):
             bits.append("bait " + ",".join(d["bonus_pickups"]))
         return "; ".join(bits) or "untouched"
+    if kind == "payout_plan":
+        return ", ".join(f'{r["count"]}x {r["reward"]}' for r in d.get("schedule", [])) or "vanilla"
     if kind == "item_choice":
         names = {int(c["id"]): c.get("name", str(c["id"])) for c in ctx.get("candidates", []) if "id" in c}
         return "ranked: " + " > ".join(str(names.get(i, i)) for i in d.get("order", [])[:4])

@@ -312,6 +312,150 @@ def run(tmp, game):
     W.heldPill = 5
     print("15. uncovered pill: button held until the plan covered it, then free")
 
+    # --- drops the game would scatter mid-fight are swallowed and handed to the room clear -------
+    KEYS, SPAWN0 = g.KeySubType, len(W.spawned)
+    foe = W.makeEnemy(10)
+    W.enemies = lua.table_from([foe])
+    W.enter(85)                                    # a room the DM decides the clear of, armed on entry
+    PV = g.PickupVariant
+    heart = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_HEART, g.HeartSubType.HEART_HALF)
+    key = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_KEY, KEYS.KEY_NORMAL)
+    coin = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, 500, 100)
+    mine = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY)
+    item = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COLLECTIBLE, 2)
+    W.fire(MC.MC_POST_NPC_DEATH, foe)              # a kill: the heart and key it drops are swallowed
+    for p in (heart, key, coin, item):
+        W.fire(MC.MC_POST_PICKUP_INIT, p)
+    assert heart.removed and key.removed and coin.removed, "enemy-death and natural drops are swallowed"
+    assert not item.removed, "item pedestals are never touched"
+    # loot from a tinted rock the player bombs is theirs, even mid-fight (grid 22 stands at 360,40)
+    rock_loot = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_HEART, g.HeartSubType.HEART_SOUL, 360, 40)
+    tick()                                         # the rock is seen standing
+    W.gridState[22] = 2
+    W.fire(MC.MC_POST_PICKUP_INIT, rock_loot)
+    assert not rock_loot.removed, "a broken tinted rock's loot is never swallowed"
+    W.gridState[22] = None
+    g.Apply = modules["dm.apply"]
+    modules["dm.apply"].spawning = True            # the mod's own spawn must pass through
+    W.fire(MC.MC_POST_PICKUP_INIT, mine)
+    modules["dm.apply"].spawning = False
+    assert not mine.removed
+    foe.HitPoints = 0
+    tick()
+    ret = W.fire(MC.MC_PRE_SPAWN_CLEAN_AWARD, g.RNG(), g.Vector(320, 280))
+    assert ret is True and Hold.holding("clear:1:85")
+    W.frame += 1                                   # the last kill's fallout, a frame after the clear
+    fallout = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_TRINKET, 133)
+    W.fire(MC.MC_POST_PICKUP_INIT, fallout)
+    assert fallout.removed, "a drop just after the clear is still swallowed, into the clear's tally"
+    wait(lambda: not Hold.active(), 8, "the clear reward that sees the swallowed drops")
+    req = [m for m in sent(game) if m.get("t") == "req" and m.get("key") == "clear:1:85"][-1]
+    assert req["ctx"]["suppressed_drops"] == {"half_heart": 1, "key": 1, "penny": 1}, req["ctx"]
+    eff = [m for m in sent(game) if m.get("t") == "effect" and m.get("key") == "clear:1:85"][-1]["effect"]
+    assert any("would have dropped, not replaced" in line for line in eff), eff
+    assert any("trinket" in line for line in eff), eff
+    W.frame += 30
+    late = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_HEART, g.HeartSubType.HEART_HALF)
+    W.fire(MC.MC_POST_PICKUP_INIT, late)
+    assert not late.removed, "once the clear has settled, drops pass through"
+    # The reward already out when the fallout lands: it is lost, and the clear says so.
+    Catcher, lost = modules["dm.dropcatcher"], []
+    Catcher.arm(999, True)
+    entry = Catcher.close(6)
+    Catcher.settle(entry, lambda name: lost.append(name))
+    W.frame += 2
+    fallout2 = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_TRINKET, 133)
+    W.fire(MC.MC_POST_PICKUP_INIT, fallout2)
+    assert fallout2.removed and len(lost) == 1 and entry.total == 0, (lost, entry.total)
+    W.frame += 10
+    late2 = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_TRINKET, 133)
+    W.fire(MC.MC_POST_PICKUP_INIT, late2)
+    assert not late2.removed and len(lost) == 1, "the trail ends a few frames after the clear"
+    # The room's own pickups spawn as it loads, before the catcher is armed: adopted once armed,
+    # unless the layout already removed or morphed them.
+    W.frame += 10
+    loaded = [W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_KEY, KEYS.KEY_NORMAL),
+              W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_BOMB, 1),
+              W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY)]
+    for p in loaded:
+        W.fire(MC.MC_POST_PICKUP_INIT, p)
+    assert not any(p.removed for p in loaded), "nothing is catching yet: they stay"
+    Catcher.arm(998, True)
+    loaded[1].removed = True                       # the layout removed this one
+    loaded[2].Variant, loaded[2].SubType = PV.PICKUP_HEART, 2   # and morphed this one
+    assert Catcher.adopt(modules["dm.bridge"]) == 1 and loaded[0].removed
+    assert dict(Catcher.counts().items()) == {"key": 1}, dict(Catcher.counts().items())
+    Catcher.release(Catcher.close())
+    stale = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_KEY, KEYS.KEY_NORMAL)
+    W.fire(MC.MC_POST_PICKUP_INIT, stale)
+    W.frame += 5
+    Catcher.arm(997, True)                         # a later room: last room's strays aren't its layout
+    assert Catcher.adopt(modules["dm.bridge"]) == 0 and not stale.removed
+    Catcher.close()
+    print("15b. kill drops swallowed, reward decided with them, shortfall reported:", eff, "| lost after the reward:", list(lost))
+
+    # --- a beggar follows its payout schedule (key, nothing, penny); the game's own payout is cancelled ---
+    beggar = W.makePickup(g.EntityType.ENTITY_SLOT, 4, 0, 330, 300)
+    W.pickups = lua.table_from([beggar])
+    W.coins = 3
+    pkey = f"payout:1:{int(beggar.InitSeed)}"
+    wait(lambda: Bridge.peek(pkey), 6, "the beggar's payout schedule")
+
+    def frames(n):
+        for _ in range(n):
+            W.frame += 1
+            W.fire(MC.MC_POST_UPDATE)
+
+    def payout(vanilla):
+        """The player pays; the game (if `vanilla`) pays its own penny beside the beggar."""
+        W.coins -= 1
+        frames(10)
+        if vanilla:
+            p = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, 330, 330)
+            W.fire(MC.MC_POST_PICKUP_INIT, p)
+            return p
+    SPAWN0 = len(W.spawned)
+    v1 = payout(True)
+    assert v1.removed and W.spawned[SPAWN0 + 1].v == PV.PICKUP_KEY, "use 1: the game's penny is cancelled, a key is paid"
+    n1 = len(W.spawned)
+    v2 = payout(True)
+    assert v2.removed and len(W.spawned) == n1, "use 2 is scheduled as 'nothing': the game's payout is cancelled"
+    payout(False)
+    frames(100)
+    assert W.spawned[len(W.spawned)].v == PV.PICKUP_COIN, "use 3: the game paid nothing, the scheduled penny is paid anyway"
+    effects = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == pkey for l in m["effect"]]
+    assert any("use 1" in l and "+1 key" in l for l in effects) and any("use 2: nothing" in l for l in effects), effects
+    print("15c. beggar paid on its schedule:", effects)
+
+    # --- a golden chest's contents are fixed when it appears and paid when it opens ---
+    chest = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_LOCKEDCHEST, 1, 400, 300)
+    W.pickups = lua.table_from([chest])
+    frames(60)                                     # the beggar is gone: its payout window can't claim the loot
+    ckey = f"payout:1:{int(chest.InitSeed)}"
+    wait(lambda: Bridge.peek(ckey), 6, "the chest's contents")
+    n0 = len(W.spawned)
+    chest.SubType = 0                              # opened
+    W.fire(MC.MC_POST_PICKUP_UPDATE, chest)
+    loot = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_KEY, KEYS.KEY_NORMAL, 410, 330)
+    W.fire(MC.MC_POST_PICKUP_INIT, loot)
+    assert loot.removed and [s.v for s in list(W.spawned.values())[n0:]] == [PV.PICKUP_HEART, PV.PICKUP_BOMB]
+    W.pickups = lua.table_from([])
+    print("15d. chest paid its scheduled contents instead of the game's")
+
+    # --- a grab bag is a chest: its contents are scheduled, and its spawns are never classed as natural ---
+    bag = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_GRAB_BAG, 1, 340, 300)
+    W.pickups = lua.table_from([bag])
+    bkey = f"payout:1:{int(bag.InitSeed)}"
+    wait(lambda: Bridge.peek(bkey), 6, "the grab bag's contents")
+    n0 = len(W.spawned)
+    bag.removed = True                             # taken: gone, the game fills it with its own pickups
+    spilled = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, 345, 300)
+    spilled.SpawnerEntity = bag
+    W.fire(MC.MC_POST_PICKUP_INIT, spilled)
+    assert spilled.removed and len(W.spawned) > n0, "the bag's own contents are replaced by its schedule"
+    W.pickups = lua.table_from([])
+    print("15e. grab bag paid its scheduled contents")
+
     # --- the receipt: on disk for the app, no longer in the game's menu ----------------
     assert not [e for e in menu if e.sub == "Receipt"], "the receipt lives in the app, not the menu"
     files = list((Path(tmp) / "receipts").glob("*.jsonl"))
@@ -383,7 +527,7 @@ def run(tmp, game):
 
     text = last()
     assert text.startswith("HERE LIES ISAAC") and "Reached: Basement II" in text and "Last hit by: gaper" in text
-    assert "Rooms cleared: 3" in text and "Pills eaten: 2" in text and "tallying" in text, text
+    assert "Rooms cleared: 4" in text and "Pills eaten: 2" in text and "tallying" in text, text
     death = [m for m in sent(game) if m.get("t") == "event" and m.get("name") == "death"]
     assert death and death[0]["data"]["run"] == "TEST 1234" and death[0]["data"]["rows"][0] == ["Reached", "Basement II"]
     wait(lambda: "Extra enemies" in last(), 5, "the DM's side of the stats")
