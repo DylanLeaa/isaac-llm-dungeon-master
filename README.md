@@ -170,7 +170,8 @@ write a real narrative and floor brief and hand them to the DM.
 ## Configuration
 
 `mod/llm_dungeon_master/dm/config.lua` toggles each control area, the prefetch lead factor,
-refresh limits, taunts and the debug HUD. `ALLOW_LAYOUT_RESEED` lets the DM's treasure-room
+refresh limits, taunts, the debug HUD and `SHOW_EFFECTS` (what the DM just did, as icons in the
+bottom-right corner: "+1 bomb", "-1 penny", "+2 attack flies"). `ALLOW_LAYOUT_RESEED` lets the DM's treasure-room
 distance wish reroll the floor via the `reseed` console command — off by default because
 console commands disable achievements for that run.
 
