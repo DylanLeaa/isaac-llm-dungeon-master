@@ -119,6 +119,7 @@ mod:AddCallback(ModCallbacks.MC_POST_RENDER, safe("render", function()
 end))
 
 mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, Loading.blockInput)
+mod:AddCallback(ModCallbacks.MC_PRE_NPC_UPDATE, safe("hold_npc", Loading.holdNpc))
 mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, safe("block_pill", function(_, ent, hook, action)
   return Cons.blockPill(ent, hook, action)
 end))

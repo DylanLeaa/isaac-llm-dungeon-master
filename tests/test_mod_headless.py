@@ -268,10 +268,15 @@ def run(tmp, game):
     assert Hold.active() and Hold.holding("layout:1:87"), "walking into an undressed room holds the game"
     assert Bridge.isPending("layout:1:87"), "...and asks for the room right then"
     assert Hold.blockInput(None, None, g.InputHook.IS_ACTION_PRESSED, 7) is False
+    assert W.fire(MC.MC_PRE_NPC_UPDATE, imp) is True, "enemy AI is skipped from the room's first frame"
     tick()
     assert imp.flags & FREEZE, "enemies stand still while the game waits"
+    imp.flags = 0                                  # the game cleared the freeze status itself
+    tick()
+    assert imp.flags & FREEZE, "a freeze the game cleared is put back"
     wait(lambda: not Hold.active(), 8, "the late room layout")
     assert Bridge.peek("layout:1:87") is None and not imp.flags & FREEZE, "layout taken, enemies free again"
+    assert W.fire(MC.MC_PRE_NPC_UPDATE, imp) is None, "enemy AI runs again"
     print("12. undressed room: game held until its layout came in, then dressed it")
 
     imp.HitPoints = 0                              # one shot: no time to prefetch the reward
