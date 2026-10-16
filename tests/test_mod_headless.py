@@ -394,6 +394,25 @@ def run(tmp, game):
     Catcher.close()
     print("15b. kill drops swallowed, reward decided with them, shortfall reported:", eff, "| lost after the reward:", list(lost))
 
+    # --- a tinted rock holds what the room's layout planned, not the game's loot ---
+    Rocks = modules["dm.rockloot"]
+    Rocks.plan(85, "layout:1:85", lua.table_from(["key", "penny"]))
+    tick()                                         # grid 22 (at 360,40) is seen standing
+    n0 = len(W.spawned)
+    W.gridState[22] = 2                            # bombed: the game drops its soul heart
+    vanilla = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_HEART, g.HeartSubType.HEART_SOUL, 360, 40)
+    W.fire(MC.MC_POST_PICKUP_INIT, vanilla)
+    assert vanilla.removed, "the game's loot from a planned rock is cancelled"
+    tick(3)
+    paid = [s.v for s in list(W.spawned.values())[n0:]]
+    assert paid == [PV.PICKUP_KEY, PV.PICKUP_COIN], paid
+    tick(10)
+    assert len(W.spawned) == n0 + 2, "a rock pays once"
+    reff = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == "layout:1:85" for l in m["effect"]]
+    assert "tinted rock bombed: +1 key, +1 penny (instead of the game's 1 soul heart)" in reff, reff
+    W.gridState[22] = None
+    print("15b2. tinted rock paid the DM's loot instead of the game's:", reff[-1])
+
     # --- a beggar follows its payout schedule (key, nothing, penny); the game's own payout is cancelled ---
     beggar = W.makePickup(g.EntityType.ENTITY_SLOT, 4, 0, 330, 300)
     W.pickups = lua.table_from([beggar])

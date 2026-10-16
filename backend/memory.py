@@ -74,6 +74,7 @@ class RunMemory:
         elif kind == "room_layout":
             c["troll_bombs_floor"] += int(d.get("layout_pickups") == "troll_bombs")
             c["troll_bombs_floor"] += d.get("bonus_pickups", []).count("troll_bomb")
+            c["troll_bombs_floor"] += d.get("tinted_rock_loot", []).count("troll_bomb")
             bits = []
             if d.get("extra_enemies"):
                 bits.append("+" + ",".join(f'{e["count"]}x{e["key"]}' for e in d["extra_enemies"]))
@@ -83,6 +84,8 @@ class RunMemory:
                 bits.append(f'{d["tinted_rocks"]} tinted rock(s)')
             if d.get("hide_tinted_rocks"):
                 bits.append("hid tinted rocks")
+            if d.get("tinted_rock_loot"):
+                bits.append("tinted rocks hold:" + ",".join(d["tinted_rock_loot"]))
             if d.get("bonus_pickups"):
                 bits.append("bait:" + ",".join(d["bonus_pickups"]))
             self.events.append("room dressed: " + ("; ".join(bits) or "untouched"))

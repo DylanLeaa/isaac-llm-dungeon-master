@@ -335,6 +335,8 @@ def summarize(kind: str, d: dict, ctx: dict) -> str:
             bits.append(f'champions {round(100 * d["champion_chance"])}% {d.get("champion_color", "")}'.strip())
         if d.get("tinted_rocks"):
             bits.append(f'{d["tinted_rocks"]} tinted rock(s)' + (" hidden" if d.get("hide_tinted_rocks") else ""))
+        if d.get("tinted_rock_loot"):
+            bits.append("tinted rocks hold " + ",".join(d["tinted_rock_loot"]))
         if d.get("layout_pickups") not in (None, "keep"):
             bits.append("pickups " + str(d["layout_pickups"]))
         if d.get("bonus_pickups"):

@@ -159,3 +159,27 @@ def test_payout_schedule_rules():
     empty = clamp("payout_plan", {"schedule": [{"reward": "nothing"}], "taunt": ""}, st(), chest,
                   cruelty=8, counters={})["schedule"]
     assert empty == [{"reward": "nothing", "count": 1}]           # an empty chest: one joke, cruel runs only
+
+
+def test_tinted_rock_loot():
+    base = {"champion_chance": 0, "extra_enemies": [], "tinted_rocks": 1, "layout_pickups": "keep", "taunt": ""}
+
+    def loot(asked, cruelty=6, state=None, counters=None):
+        return clamp("room_layout", {**base, "tinted_rock_loot": asked}, state or st(), {}, cruelty,
+                     counters or {})["tinted_rock_loot"]
+
+    assert clamp("room_layout", base, st(), {}, cruelty=6, counters={})["tinted_rock_loot"] == []   # the game's own
+    assert loot(["golden_key", "nope", {"x": 1}, "penny", "dime"]) == ["golden_key", "penny"]
+    assert loot(["nothing"]) == ["nothing"]
+    assert loot(["penny", "nothing"]) == ["penny"], "nothing only stands alone"
+    assert loot(["nothing"], cruelty=2) == [] and loot(["nothing"], state=st(hp_red=1)) == []
+    assert loot(["troll_bomb", "troll_bomb"]) == ["troll_bomb"]
+    assert loot(["troll_bomb"], counters={"troll_bombs_floor": 9}) == []
+    assert loot(["troll_bomb"], cruelty=2) == []
+    # the room's own troll bomb spends the budget first: cruelty 4 -> 1 + 4//4 = 2, one already used
+    raw = {**base, "layout_pickups": "troll_bombs", "tinted_rock_loot": ["troll_bomb"]}
+    out = clamp("room_layout", raw, st(), {}, cruelty=4, counters={"troll_bombs_floor": 1})
+    assert out["layout_pickups"] == "troll_bombs"
+    assert out["tinted_rock_loot"] == [] and any("tinted rock" in n for n in out["guardrails"])
+    diffs = clamp_diff("room_layout", raw, out)
+    assert "tinted rock loot troll_bomb -> none" in diffs, diffs

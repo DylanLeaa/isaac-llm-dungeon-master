@@ -26,7 +26,7 @@
 local Sched = {}
 
 local game = Game()
-local cfg, Bridge, State, Apply, Taunt, Cons, Loading, Catcher, Payouts
+local cfg, Bridge, State, Apply, Taunt, Cons, Loading, Catcher, Payouts, Rocks
 
 local floorNo = 0
 local levelSig
@@ -203,6 +203,7 @@ local function holdLayout(key, desc)
       if not res then return end
       if curIdx() ~= idx then return Bridge.effect(key, { "not applied: the player left the room" }) end
       Bridge.effect(key, Apply.roomLayout(res.decision, game:GetFrameCount() - entered))
+      Rocks.plan(idx, key, res.decision.tinted_rock_loot)
       if room and room.idx == idx then
         room.layoutApplied = true
         Catcher.adopt(Bridge)
@@ -403,6 +404,7 @@ local function checkLevelChange()
   Bridge.forget("clear:" .. (floorNo - 1))
   Bridge.forget("items:" .. (floorNo - 1))
   Catcher.reset()
+  Rocks.reset()
   Payouts.onNewLevel(floorNo)
   Cons.onNewFloor(floorNo)
   State.onNewFloor()
@@ -433,6 +435,7 @@ function Sched.onNewRoom()
     local res = Bridge.take(key)
     if res then
       Bridge.effect(key, Apply.roomLayout(res.decision))
+      Rocks.plan(room.idx, key, res.decision.tinted_rock_loot)
       room.layoutApplied = true
     elseif Bridge.ready() and eligibleLayoutRoom(room.type)
         and room.idx ~= game:GetLevel():GetStartingRoomIndex() then   -- the start room is never dressed
@@ -652,13 +655,14 @@ function Sched.resetRun()
   floorPlanFor, latePlan, drawn, swaps, toHold = nil, nil, nil, {}, {}
   floorItemsRequestedFor = -1
   Catcher.reset()
+  Rocks.reset()
   Payouts.reset()
   Cons.resetRun()
 end
 
-function Sched.init(config, bridge, state, apply, taunt, cons, loading, catcher, payouts)
+function Sched.init(config, bridge, state, apply, taunt, cons, loading, catcher, payouts, rocks)
   cfg, Bridge, State, Apply, Taunt, Cons, Loading = config, bridge, state, apply, taunt, cons, loading
-  Catcher, Payouts = catcher, payouts
+  Catcher, Payouts, Rocks = catcher, payouts, rocks
   POOL_FOR_ROOM = {}
   CONTROLLED_POOL = {}
   local function map(rt, pool)
