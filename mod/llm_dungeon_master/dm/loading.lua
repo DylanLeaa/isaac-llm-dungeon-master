@@ -3,10 +3,11 @@
 --
 -- "Ready" means two things. First, the backend says this floor's plans are in: the run narrative
 -- (on the first floor) and the floor brief. Decisions are only made against the brief, so the
--- floor's first asks are held on the backend until it lands. Second, every decision the floor
--- opened with has an answer (the start room's neighbour layouts, the floor's item pools, the
--- consumables plan). Without this screen those first asks would land after the player walked
--- through the door, and the game would freeze on a hold (below) right away.
+-- floor's first asks are held on the backend until it lands. Second, every decision the player
+-- could need on leaving the start room has an answer (its neighbours' layouts, and the item ranking
+-- for any special room next door). Without this screen those first asks would land after the player
+-- walked through the door, and the game would freeze on a hold (below) right away. The rest of the
+-- floor (other item pools, the consumables plan) is asked in the background and isn't waited for.
 --
 -- On a new floor the mod sends "prepare" with a snapshot and the floor number; the backend
 -- answers "ready" for that floor. Meanwhile input is blocked, the player can't be hurt, the HUD is

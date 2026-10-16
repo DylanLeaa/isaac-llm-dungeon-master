@@ -51,7 +51,7 @@ return {
   MENU_WIDTH = 32,
 
   -- Every floor waits on a loading screen until the DM is ready for it: the run
-  -- narrative (first floor), the floor brief, and answers to the floor's opening decisions.
+  -- narrative (first floor), the floor brief, and answers for the rooms next to the start room.
   -- It gives up on its own: CONNECT if the backend isn't there, TIMEOUT (run start) or
   -- FLOOR_TIMEOUT (later floors) if the plans never land.
   LOADING_SCREEN = true,

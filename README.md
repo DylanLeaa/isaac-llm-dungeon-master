@@ -49,14 +49,18 @@ backend at all, the run is plain vanilla.
 | `floor_plan` (curses, treasure distance) | you enter the boss room | boss dies | `MC_POST_CURSE_EVAL` of the next floor (late: curses changed once the plan lands) |
 
 The planners start when the first request of a new run, or of a new floor (`stage` and
-`stage_type` from the snapshot), reaches the backend. A new run opens on a **loading screen**: the mod
-sends `prepare`, input is blocked and you can't be hurt until the backend answers `ready` (the narrative,
-about 20–60s, is written or has failed). It can't be skipped, but it gives up by itself after
-`LOADING_CONNECT_MS` with no backend or `LOADING_TIMEOUT_MS` without a narrative, and it doesn't come up at
-all if no backend has answered since the game started (`LOADING_SCREEN = false` turns it off). The time spent there isn't counted in the run's clock. Nothing else waits: until a floor's
-brief (about 5–15s) lands, Haiku improvises. The old brief is dropped as soon as the floor changes. A
-floor brief waits up to 25s for the run narrative, then goes ahead without it. If a planner
-fails, it is logged and the DM carries on.
+`stage_type` from the snapshot), reaches the backend. A new run, and every new floor, opens on a
+**loading screen**: the mod sends `prepare`, input is blocked and you can't be hurt until the backend
+answers `ready` (the narrative, about 20–60s, on the first floor; the floor brief, about 5–15s) and the
+rooms next to the start room have their answers (their layouts, and the item ranking for any special
+room next door). The rest of the floor (its other item pools, the consumables plan) is asked in the
+background while you play. The screen can't be skipped, but it gives up by itself after
+`LOADING_CONNECT_MS` with no backend or `LOADING_TIMEOUT_MS` / `LOADING_FLOOR_TIMEOUT_MS` without its
+plans, and it doesn't come up at all if no backend has answered since the game started
+(`LOADING_SCREEN = false` turns it off). The time spent there isn't counted in the run's clock. Decisions
+are never written against a stale brief: a request waits up to 45s for its floor's brief. A floor brief
+waits up to 25s for the run narrative, then goes ahead without it. If a planner fails, it is logged and
+the DM carries on.
 
 Requests for the same key supersede each other: the backend cancels the stale Haiku call and
 the mod only replaces a result with one for a newer request. The p90 latency is measured live,

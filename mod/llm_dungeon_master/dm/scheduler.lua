@@ -384,6 +384,7 @@ local function prefetchNeighbours(reason)
       local pool = POOL_FOR_ROOM[d.Data.Type]
       if cfg.CONTROL_ITEMS and pool then
         requestItems(pool, State.roomTypeName(d.Data.Type), "player is next to this room")
+        room.poolKeys[fkey("items", pool)] = true
       end
     end
   end
@@ -416,7 +417,7 @@ function Sched.onNewRoom()
   room = {
     idx = desc.SafeGridIndex, type = r:GetType(), enteredAt = Isaac.GetTime(),
     enteredFrame = game:GetFrameCount(), firstVisit = r:IsFirstVisit(),
-    layoutApplied = false, layoutKeys = {}, wasClear = r:IsClear(),
+    layoutApplied = false, layoutKeys = {}, poolKeys = {}, wasClear = r:IsClear(),
     hpSamples = {}, dps = 0, startHp = nil, clearSends = 0, clearReqAt = nil,
     lastProbe = 0, lastNeighbourRefresh = Isaac.GetTime(), poolsAsked = {}, lastSourceScan = 0,
     clearReqSupp = 0, clearSeenFrame = nil,
@@ -475,8 +476,6 @@ function Sched.onNewLevel()
   if game:IsGreedMode() then return end
   checkLevelChange()
   Bridge.event("new_level", { stage = game:GetLevel():GetStage(), name = game:GetLevel():GetName() })
-  -- Base item rankings for the pools this floor actually has.
-  requestFloorItems()
   if latePlan then return end        -- any reroll waits for the plan (holdFloorPlan)
   maybeReseed()
 end
@@ -491,8 +490,11 @@ function Sched.update()
   if not room.prefetched and Bridge.ready() then
     room.prefetched = true
     prefetchNeighbours("backend connected")
-    requestFloorItems()
   end
+  -- Base rankings for every pool this floor has, once per floor. Asked here rather than on the new
+  -- level so they queue behind the start room's neighbours (POST_NEW_LEVEL fires before POST_NEW_ROOM):
+  -- the loading screen only waits on those, and these fill in while the player plays.
+  requestFloorItems()
 
   -- Decisions the game had to go ahead without, inside its own callbacks: wait on them now.
   if latePlan then
@@ -704,19 +706,20 @@ end
 
 function Sched.floor() return floorNo end
 
---- The decisions this floor opened with: the start room's neighbour layouts, the item pools asked
---- so far and the consumables plan. The loading screen waits for these. Only keys that were
---- actually sent count (a request made while disconnected would never settle).
+--- The decisions the player could need the moment they step out of the start room: its neighbours'
+--- layouts and the item rankings for any special room next door. The loading screen waits for these
+--- only; the floor's other pools and the consumables plan are asked in the background, and if the
+--- player gets to one first, its hold covers it. Only keys that were actually sent count (a request
+--- made while disconnected would never settle).
 function Sched.floorReadyKeys()
   local keys = {}
   local function add(key)
-    if key and (Bridge.isPending(key) or Bridge.settled(key)) then keys[#keys + 1] = key end
+    if Bridge.isPending(key) or Bridge.settled(key) then keys[#keys + 1] = key end
   end
   if room then
     for key in pairs(room.layoutKeys) do add(key) end
+    for key in pairs(room.poolKeys) do add(key) end
   end
-  for pool in pairs(itemSigs) do add(fkey("items", pool)) end
-  add(Cons.askedKey())
   return keys
 end
 

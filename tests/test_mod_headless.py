@@ -473,7 +473,7 @@ def run(tmp, game):
     print(f"16. receipt file {files[0].name}: {len(recs)} records, {len(calls)} LLM calls, "
           f"{len(effects)} effect lines")
 
-    # --- floor 2: a loading screen again, held until the brief and the opening decisions are in ---
+    # --- floor 2: a loading screen again, held until the brief and the start room's neighbours are in ---
     W.stage = 2
     for idx in (84, 85, 71, 86):
         W.rooms[idx].VisitedCount = 0
@@ -488,9 +488,17 @@ def run(tmp, game):
     Loading.handle(lua.table_from({"status": "ready", "floor": 1}))           # a stale ready from floor 1
     tick()
     assert Loading.active(), "a ready for another floor doesn't end this floor's wait"
-    wait(lambda: not Loading.active(), 8, "floor 2's plans and opening decisions")
-    opening = [k for k in ("layout:2:85", "items:2:0", "cons:2") if Bridge.settled(k)]
-    assert opening == ["layout:2:85", "items:2:0", "cons:2"], opening
+    # Only the start room's neighbours gate the screen: room 85's layout and treasure room 71's pool.
+    # The boss pool (room 86 isn't next door) and the consumables plan go in the background.
+    gated = sorted(Sched.floorReadyKeys().values())
+    assert gated == ["items:2:0", "layout:2:85"], gated
+    asks = [m["ctx"]["reason"] for m in sent(game) if m.get("t") == "req" and m.get("key") == "items:2:0"]
+    assert asks == ["player is next to this room"], f"the gated pool is asked as next door (not floor start): {asks}"
+    assert Bridge.isPending("items:2:2") or Bridge.settled("items:2:2"), "boss pool still asked, in the background"
+    wait(lambda: Bridge.isPending("cons:2") or Bridge.settled("cons:2"), 2, "consumables asked, in the background")
+    wait(lambda: not Loading.active(), 8, "floor 2's plans and the start room's neighbours")
+    opening = [k for k in ("layout:2:85", "items:2:0") if Bridge.settled(k)]
+    assert opening == ["layout:2:85", "items:2:0"], opening
     prepares = [m for m in sent(game) if m.get("t") == "prepare"]
     assert prepares[-1]["floor"] == 2 and prepares[-1]["state"]["level"]["stage"] == 2
     # Empty slots are spelled out, so a planner can't fill them from the character's usual loadout.
@@ -504,8 +512,8 @@ def run(tmp, game):
     early = [r["key"] for r in recs[:brief2] if r.get("type") == "entry" and str(r.get("key", "")).startswith(
         ("layout:2:", "items:2:", "cons:2"))]
     assert not early, f"floor 2 decisions made before its brief: {early}"
-    print("17. floor 2: loading screen held until its brief and opening decisions were in"
-          " (layout:2:85, items:2:0, cons:2), none made before the brief")
+    print("17. floor 2: loading screen held until its brief and the start room's neighbours were in"
+          " (layout:2:85, items:2:0); boss pool and consumables in the background; none made before the brief")
 
     # --- the next floor is generated before its plan lands: its curses change once it does ---
     W.enter(86)
