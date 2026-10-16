@@ -456,6 +456,9 @@ class App:
             self._set_status("#4cc96b", "Game connected" + (f"  |  run {run}" if run else ""))
         else:
             self._set_status("#8a8a8a", "Waiting for the game: start Isaac with the mod enabled")
+            if self.current.full or self.current.run_id:    # no game, no current run
+                self.current = Receipt(None, keep=sys.maxsize, keep_full=True)
+                self.run_view.show(None)
         if dm is not None:
             self.dm_label.configure(text="DM: " + dm.engine.label.split(" (")[0])
         crashed = dm is not None and not dm.alive()
