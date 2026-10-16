@@ -171,17 +171,24 @@ NO_EFFECT = {"ok": "not used yet", "replaced": "never used"}
 
 # ====================================================================== one run's receipt
 class RunView(ttk.Frame):
-    """A run's receipt: summary on top, every entry below, the selected one in full."""
+    """A run's receipt: summary on top, every entry below, the selected one in full.
 
-    COLUMNS = (("time", "Time", 65), ("what", "What", 90), ("key", "Key", 105), ("status", "Status", 75),
-               ("reason", "Asked because", 150), ("intent", "Intent", 230), ("result", "Result", 220),
-               ("effect", "Effect", 240), ("ms", "ms", 55), ("cost", "Cost", 65))
+    With spoiler mode off it shows only what the game used, in the order it used it, and none of
+    the DM's reasoning: no status, reason, intent or result columns, no entry details, no plans.
+    """
+
+    COLUMNS = (("time", "Generated time", 105), ("applied_time", "Applied time", 95), ("what", "What", 90),
+               ("key", "Key", 105), ("status", "Status", 75), ("reason", "Asked because", 150),
+               ("intent", "Intent", 230), ("result", "Result", 220), ("effect", "Effect", 240),
+               ("ms", "ms", 55), ("cost", "Cost", 65))
     WIDE = ("intent", "result", "effect")
+    SPOILERS = ("status", "reason", "intent", "result")    # hidden with spoiler mode off
 
-    def __init__(self, master, empty: str) -> None:
+    def __init__(self, master, empty: str, spoilers: bool = False) -> None:
         super().__init__(master, padding=(12, 10))
         self.empty = empty
         self.r: Receipt | None = None
+        self.spoilers = spoilers
 
         head = ttk.Frame(self)
         head.pack(fill="x")
@@ -208,7 +215,7 @@ class RunView(ttk.Frame):
         # Wrap the DM's words to whatever room the tally leaves.
         self.words.bind("<Configure>", lambda e: self.words.configure(wraplength=max(200, e.width - 8)))
 
-        panes = ttk.PanedWindow(self, orient="vertical")
+        self.panes = panes = ttk.PanedWindow(self, orient="vertical")
         panes.pack(fill="both", expand=True)
         table = ttk.Frame(panes)
         self.tree = ttk.Treeview(table, columns=[c[0] for c in self.COLUMNS], show="headings", height=10,
@@ -225,13 +232,24 @@ class RunView(ttk.Frame):
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._show_selected())
         panes.add(table, weight=3)
 
-        tabs = ttk.Notebook(panes)
+        self.details = tabs = ttk.Notebook(panes)
         entry_frame, self.entry_text = text_box(tabs, height=8, wrap="none")
         plan_frame, self.plan_text = text_box(tabs, height=8)
         tabs.add(entry_frame, text="Selected entry")
         tabs.add(plan_frame, text="The DM's plan")
         panes.add(tabs, weight=2)
-        self.show(None)
+        self.set_spoilers(spoilers)
+
+    def set_spoilers(self, on: bool) -> None:
+        """Spoiler mode: everything (on), or only what the game has used so far (off)."""
+        self.spoilers = on
+        self.tree.configure(displaycolumns=[c[0] for c in self.COLUMNS if on or c[0] not in self.SPOILERS])
+        shown = str(self.details) in map(str, self.panes.panes())
+        if on and not shown:
+            self.panes.add(self.details, weight=2)
+        elif not on and shown:
+            self.panes.forget(self.details)
+        self.show(self.r)
 
     def _lay_cards(self, frame: ttk.Frame, cols: int) -> None:
         """One row of six when there's room, else two rows of three."""
@@ -248,7 +266,10 @@ class RunView(ttk.Frame):
     def show(self, r: Receipt | None) -> None:
         self.r = r
         self.tree.delete(*self.tree.get_children())
-        for seq in sorted(r.full) if r else []:
+        rows = sorted(r.full) if r else []
+        if r and not self.spoilers:     # in the order the game used them
+            rows = sorted(filter(self._visible, rows), key=lambda s: (r.full[s].get("applied_ts") or 0, s))
+        for seq in rows:
             self._insert(seq)
         set_text(self.entry_text, "Pick an entry above to see everything behind it." if r else "")
         self.refresh()
@@ -257,13 +278,22 @@ class RunView(ttk.Frame):
         self._insert(seq)
 
     def updated(self, seq: int) -> None:
-        if self.r and self.tree.exists(str(seq)):
+        if not self.r:
+            return
+        if not self.tree.exists(str(seq)):
+            self._insert(seq)                     # just used: spoiler mode off shows it now
+        elif not self._visible(seq):
+            self.tree.delete(str(seq))
+        else:
             self.tree.item(str(seq), values=self._row(seq), tags=(self.r.full[seq].get("status"),))
             if self.tree.selection() == (str(seq),):
                 self._show_selected()
 
+    def _visible(self, seq: int) -> bool:
+        return self.spoilers or self.r.full[seq].get("status") == "applied"
+
     def _insert(self, seq: int) -> None:
-        if not self.tree.exists(str(seq)):
+        if self._visible(seq) and not self.tree.exists(str(seq)):
             self.tree.insert("", 0, iid=str(seq), values=self._row(seq), tags=(self.r.full[seq].get("status"),))
 
     def _row(self, seq: int) -> tuple:
@@ -282,8 +312,8 @@ class RunView(ttk.Frame):
         else:
             effect = NO_EFFECT.get(c["status"], "no effect reported") if c.get("intent") else ""
         cost = f'${c["cost"]:.4f}' if c.get("cost") else ""
-        return (c["time"], c["what"], c.get("key", ""), c["status"], c.get("reason", ""), intent, result, effect,
-                c.get("ms", ""), cost)
+        return (c["time"], c.get("applied_time", ""), c["what"], c.get("key", ""), c["status"], c.get("reason", ""),
+                intent, result, effect, c.get("ms", ""), cost)
 
     def _show_selected(self) -> None:
         sel = self.tree.selection()
@@ -391,7 +421,8 @@ class App:
         self._header()
         self.tabs = ttk.Notebook(root)
         self.tabs.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        self.run_view = RunView(self.tabs, "No run yet. Start a run in Isaac with the mod enabled.")
+        self.run_view = RunView(self.tabs, "No run yet. Start a run in Isaac with the mod enabled.",
+                                spoilers=bool(self.cfg.get("spoiler_mode")))
         self.tabs.add(self.run_view, text="  Current run  ")
         self._history_tab()
         self._settings_tab()
@@ -507,7 +538,7 @@ class App:
                         else:
                             self.run_view.added(int(data["seq"]))
                 elif event == "update":
-                    if self.current.apply_update(data["seq"], data["status"]) and self.run_view.r:
+                    if self.current.apply_update(data["seq"], data["status"], data.get("ts")) and self.run_view.r:
                         self.run_view.updated(int(data["seq"]))
                 elif event == "effect":
                     if self.current.apply_effect(data["seq"], data["effect"]) and self.run_view.r:
@@ -559,7 +590,7 @@ class App:
         self.history.bind("<<TreeviewSelect>>", lambda _e: self._open_history())
         panes.add(left, weight=1)
 
-        self.history_view = RunView(panes, "Pick a run on the left.")
+        self.history_view = RunView(panes, "Pick a run on the left.", spoilers=bool(self.cfg.get("spoiler_mode")))
         panes.add(self.history_view, weight=3)
         # The run view asks for more width than there is: without this the list gets squeezed.
         panes.bind("<Map>", lambda _e: panes.sashpos(0, 400), add="+")
@@ -655,6 +686,15 @@ class App:
         self.settings_msg = ttk.Label(row, text="", wraplength=800)
         self.settings_msg.pack(side="left", padx=12)
 
+        box = ttk.LabelFrame(tab, text=" Display ", padding=(14, 10))
+        box.pack(fill="x", pady=(20, 0))
+        self.spoiler_var = tk.BooleanVar(value=bool(self.cfg.get("spoiler_mode")))
+        ttk.Checkbutton(box, text="Spoiler mode", variable=self.spoiler_var, style="Switch.TCheckbutton",
+                        command=self._set_spoilers).pack(anchor="w")
+        ttk.Label(box, text="On: Current run and History show everything the DM decided, why, and its plans.\n"
+                            "Off: they show only what the game has used, as it's used. Applies straight away.",
+                  foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
+
         ttk.Label(tab, text="Files", style="Header.TLabel").pack(anchor="w", pady=(26, 6))
         files = ttk.Frame(tab)
         files.pack(fill="x")
@@ -679,8 +719,20 @@ class App:
             return
         self.cc_status.configure(text=f"Found: {path}", foreground=GOOD if self.cc_var.get() else MUTED)
 
+    def _set_spoilers(self) -> None:
+        on = self.spoiler_var.get()
+        self.run_view.set_spoilers(on)
+        self.history_view.set_spoilers(on)
+        try:
+            appdata.save_config({**self.cfg, "spoiler_mode": on})     # the saved DM settings, not unsaved edits
+        except OSError as e:
+            self.settings_msg.configure(text=f"Couldn't save the settings: {e}", foreground=BAD)
+            return
+        self.cfg["spoiler_mode"] = on
+
     def save_settings(self) -> None:
-        cfg = {"openrouter_api_key": self.key_var.get().strip(), "use_claude_code": self.cc_var.get()}
+        cfg = {"openrouter_api_key": self.key_var.get().strip(), "use_claude_code": self.cc_var.get(),
+               "spoiler_mode": self.spoiler_var.get()}
         try:
             engine = self._engine(cfg)
         except ValueError as e:

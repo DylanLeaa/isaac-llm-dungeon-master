@@ -2,6 +2,7 @@
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
@@ -205,11 +206,14 @@ def test_listener_and_load_mirror_the_file(tmp_path):
     assert [e[0] for e in events] == ["run", "entry", "update", "effect"]
     assert events[3][1] == {"seq": 1, "effect": ["+1 key dropped"]}
     assert events[0][1]["run"] == "SEED 1" and events[0][1]["fresh"] and events[0][1]["path"] == coord.receipt.path
-    assert events[1][1]["what"] == "room_clear" and events[2][1] == {"seq": 1, "status": "applied"}
+    assert events[1][1]["what"] == "room_clear"
+    assert events[2][1]["seq"] == 1 and events[2][1]["status"] == "applied" and events[2][1]["ts"] > 0
 
     r = load(coord.receipt.path)
     assert r.run_id == "SEED 1" and r.path is None and r.source == coord.receipt.path
     assert r.full[1]["status"] == "applied" and r.full[1]["decision"]["rewards"] == answer["rewards"]
+    assert r.full[1]["applied_ts"] == events[2][1]["ts"] >= r.full[1]["ts"]
+    assert compact(r.full[1])["applied_time"] == time.strftime("%H:%M:%S", time.localtime(events[2][1]["ts"]))
     assert r.full[1]["effect"] == ["+1 key dropped"]
     assert r.prompt_text == {h: t for h, t in zip(r.full[1]["llm"]["system"], ["PERSONA", "CAMPAIGN"])}
     assert r.totals() == coord.receipt.totals()
