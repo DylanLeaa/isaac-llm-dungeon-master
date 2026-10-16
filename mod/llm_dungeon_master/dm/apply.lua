@@ -66,6 +66,7 @@ local function plural(name, n)
   if name:match("[sx]$") or name:match("ch$") then return name .. "es" end
   return name .. "s"
 end
+Apply.plural = plural
 
 --- "+2 keys", "-1 heart": `n` of `name` (a catalog key like "soul_heart" is fine).
 local function count(sign, n, name)

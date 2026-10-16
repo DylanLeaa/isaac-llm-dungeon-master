@@ -36,6 +36,7 @@ local LAT_N = 24
 local lastHello = -1e9
 local onSummary        -- optional callback(msg) for the backend's run_summary (after-death stats)
 local onReady          -- optional callback(msg) for the backend's "ready" (the run narrative is in)
+local onEffect         -- optional callback(lines) for every effect sent (the on-screen effect list)
 local cruelty          -- nil = backend's --cruelty; set from config / the DM Settings menu
 
 local lineNo = 0       -- numbers our messages in the log
@@ -194,8 +195,14 @@ function Bridge.markApplied(key) send({ t = "applied", key = key }) end
 --- What a used result actually did, as short lines ("+1 bomb dropped"), for the receipt. A result
 --- used gradually reports each use as it happens.
 function Bridge.effect(key, lines)
-  if type(lines) == "table" and #lines > 0 then send({ t = "effect", key = key, effect = lines }) end
+  if type(lines) == "table" and #lines > 0 then
+    send({ t = "effect", key = key, effect = lines })
+    if onEffect then pcall(onEffect, lines) end    -- a display must never stop the game's side
+  end
 end
+
+--- Who else hears about each effect (the on-screen effect list).
+function Bridge.setEffectHandler(fn) onEffect = fn end
 
 --- Drop every pending/result whose key starts with prefix.
 function Bridge.forget(prefix)

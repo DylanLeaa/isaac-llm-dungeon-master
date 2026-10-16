@@ -467,6 +467,8 @@ def run(tmp, game):
     effects = [line for r in recs if r["type"] == "effect" for line in r["effect"]]
     assert any(line.endswith(" dropped") for line in effects), effects      # what each used decision did
     assert any(line.startswith("item offered: ") for line in effects), effects
+    icons = {W.drawn[i].file for i in range(1, len(W.drawn) + 1)}
+    assert any(f.startswith("gfx/005.") for f in icons), "used decisions show in the corner, as pickup icons"
     assert any(r.get("what") == "cruelty" and r.get("result") == "6 -> 3" for r in recs)
     print(f"16. receipt file {files[0].name}: {len(recs)} records, {len(calls)} LLM calls, "
           f"{len(effects)} effect lines")

@@ -80,6 +80,20 @@ Vector.Zero = Vector(0, 0)
 
 function KColor(r, g, b, a) return { Red = r, Green = g, Blue = b, Alpha = a } end
 function Font() return { Load = function() end, IsLoaded = function() return false end, DrawStringScaled = function() end } end
+function Color(r, g, b, a) return { R = r, G = g, B = b, A = a } end
+Options = { HUDOffset = 0 }
+-- Sprites record what they drew (W.drawn) so tests can see where; W.missingSprites[file] won't load.
+W.drawn, W.missingSprites = {}, {}
+function Sprite()
+  local s = { Scale = nil, Color = nil }
+  function s:Load(file) self.file = file end
+  function s:IsLoaded() return self.file ~= nil and not W.missingSprites[self.file] end
+  function s:Play(anim) self.anim = anim end
+  function s:IsPlaying(anim) return self.anim == anim end
+  function s:GetDefaultAnimation() return "Default" end
+  function s:Render(pos) W.drawn[#W.drawn + 1] = { file = self.file, x = pos.X, y = pos.Y, a = self.Color and self.Color.A } end
+  return s
+end
 
 function RNG()
   local r = { s = 1 }
@@ -231,6 +245,8 @@ local game = { Difficulty = 0 }
 function game:GetLevel() return level end
 function game:GetRoom() return room end
 function game:GetFrameCount() return W.frame end
+function game:GetNumPlayers() return 1 end
+function game:IsPaused() return W.paused or false end
 function game:IsGreedMode() return false end
 function game:GetSeeds() return seeds end
 function game:GetItemPool() return itemPool end

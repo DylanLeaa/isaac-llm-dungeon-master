@@ -16,9 +16,11 @@ local Death  = include("dm.deathscreen")
 local Loading = include("dm.loading")
 local Catcher = include("dm.dropcatcher")
 local Payouts = include("dm.payouts")
+local EffectHud = include("dm.effecthud")
 
 Taunt.enabled = cfg.SHOW_TAUNTS
 Apply.init(Taunt)
+EffectHud.init(cfg, Apply)
 Cons.init(cfg, Bridge, State, Taunt, Loading)
 Catcher.init(cfg, Apply)
 Catcher.setExempt(Payouts.near)
@@ -49,6 +51,7 @@ Death.init(cfg, Bridge, State, Cons, Settings)
 Bridge.setSummaryHandler(Death.handle)
 Loading.init(cfg, Bridge, State, Taunt, Sched)
 Bridge.setReadyHandler(Loading.handle)
+Bridge.setEffectHandler(EffectHud.push)
 
 -- Connect as soon as the mod loads so the DM is warm by the time a run starts.
 Bridge.init(cfg, SaveFile, "menu")
@@ -73,6 +76,7 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function
   Sched.resetRun()
   Death.startRun(seed)
   Loading.start()
+  EffectHud.clear()
   -- Pill colours the DM fixed earlier in this run must stay fixed after a continue.
   Cons.onLock = function(locked)
     local pills = {}                       -- string keys: colours are a sparse int table
@@ -117,6 +121,7 @@ mod:AddCallback(ModCallbacks.MC_POST_RENDER, safe("render", function()
   Loading.update()
   Loading.render()
   Taunt.render()
+  EffectHud.render(Loading.active() or Death.active())
   Death.render()
   if cfg.SHOW_DEBUG_HUD and not Death.active() then
     Taunt.renderDebug(Bridge.status(), math.floor(Bridge.latencyAvg()), math.floor(Bridge.latencyP90()),

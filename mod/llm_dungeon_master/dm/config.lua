@@ -66,6 +66,9 @@ return {
   HOLD_TIMEOUT_MS = 45000,
 
   SHOW_TAUNTS = true,
+  -- What the DM just did ("+1 bomb", "-1 penny", "+2 attack flies"), as icons in the bottom-right
+  -- corner for a few seconds.
+  SHOW_EFFECTS = true,
   -- After-death stats (yours and the DM's, plus its epitaph) over the game-over screen; the map
   -- button hides it. Always kept under Mod Config Menu > DM Settings > Last run.
   SHOW_DEATH_SCREEN = true,
