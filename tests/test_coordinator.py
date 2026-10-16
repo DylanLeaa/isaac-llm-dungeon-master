@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from schemas import _clean_text  # noqa: E402
+from bridge import PROTO  # noqa: E402
 from server import Coordinator  # noqa: E402
 
 
@@ -90,13 +91,13 @@ def test_cruelty_follows_hello_and_settings():
         asyncio.run(coord.handle(msg, send))
         return coord.cruelty
 
-    assert handle({"t": "hello", "session": "S", "run": "R", "cruelty": 9}) == 9 and dm.cruelty == 9
+    assert handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R", "cruelty": 9}) == 9 and dm.cruelty == 9
     assert handle({"t": "settings", "cruelty": 2}) == 2 and dm.cruelty == 2
     assert [m for m in sent if m["t"] == "settings_ok"][-1] == {"t": "settings_ok", "session": "S", "cruelty": 2}
     assert handle({"t": "settings"}) == 6 and dm.cruelty == 6        # menu's "backend default"
     assert handle({"t": "settings", "cruelty": 42}) == 10
     assert handle({"t": "settings", "cruelty": "lots"}) == 10        # garbage is ignored
-    assert handle({"t": "hello", "session": "S2", "run": "R"}) == 6  # reconnect without override
+    assert handle({"t": "hello", "proto": PROTO, "session": "S2", "run": "R"}) == 6  # reconnect without override
 
 
 def test_clean_text_cuts_on_word_boundary():
@@ -160,7 +161,7 @@ def _run_coord(coord, msgs, settle=0.05):
 def test_narrative_once_per_run_and_brief_once_per_floor():
     dm, planner = CampaignDM(5), ScriptedPlanner()
     coord = Coordinator(dm, cruelty=6, planner=planner)
-    _run_coord(coord, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+    _run_coord(coord, [{"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True},
                        floor_req(1, 1, "Basement I"), floor_req(2, 1, "Basement I"),
                        floor_req(3, 2, "Caves I"), floor_req(4, 2, "Caves I"),
                        floor_req(5, 2, "Caves I")])
@@ -204,10 +205,10 @@ def test_new_run_discards_late_narrative_from_old_run():
         pass
 
     async def go():
-        await coord.handle({"t": "hello", "session": "S", "run": "R1", "new_run": True}, send)
+        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True}, send)
         await coord.handle(floor_req(1, 1, "Basement I"), send)
         await asyncio.sleep(0.02)
-        await coord.handle({"t": "hello", "session": "S", "run": "R2", "new_run": True}, send)
+        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R2", "new_run": True}, send)
         planner.gate.set()                       # the old run's narrative "arrives" now
         await asyncio.sleep(0.05)
 
@@ -254,7 +255,7 @@ def _prepare_msgs(planner, msgs):
 
 def test_prepare_answers_ready_once_the_narrative_is_written():
     planner = ScriptedPlanner(gated=True)
-    sent, coord, go = _prepare_msgs(planner, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+    sent, coord, go = _prepare_msgs(planner, [{"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True},
                                               {"t": "prepare", "floor": 1,
                                                "state": floor_req(1, 1, "Basement I")["state"]}])
 
@@ -273,7 +274,7 @@ def test_prepare_answers_ready_once_the_narrative_is_written():
 def test_prepare_twice_writes_one_narrative_and_a_late_request_adds_no_second():
     planner = ScriptedPlanner()
     state = floor_req(1, 1, "Basement I")["state"]
-    sent, coord, go = _prepare_msgs(planner, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+    sent, coord, go = _prepare_msgs(planner, [{"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True},
                                               {"t": "prepare", "state": state}, {"t": "prepare", "state": state},
                                               floor_req(1, 1, "Basement I")])
     asyncio.run(go())
@@ -282,7 +283,7 @@ def test_prepare_twice_writes_one_narrative_and_a_late_request_adds_no_second():
 
 
 def test_prepare_without_planner_is_ready_at_once():
-    sent, coord, go = _prepare_msgs(None, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+    sent, coord, go = _prepare_msgs(None, [{"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True},
                                            {"t": "prepare", "state": {}}])
     asyncio.run(go())
     assert [m["status"] for m in sent if m["t"] == "ready"] == ["none"]
@@ -294,15 +295,15 @@ def test_prepare_reports_a_failed_narrative_and_ignores_an_abandoned_run():
             raise RuntimeError("boom")
 
     state = floor_req(1, 1, "Basement I")["state"]
-    sent, coord, go = _prepare_msgs(Boom(), [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+    sent, coord, go = _prepare_msgs(Boom(), [{"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True},
                                              {"t": "prepare", "state": state}])
     asyncio.run(go())
     assert [m["status"] for m in sent if m["t"] == "ready"] == ["failed"]
 
     gated = ScriptedPlanner(gated=True)
-    sent, coord, go = _prepare_msgs(gated, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+    sent, coord, go = _prepare_msgs(gated, [{"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True},
                                             {"t": "prepare", "state": state},
-                                            {"t": "hello", "session": "S", "run": "R2", "new_run": True}])
+                                            {"t": "hello", "proto": PROTO, "session": "S", "run": "R2", "new_run": True}])
     asyncio.run(go())
     assert not [m for m in sent if m["t"] == "ready"]            # the old run's wait is dropped
 
@@ -458,7 +459,7 @@ def test_a_brief_that_never_comes_only_holds_a_decision_for_the_brief_wait():
 
 def test_floor_prepare_answers_ready_for_that_floor_once_its_brief_is_in():
     planner = BriefGatedPlanner()
-    sent, coord, go = _prepare_msgs(planner, [{"t": "hello", "session": "S", "run": "R1", "new_run": True},
+    sent, coord, go = _prepare_msgs(planner, [{"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True},
                                               {"t": "prepare", "floor": 2,
                                                "state": floor_req(1, 2, "Caves I")["state"]}])
 

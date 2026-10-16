@@ -1,14 +1,14 @@
 """LLM Dungeon Master backend.
 
-Speaks newline-delimited JSON with the Isaac mod over either
-  * TCP on 127.0.0.1:7337 (mod uses LuaSocket; needs --luadebug), or
-  * two append-only files in a shared folder (mod uses io; also needs --luadebug).
+Talks to the Isaac mod through files the game already writes, so the mod runs in Isaac's normal
+sandbox: the mod's messages come in through the game's log.txt, ours go out through the mod's save
+file (see bridge.py). There's nothing to set up in the game: this finds the game's files.
 
-Run:  python server.py                 # Haiku 5.5 DM + Opus narrative + Sonnet floor briefs, TCP
+Run:  python server.py                 # Haiku 5.5 DM + Opus narrative + Sonnet floor briefs
       python server.py --no-planners  # Haiku alone
       python server.py --mock          # no API key needed
       python server.py --backend claude-code   # same DM through your local Claude Code (claude -p)
-      python server.py --bridge file --bridge-dir "C:/.../The Binding of Isaac Rebirth/llmdm_bridge"
+      python server.py --isaac-dir "D:/SteamLibrary/steamapps/common/The Binding of Isaac Rebirth"
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ import argparse
 import asyncio
 import heapq
 import itertools
-import json
 import logging
 import os
 import time
@@ -24,6 +23,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import bridge
 import epilogue
 from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_CODE_LATE_GRACE_S,
                          CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeDM, ClaudeCodePlanner)
@@ -124,6 +124,7 @@ class Coordinator:
         self.cruelty = self.default_cruelty = cruelty
         self.memory = RunMemory()
         self.session: str | None = None
+        self.mismatched = None                    # the last session whose hello had the wrong protocol
         self.send: Send | None = None             # the game's connection, for pushing receipt entries
         # Everything the engine does this run, with the LLM calls behind it (in memory only if no dir).
         self.receipt = receipt or Receipt()
@@ -157,6 +158,16 @@ class Coordinator:
     async def handle(self, msg: dict, send: Send) -> None:
         t = msg.get("t")
         if t == "hello":
+            if msg.get("proto") != bridge.PROTO:
+                # Told once per session; the mod shows the player which side needs updating.
+                if self.mismatched != msg.get("session"):
+                    self.mismatched = msg.get("session")
+                    log.error("the mod speaks protocol %s, this backend %d: update the %s",
+                              msg.get("proto"), bridge.PROTO,
+                              "backend" if isinstance(msg.get("proto"), int) and msg["proto"] > bridge.PROTO
+                              else "mod")
+                await send({"t": "welcome", "session": msg.get("session"), "proto": bridge.PROTO})
+                return
             self.summary()
             self.session, self.send = str(msg.get("session")), send
             if msg.get("run") != self.memory.run_id or msg.get("new_run"):
@@ -169,7 +180,7 @@ class Coordinator:
                     log.info("receipt -> %s", self.receipt.path)
             self._set_cruelty(msg.get("cruelty"))
             log.info("game connected  session=%s run=%s cruelty=%s", self.session, msg.get("run"), self.cruelty)
-            await send({"t": "welcome", "session": self.session, "cruelty": self.cruelty})
+            await send({"t": "welcome", "session": self.session, "proto": bridge.PROTO, "cruelty": self.cruelty})
             await send({"t": "receipt_sync", "session": self.session, **self.receipt.snapshot()})
         elif t == "settings":
             # Changed from the in-game DM Settings menu; takes effect for the next decision.
@@ -481,83 +492,12 @@ def _compact(decision: dict) -> dict:
     return out
 
 
-# ---------------------------------------------------------------- transports
-async def serve_tcp(coord: Coordinator, host: str, port: int) -> None:
-    async def on_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        peer = writer.get_extra_info("peername")
-        log.info("tcp client %s connected", peer)
-        lock = asyncio.Lock()
-
-        async def send(obj: dict) -> None:
-            data = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
-            async with lock:
-                writer.write(data)
-                await writer.drain()
-
-        try:
-            while line := await reader.readline():
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    log.warning("bad json from game: %r", line[:200])
-                    continue
-                await coord.handle(msg, send)
-        except (ConnectionResetError, BrokenPipeError):
-            pass
-        finally:
-            log.info("tcp client %s disconnected", peer)
-            coord.summary()
-            writer.close()
-
-    server = await asyncio.start_server(on_client, host, port, limit=2**22)
-    log.info("listening on %s:%d", host, port)
-    async with server:
-        await server.serve_forever()
-
-
-async def serve_files(coord: Coordinator, bridge_dir: Path, poll_s: float = 0.03) -> None:
-    """Game appends to to_dm.jsonl; we append to from_dm.jsonl. Both tagged by session."""
-    bridge_dir.mkdir(parents=True, exist_ok=True)
-    inbox, outbox = bridge_dir / "to_dm.jsonl", bridge_dir / "from_dm.jsonl"
-    inbox.touch()
-    outbox.touch()
-    log.info("file bridge at %s", bridge_dir)
-    pos, buf = inbox.stat().st_size, b""     # ignore stale requests from old sessions
-
-    async def send(obj: dict) -> None:
-        with open(outbox, "ab") as f:
-            f.write((json.dumps(obj, separators=(",", ":")) + "\n").encode())
-
-    while True:
-        size = inbox.stat().st_size
-        if size < pos:                            # game truncated: new session
-            pos, buf = 0, b""
-        if size > pos:
-            with open(inbox, "rb") as f:
-                f.seek(pos)
-                chunk = f.read()
-            pos += len(chunk)
-            buf += chunk
-            *lines, buf = buf.split(b"\n")
-            for line in lines:
-                if not line.strip():
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if msg.get("t") == "hello":
-                    outbox.write_bytes(b"")      # fresh response log per session
-                await coord.handle(msg, send)
-        await asyncio.sleep(poll_s)
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--bridge", choices=["tcp", "file"], default="tcp")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=7337)
-    ap.add_argument("--bridge-dir", type=Path, default=Path("llmdm_bridge"))
+    ap.add_argument("--isaac-dir", type=Path, action="append",
+                    help="the game's install folder, if it isn't found in your Steam libraries (repeatable)")
+    ap.add_argument("--log", type=Path, action="append",
+                    help="the game's log.txt, if it isn't in Documents/My Games/Binding of Isaac ... (repeatable)")
     ap.add_argument("--backend", choices=["openrouter", "claude-code"],
                     default=os.environ.get("LLMDM_BACKEND", "openrouter"),
                     help="where the Claude calls go: OpenRouter, or your local Claude Code in headless mode")
@@ -628,14 +568,16 @@ def main() -> None:
                         receipt=Receipt(None if args.no_receipts else args.receipts),
                         epitaph=not args.no_epitaph, gate=gate, late_grace_s=late_grace)
 
-    async def run() -> None:
-        if args.bridge == "tcp":
-            await serve_tcp(coord, args.host, args.port)
-        else:
-            await serve_files(coord, args.bridge_dir)
+    isaac_dirs = args.isaac_dir or bridge.isaac_installs()
+    logs = args.log or bridge.default_logs()
+    if not isaac_dirs:
+        log.warning("Isaac isn't installed in any Steam library found here: pass --isaac-dir.")
+    if not logs:
+        raise SystemExit("No Documents folder found for the game's log.txt: pass --log.")
+    log.info("game: %s", ", ".join(map(str, isaac_dirs)) or "?")
 
     try:
-        asyncio.run(run())
+        asyncio.run(bridge.serve(coord.handle, logs, isaac_dirs))
     except KeyboardInterrupt:
         coord.summary()
 

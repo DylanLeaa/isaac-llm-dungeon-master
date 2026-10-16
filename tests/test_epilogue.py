@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 import epilogue  # noqa: E402
 from receipt import Receipt  # noqa: E402
+from bridge import PROTO  # noqa: E402
 from server import Coordinator  # noqa: E402
 from test_coordinator import clear_req  # noqa: E402
 
@@ -39,7 +40,7 @@ def _play(coord, sent):
         sent.append(msg)
 
     async def go():
-        await coord.handle({"t": "hello", "session": "S", "run": "SEED 1", "new_run": True}, send)
+        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "SEED 1", "new_run": True}, send)
         await coord.handle(clear_req(1), send)
         await asyncio.sleep(0.02)
         await coord.handle({"t": "applied", "key": "clear:1:82"}, send)

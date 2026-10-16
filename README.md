@@ -22,7 +22,7 @@ and a voice. Both go into Haiku's system prompt, so every decision serves the pl
  scheduler.lua  ── "decide clear:3:85" + snapshot ─▶ Coordinator ── Haiku 5.5 (tool call)
    decides WHEN to ask                                 latest-wins per key     │
  bridge.lua     ◀─ clamped decision ───────────────  clamp() guardrails ◀──────┘
-   non-blocking TCP / file                             RunMemory (schemes, ledger)
+   out: log.txt   in: the mod's save file            RunMemory (schemes, ledger)
  apply.lua      spawns / morphs / curses
 ```
 
@@ -43,9 +43,9 @@ decides that one event.
 The planners start when the first request of a new run, or of a new floor (`stage` and
 `stage_type` from the snapshot), reaches the backend. A new run opens on a **loading screen**: the mod
 sends `prepare`, input is blocked and you can't be hurt until the backend answers `ready` (the narrative,
-about 20–60s, is written or has failed). Enter skips it, and it gives up by itself after
-`LOADING_CONNECT_MS` with no backend or `LOADING_TIMEOUT_MS` without a narrative (`LOADING_SCREEN = false`
-turns it off). The time spent there isn't counted in the run's clock. Nothing else waits: until a floor's
+about 20–60s, is written or has failed). It can't be skipped, but it gives up by itself after
+`LOADING_CONNECT_MS` with no backend or `LOADING_TIMEOUT_MS` without a narrative, and it doesn't come up at
+all if no backend has answered since the game started (`LOADING_SCREEN = false` turns it off). The time spent there isn't counted in the run's clock. Nothing else waits: until a floor's
 brief (about 5–15s) lands, Haiku improvises. The old brief is dropped as soon as the floor changes. A
 floor brief waits up to 25s for the run narrative, then goes ahead without it. If a planner
 fails, it is logged and the DM carries on.
@@ -79,7 +79,7 @@ Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the
 cd backend
 pip install -r requirements.txt
 export OPENROUTER_API_KEY=sk-or-...       # PowerShell: $env:OPENROUTER_API_KEY="sk-or-..."   cmd.exe: set OPENROUTER_API_KEY=sk-or-...
-python server.py --cruelty 6              # TCP on 127.0.0.1:7337, model anthropic/claude-haiku-5.5 via OpenRouter
+python server.py --cruelty 6              # finds the game by itself; model anthropic/claude-haiku-5.5 via OpenRouter
 python server.py --mock                   # offline stand-in, no key needed
 python server.py --no-planners            # Haiku only: no Opus narrative / Sonnet floor briefs
 python server.py --narrative-model anthropic/claude-opus-5.5 --floor-model anthropic/claude-sonnet-5.5   # default is both sonnet
@@ -104,13 +104,27 @@ $0.05 per run (Opus) and $0.02–0.03 per floor (Sonnet).
 
 **2. Mod**
 - Copy `mod/llm_dungeon_master/` into `…/steamapps/common/The Binding of Isaac Rebirth/mods/`.
-- Steam → Isaac → Properties → Launch Options: `--luadebug`.
-  This is what allows the socket/file access. It lifts the mod sandbox for **every** enabled
-  mod, so only run it with mods you trust, and remove it when you're done.
-- Start a run. Bottom-left shows `DM tcp connected  avg …ms p90 …ms`.
+  No launch options: the mod runs in the game's normal sandbox.
+- Start the game with the backend running. Bottom-left shows `DM connected, link …ms  avg …ms p90 …ms`
+  (`link` is the round trip of the connection alone; `avg` / `p90` include the LLM).
 
-If LuaSocket won't load on your install, set `TRANSPORT = "file"` in `dm/config.lua` and run
-`python server.py --bridge file --bridge-dir "<Isaac install>/llmdm_bridge"` (create that folder).
+The backend looks for the game in your Steam libraries and its `log.txt` under
+`Documents/My Games/Binding of Isaac …`. If it can't find them, pass `--isaac-dir "<Isaac install>"`
+and/or `--log "<path to log.txt>"`. With no backend running, the game plays as vanilla: there's no
+loading screen, and the DM says once per run that it isn't there.
+
+**How the mod talks to the backend.** Isaac's sandbox gives a mod no sockets or file access, so
+the link goes through two files the game writes anyway ([backend/bridge.py](backend/bridge.py),
+[dm/bridge.lua](mod/llm_dungeon_master/dm/bridge.lua)):
+- *Mod → backend*: each message is written with `Isaac.DebugString`, so it lands in `log.txt` as
+  `[LLMDM:<n>:<i>/<k>]<json>`, split over several lines when it's long. The backend tails the log.
+- *Backend → mod*: the backend writes its messages, numbered, into the mod's save file
+  (`<install>/data/llm_dungeon_master/save1.dat`, under `"dm"`). The mod reads it every `POLL_MS`
+  and acks what it has handled. The mod's own data in that file (settings, pill locks, run stats) is
+  kept as is. The mod puts its session id in the file before its hello, and the backend finds the file
+  by looking for it, so the save slot and the Workshop folder name don't matter.
+- Hello and welcome carry a protocol version (`PROTO` in both files). If they differ, the mod
+  doesn't play, and it tells the player whether the backend or the mod needs updating.
 
 **3. Check the DM's voice first (optional)**: `python tests/live_smoke.py --cruelty 8` makes one
 real call per decision kind and prints the results and latencies. Add `--planners` to first
@@ -169,8 +183,10 @@ Mod Config Menu → **DM Settings → Last run**. The backend also logs it and a
 ## What's tested, and what isn't
 
 - `tests/test_clamp.py` — guardrails.
-- `tests/test_bridge_e2e.py` — the real `bridge.lua` under Lua 5.3 talking to the backend over
-  the file bridge, plus the TCP server: superseding, timeouts, acks.
+- `tests/test_bridge_e2e.py` — the real `bridge.lua` and `savefile.lua` under Lua 5.3 talking to the
+  backend through a fake game folder (log.txt + save file), plus a Python stand-in for the mod:
+  superseding, timeouts, chunked messages, acks, protocol mismatch, and each side's data surviving the
+  other's writes.
 - `tests/test_mod_headless.py` — the **whole mod** (`main.lua` + `dm/*`) on a fake Isaac API
   against the mock backend: prefetch → room dressed on entry → clear decision requested mid-fight
   and ready at the last kill → DM-picked treasure item → card/rune/trinket draws and a locked pill
@@ -182,9 +198,8 @@ Mod Config Menu → **DM Settings → Last run**. The backend also logs it and a
 - `tests/test_epilogue.py` — the after-death stats: only applied decisions count, the epitaph
   follows the stats and a failed one never leaves the screen waiting.
 
-These run without the game. The Isaac API calls follow the official docs, but the mod has not
-been run inside Isaac yet, so expect a first-session shakedown; errors are caught per callback,
-printed once to the console/`log.txt`, and that event falls back to vanilla.
+These run without the game, against a fake Isaac API and a fake game folder. In the game, errors are
+caught per callback and printed once to the console/`log.txt`, and that event falls back to vanilla.
 
 ## Known limits (vanilla API)
 

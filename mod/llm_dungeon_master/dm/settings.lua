@@ -1,13 +1,11 @@
--- DM Settings: the in-game menu (Mod Config Menu) and the mod's save file.
+-- DM Settings: the in-game menu (Mod Config Menu) and what the mod saves.
 --   General : the cruelty slider
 --   Receipt : what the engine did this run (decisions, LLM calls, tokens, cost), newest first
 --   Last run: the after-death stats screen of the last finished run
 -- Without Mod Config Menu installed this just applies config.lua and stays out of the way.
-local json = require("json")
-
 local Settings = {}
 
-local mod, cfg, Bridge, Receipt, Death
+local store, cfg, Bridge, Receipt, Death
 local registered = false
 local DEFAULT = -1     -- menu/save value meaning "use the backend's --cruelty"
 local CATEGORY = "DM Settings"
@@ -21,21 +19,11 @@ local function band(c)
   return "merciless"
 end
 
---- The whole save file as a table ({} if missing or unreadable).
-function Settings.load()
-  if not (mod.HasData and mod:HasData()) then return {} end
-  local ok, data = pcall(json.decode, mod:LoadData())
-  return (ok and type(data) == "table") and data or {}
-end
+--- Everything the mod has saved, as a table.
+function Settings.load() return store.get() end
 
 --- Merge fields into the save file. Isaac gives a mod one file, so everything saved goes through here.
-function Settings.save(fields)
-  if not mod.SaveData then return end
-  local data = Settings.load()
-  for k, v in pairs(fields) do data[k] = v end
-  local ok, line = pcall(json.encode, data)
-  if ok then mod:SaveData(line) end
-end
+function Settings.save(fields) store.save(fields) end
 
 local function saveCruelty()
   local c = Bridge.getCruelty()
@@ -132,14 +120,25 @@ function Settings.registerMenu()
   addLines("Last run", LAST_RUN_LINES, function() return Death.menuLines(width()) end)
 end
 
-function Settings.init(theMod, config, theBridge, theReceipt, theDeath)
-  mod, cfg, Bridge, Receipt, Death = theMod, config, theBridge, theReceipt, theDeath
+-- Cruelty from config.lua, unless the menu saved one.
+local function applySavedCruelty()
   local c = cfg.CRUELTY
   local saved = Settings.load().cruelty
   if type(saved) == "number" then c = saved ~= DEFAULT and saved or nil end
   if c ~= nil then c = math.max(0, math.min(10, math.floor(c))) end
   Bridge.setCruelty(c)
+end
+
+function Settings.init(theStore, config, theBridge, theReceipt, theDeath)
+  store, cfg, Bridge, Receipt, Death = theStore, config, theBridge, theReceipt, theDeath
+  applySavedCruelty()
   Settings.registerMenu()
+end
+
+--- A game is starting: the save slot is chosen now, so read it again.
+function Settings.reload()
+  store.reload()
+  applySavedCruelty()
 end
 
 return Settings
