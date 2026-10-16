@@ -46,6 +46,7 @@ class Receipt:
         self.seq = 0
         self.status: dict[int, str] = {}                      # every entry's current status
         self.decisions: dict[int, tuple[str, dict]] = {}      # seq -> (kind, clamped decision)
+        self.effects: dict[int, list[str]] = {}               # seq -> what it did in the game
         self.usage = Counter()
         self.prompts: set[str] = set()                        # system prompt hashes already in the file
         self.full: dict[int, dict] = {}                       # seq -> the whole entry (keep_full)
@@ -209,6 +210,7 @@ class Receipt:
     def _apply_effect(self, seq, lines) -> bool:
         if seq not in self.status or not isinstance(lines, list):
             return False
+        self.effects[seq] = self.effects.get(seq, []) + lines
         if self.keep_full and seq in self.full:
             self.full[seq]["effect"] = self.full[seq].get("effect", []) + lines
         return True
@@ -223,6 +225,10 @@ class Receipt:
     def applied(self) -> list[tuple[str, dict]]:
         """Every decision the game actually used this run, oldest first, as (kind, decision)."""
         return [self.decisions[s] for s in sorted(self.decisions) if self.status.get(s) == "applied"]
+
+    def effect_lines(self) -> list[str]:
+        """Every effect line the game reported this run, oldest first ("-1 key (...)")."""
+        return [line for s in sorted(self.effects) for line in self.effects[s]]
 
     # ------------------------------------------------- with keep_full: the app
     def run_summary(self) -> dict | None:

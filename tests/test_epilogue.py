@@ -119,3 +119,30 @@ def test_tallies_and_title():
     assert epilogue.run_title("PREMISE: x\nTITLE: Cain and the Cursed Rabbit's Foot\n") == \
         "Cain and the Cursed Rabbit's Foot"
     assert epilogue.run_title(None) is None
+
+
+def test_pickups_taken_away_count_against_the_dm():
+    applied = [("room_clear", {"rewards": [{"reward": "key", "count": 2}, {"reward": "penny", "count": 1}]})]
+    effects = ["+2 keys dropped", "+1 penny dropped",
+               "-1 key (would have dropped, not replaced)",
+               "-2 pennies, -1 soul heart, -1 card (layout pickups removed)",
+               "-1 bomb -> +1 troll bomb (layout pickup)",
+               "-3 hearts -> +3 coins (layout pickups)",
+               "-1 coin (dropped as the room cleared, not replaced)"]
+    assert epilogue.losses(effects) == {"keys": 1, "bombs": 1, "coins": 3, "hearts": 4}
+    rows = dict(map(tuple, epilogue.dm_side(applied, {}, None, effects)[0]))
+    assert rows["Keys / bombs"] == "+2 -1 / +0 -1"
+    assert rows["Coins / hearts"] == "+1 -3 / +0 -4"
+    assert dict(map(tuple, epilogue.dm_side(applied, {}, None, ["+2 keys dropped"])[0]))["Keys / bombs"] == "2 / 0"
+
+
+def test_receipt_keeps_effects_for_the_tally(tmp_path):
+    rec = Receipt(tmp_path)
+    rec.start_run("SEED 2", fresh=True)
+    seq = rec.add("room_clear", "ok", decision={"rewards": []})
+    rec.add_effect(seq, ["-1 key (would have dropped, not replaced)"])
+    rec.add_effect(seq, ["-1 bomb (dropped as the room cleared, not replaced)"])
+    assert rec.effect_lines() == ["-1 key (would have dropped, not replaced)",
+                                  "-1 bomb (dropped as the room cleared, not replaced)"]
+    rec.start_run("SEED 2", fresh=False)                # a continued run replays them from its file
+    assert len(rec.effect_lines()) == 2
