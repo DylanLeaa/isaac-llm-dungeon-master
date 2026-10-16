@@ -130,3 +130,47 @@ def test_continued_run_resumes_its_receipt_and_new_run_starts_fresh(tmp_path):
     third.receipt.start_run("R", fresh=True)
     assert third.receipt.seq == 0 and third.receipt.totals()["calls"] == 0
     assert third.receipt.path != first.receipt.path
+
+
+def test_listener_and_load_mirror_the_file(tmp_path):
+    """What the app sees: events as the run is recorded, and the whole file read back."""
+    from receipt import load
+    answer = {"intent": "one key", "rewards": [{"reward": "key", "count": 1}], "taunt": "Door's that way."}
+    coord = Coordinator(CallDM([answer]), cruelty=6, receipt=Receipt(tmp_path))
+    events = []
+    coord.receipt.listener = lambda event, data: events.append((event, dict(data)))
+
+    async def send(msg):
+        pass
+
+    async def go():
+        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "SEED 1", "new_run": True}, send)
+        await coord.handle(clear_req(1), send)
+        await asyncio.sleep(0.02)
+        await coord.handle({"t": "applied", "key": "clear:1:82"}, send)
+
+    asyncio.run(go())
+    assert [e[0] for e in events] == ["run", "entry", "update"]
+    assert events[0][1]["run"] == "SEED 1" and events[0][1]["fresh"] and events[0][1]["path"] == coord.receipt.path
+    assert events[1][1]["what"] == "room_clear" and events[2][1] == {"seq": 1, "status": "applied"}
+
+    r = load(coord.receipt.path)
+    assert r.run_id == "SEED 1" and r.path is None and r.source == coord.receipt.path
+    assert r.full[1]["status"] == "applied" and r.full[1]["decision"]["rewards"] == answer["rewards"]
+    assert r.prompt_text == {h: t for h, t in zip(r.full[1]["llm"]["system"], ["PERSONA", "CAMPAIGN"])}
+    assert r.totals() == coord.receipt.totals()
+    assert r.run_summary() is None
+
+
+def test_run_summary_and_plans_from_a_receipt(tmp_path):
+    from receipt import load
+    rec = Receipt(tmp_path, keep_full=True)
+    rec.start_run("R", fresh=True)
+    rec.add("narrative", "written", text="TITLE: The Long Con\nACT 1: ...")
+    rec.add("floor_brief", "written", key="Basement I", text="BRIEF 1")
+    rec.add("floor_brief", "discarded", key="Basement I", text="NOT THIS")
+    rec.add("run_summary", "death", summary={"outcome": "death", "sections": [], "epitaph": None})
+    rec.add("epitaph", "written", result="Here lies Isaac.")
+    for r in (rec, load(rec.path)):
+        assert r.plans() == ("TITLE: The Long Con\nACT 1: ...", "BRIEF 1")
+        assert r.run_summary() == {"outcome": "death", "sections": [], "epitaph": "Here lies Isaac."}

@@ -18,3 +18,8 @@ Thumbs.db
 
 # Per-run DM receipts (backend/receipts/)
 backend/receipts/
+
+# Exe builds (backend/build.ps1)
+backend/build/
+backend/dist/
+*.spec

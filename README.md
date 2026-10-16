@@ -75,6 +75,34 @@ Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the
 ## Setup
 
 **1. Backend**
+
+*The app (what players run).* `LLM Dungeon Master.exe` opens a window instead of a console. In
+**Settings**, paste an OpenRouter key or switch on **Use Claude Code**, then press **Save and apply**.
+Changes apply to the running DM straight away, mid-run included. The window has four tabs:
+- **Current run**: the receipt summary (LLM bill, tokens, decisions used / unused / left to vanilla,
+  what the DM did to you, its scheme, last taunt and epitaph), every entry live, the selected entry
+  in full, and the run narrative and floor brief.
+- **History**: every past run's receipt in the same view.
+- **Settings**: the key and the Claude Code switch, plus the files the backend found.
+- **Log**: what the console used to show.
+
+The header shows whether the game is connected. Errors show in a dialog and the Log tab, and are
+also written to the app's own log file.
+
+The app keeps its files in `%APPDATA%\LLM Dungeon Master\`:
+- `config.json`: the settings, with the key in plain text in your own user folder;
+- `receipts\`: the run receipts;
+- `backend.log`: the app's log, which is what to attach to a bug report.
+
+A blank key falls back to `OPENROUTER_API_KEY`. Only one copy of the app runs at a time.
+Windows SmartScreen may warn about an unsigned exe: choose **More info → Run anyway**.
+
+Run the app from source with `python backend/app.py` (`--mock` for no key). To build the exe:
+```powershell
+powershell -ExecutionPolicy Bypass -File backend\build.ps1   # -> backend\dist\LLM Dungeon Master.exe
+```
+
+*The console server (development, and what the tests drive).*
 ```bash
 cd backend
 pip install -r requirements.txt
@@ -98,8 +126,8 @@ fit the game's 10–12 s deadlines it runs at most 3 decisions at once, starts e
 call does, and lets a call run up to 20 s past its deadline and still deliver: the game keeps a late
 answer and uses it if it still needs one. Use `--claude-bin` if `claude` isn't on PATH.
 `python tests/live_smoke.py --backend claude-code` checks it.
-The console logs every decision with its latency, intent and taunt, and prints the run
-narrative and each floor brief in full. It's fun on a second monitor. The planners add roughly
+The console (or the app's Log tab) logs every decision with its latency, intent and taunt, and
+prints the run narrative and each floor brief in full. It's fun on a second monitor. The planners add roughly
 $0.05 per run (Opus) and $0.02–0.03 per floor (Sonnet).
 
 **2. Mod**
@@ -145,11 +173,13 @@ fired. It also gets the planners' narrative and briefs, fallbacks to vanilla, ti
 superseded calls and cruelty changes. Each LLM call keeps its model, provider, generation id,
 finish reason, raw response message, tokens and cost.
 
-- **On disk**: `backend/receipts/<started>_run-<seed>.jsonl`, one JSON object per line
+- **On disk**: `<started>_run-<seed>.jsonl` in `backend/receipts/` (from source) or
+  `%APPDATA%\LLM Dungeon Master\receipts\` (the exe), one JSON object per line
   (`--receipts DIR` moves it, `--no-receipts` keeps it in memory only). System prompts are
   stored once per file and referenced by hash. Later outcomes (`applied`, or `replaced` when a
   re-ask made an answer unused) are appended as `update` lines. Continuing a run resumes its
   file, even after a backend restart.
+- **In the app**: the Current run and History tabs (see Setup).
 - **In game**: Mod Config Menu → **DM Settings → Receipt** shows run totals (actions, LLM calls,
   cost, tokens, cache hit rate, applied/replaced/vanilla/timeouts/errors), an entry browser
   (left/right steps back through the last 40 actions: model, latency, tokens, cost, intent,
