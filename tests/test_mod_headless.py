@@ -461,6 +461,24 @@ def run(tmp, game):
     W.pickups = lua.table_from([])
     print("15d. chest paid its scheduled contents instead of the game's")
 
+    # --- chests with no item pool are scheduled too, and two side by side each pay their own plan:
+    # the spiked chest opens inside the bomb chest's payout window, its loot within reach of both ---
+    stone = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_BOMBCHEST, 1, 400, 300)
+    spiked = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_SPIKEDCHEST, 1, 460, 300)
+    W.pickups = lua.table_from([stone, spiked])
+    for c in (stone, spiked):
+        wait(lambda: Bridge.peek(f"payout:1:{int(c.InitSeed)}"), 6, "the chest's contents")
+    for c, x in ((stone, 400), (spiked, 460)):
+        n0 = len(W.spawned)
+        c.SubType = 0                              # opened (the bomb chest blown open)
+        W.fire(MC.MC_POST_PICKUP_UPDATE, c)
+        loot = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, x, 300)
+        W.fire(MC.MC_POST_PICKUP_INIT, loot)
+        assert loot.removed and [s.v for s in list(W.spawned.values())[n0:]] == [PV.PICKUP_HEART, PV.PICKUP_BOMB], \
+            f"variant {c.Variant}: its own plan pays out, not swallowed by its neighbour's"
+    W.pickups = lua.table_from([])
+    print("15d2. bomb chest and spiked chest side by side each paid their own scheduled contents")
+
     # --- a grab bag is a chest: its contents are scheduled, and its spawns are never classed as natural ---
     bag = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_GRAB_BAG, 1, 340, 300)
     W.pickups = lua.table_from([bag])

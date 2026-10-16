@@ -31,9 +31,18 @@ function Payouts.init(config, bridge, state, apply, taunt, itemForFn, slotPools,
   cfg, Bridge, State, Apply, Taunt, itemFor = config, bridge, state, apply, taunt, itemForFn
   SLOT, CHEST = {}, {}
   for variant, src in pairs(slotPools) do SLOT[variant] = { label = src[2], pool = src[1], hearts = variant == 5 } end
-  SLOT[1] = { label = "slot_machine" }                      -- the plain slot machine has no item pool
+  -- No item pool for these; the game's own variant numbers (slots have no enum).
+  SLOT[1] = { label = "slot_machine" }
+  SLOT[15] = { label = "hell_game", hearts = true }         -- a shell game paid for with hearts
   for variant, src in pairs(pickupPools) do CHEST[variant] = { label = src[2], pool = src[1] } end
-  if PickupVariant.PICKUP_CHEST then CHEST[PickupVariant.PICKUP_CHEST] = { label = "chest" } end
+  -- Chests with no item pool. Eternal and mega chests can close again and be reopened: only the
+  -- first opening is scheduled, later ones pay what the game rolls.
+  for name, label in pairs({ PICKUP_CHEST = "chest", PICKUP_BOMBCHEST = "bomb_chest",
+                             PICKUP_SPIKEDCHEST = "spiked_chest", PICKUP_ETERNALCHEST = "eternal_chest",
+                             PICKUP_MIMICCHEST = "mimic_chest", PICKUP_MEGACHEST = "mega_chest",
+                             PICKUP_HAUNTEDCHEST = "haunted_chest" }) do
+    if PickupVariant[name] then CHEST[PickupVariant[name]] = { label = label } end
+  end
   if PickupVariant.PICKUP_GRAB_BAG then CHEST[PickupVariant.PICKUP_GRAB_BAG] = { label = "grab_bag", bag = true } end
 end
 
@@ -180,40 +189,60 @@ local function openChest(i)
 end
 
 -- ------------------------------------------------------------------ hooks
+local function radiusOf(i) return i.class == "chest" and NEAR_CHEST or NEAR_SLOT end
+
+-- The one instance a pickup appearing at pos belongs to: the one that spawned it, else the nearest
+-- with a payout window open (the latest use or opening on a tie). Two chests side by side, opened
+-- one after the other, each keep their own contents.
+local function claimant(pickup, pos, f)
+  local sp = pickup.SpawnerEntity
+  local best, bestD, bestFrame
+  for _, i in pairs(insts) do
+    if here(i) and i.pos then
+      local d = i.pos:Distance(pos)
+      if i.class == "chest" and not i.opened and d <= NEAR_CHEST and chestOpening(i) then openChest(i) end
+      local latest
+      for _, p in ipairs(i.pending) do
+        if f - p.frame <= WINDOW and (not latest or p.frame > latest) then latest = p.frame end
+      end
+      if latest then
+        if sp and sp.InitSeed == i.seed then
+          best, bestD, bestFrame = i, -1, latest                  -- its own spawn: nothing beats that
+        elseif d <= radiusOf(i) and (not best or d < bestD or (d == bestD and latest > bestFrame)) then
+          best, bestD, bestFrame = i, d, latest
+        end
+      end
+    end
+  end
+  return best
+end
+
 --- MC_POST_PICKUP_INIT. True if this pickup is a payout the schedule cancelled or let through.
 function Payouts.onPickupInit(pickup)
   if Apply.spawning or not active() then return false end
   local f, pos = game:GetFrameCount(), pickup.Position
-  for _, i in pairs(insts) do
-    if here(i) and i.pos then
-      if i.class == "chest" and not i.opened and i.pos:Distance(pos) <= NEAR_CHEST and chestOpening(i) then
-        openChest(i)
+  local i = claimant(pickup, pos, f)
+  if not i then return false end
+  for _, p in ipairs(i.pending) do
+    if p.waiting then
+      if f - p.frame <= WINDOW then   -- the game's contents spawn right after the opening
+        p.held[#p.held + 1] = { variant = pickup.Variant, subtype = pickup.SubType,
+                                pos = Vector(pos.X, pos.Y) }
+        p.at = p.at or Vector(pos.X, pos.Y)
+        pickup:Remove()
+        return true
       end
-      local radius = i.class == "chest" and NEAR_CHEST or NEAR_SLOT
-      if i.pos:Distance(pos) <= radius then
-        for _, p in ipairs(i.pending) do
-          if p.waiting then
-            if f - p.frame <= WINDOW then   -- the game's contents spawn right after the opening
-              p.held[#p.held + 1] = { variant = pickup.Variant, subtype = pickup.SubType,
-                                      pos = Vector(pos.X, pos.Y) }
-              p.at = p.at or Vector(pos.X, pos.Y)
-              pickup:Remove()
-              return true
-            end
-          elseif f - p.frame <= WINDOW then
-            local wantsItem = false
-            for _, e in ipairs(p.entries) do if e.reward == "item" then wantsItem = true end end
-            if pickup.Variant == PickupVariant.PICKUP_COLLECTIBLE and wantsItem then
-              p.itemSeen = true
-              if not p.resolved then deliver(i, p, pos) end
-              return true
-            end
-            pickup:Remove()
-            if not p.resolved then deliver(i, p, pos) end
-            return true
-          end
-        end
+    elseif f - p.frame <= WINDOW then
+      local wantsItem = false
+      for _, e in ipairs(p.entries) do if e.reward == "item" then wantsItem = true end end
+      if pickup.Variant == PickupVariant.PICKUP_COLLECTIBLE and wantsItem then
+        p.itemSeen = true
+        if not p.resolved then deliver(i, p, pos) end
+        return true
       end
+      pickup:Remove()
+      if not p.resolved then deliver(i, p, pos) end
+      return true
     end
   end
   return false
@@ -223,7 +252,7 @@ end
 function Payouts.near(pos)
   if not active() then return false end
   for _, i in pairs(insts) do
-    if here(i) and i.pos and i.pos:Distance(pos) <= (i.class == "chest" and NEAR_CHEST or NEAR_SLOT) then return true end
+    if here(i) and i.pos and i.pos:Distance(pos) <= radiusOf(i) then return true end
   end
   return false
 end
