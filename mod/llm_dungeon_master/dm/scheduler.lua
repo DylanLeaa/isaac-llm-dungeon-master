@@ -14,6 +14,9 @@
 --   floor_plan   asked on entering the boss room; re-asked once the boss dies.
 --   item_choice  also asked for chest/beggar pools the moment one of those shows up in a room.
 --   consumables  see consumables.lua (floor start, then when a new pill colour is in play).
+--   payout_plan  see payouts.lua: asked once per beggar/machine/chest when it shows up.
+--   drops        enemy-death and natural pickups are swallowed (dropcatcher.lua) and ride along
+--                with room_clear as context.suppressed_drops.
 --
 -- If an answer isn't there when the game needs it, the game freezes on a hold (loading.lua) until it
 -- is, asking right then if it never asked. Rooms are dressed and rewards dropped late; item
@@ -23,13 +26,14 @@
 local Sched = {}
 
 local game = Game()
-local cfg, Bridge, State, Apply, Taunt, Cons, Loading
+local cfg, Bridge, State, Apply, Taunt, Cons, Loading, Catcher, Payouts
 
 local floorNo = 0
 local levelSig
 local room = nil         -- per-room tracker
 local itemQueues = {}    -- pool -> {resultId, ids}
-local itemSigs = {}      -- pool -> signature of the last item_choice request (candidates + build)
+local itemSigs = {}      -- pool -> signature of the last item_choice request (candidates + player state)
+local itemSends = {}     -- pool -> item_choice requests sent this floor
 local layoutSends = {}   -- layout key -> {hash, n}: what we last asked about that room, and how often
 local fallbackSent = {}  -- key -> true: a hold on it gave up and the game decided (reported once)
 local floorPlanAsked = false
@@ -105,7 +109,7 @@ local function requestLayout(desc, reason)
   return key
 end
 
-local function requestClear(reason, etaMs, deadlineMs)
+local function requestClear(reason, etaMs, deadlineMs, caught)
   local key = fkey("clear", room.idx)
   local hp, n = alive()
   Bridge.request("room_clear", key, State.snapshot(), {
@@ -113,9 +117,11 @@ local function requestClear(reason, etaMs, deadlineMs)
     enemies_left = n, enemy_hp_left = math.floor(hp),
     est_ms_until_clear = math.floor(math.min(etaMs or 0, 60000)),
     seconds_in_room = math.floor((Isaac.GetTime() - room.enteredAt) / 100) / 10,
+    suppressed_drops = caught or Catcher.counts(),     -- a late ask after the clear carries what was caught
   }, deadlineMs or math.floor(math.max(1500, math.min(etaMs or 4000, 10000)) + 2000))
   room.clearReqAt = Isaac.GetTime()
   room.clearReqHash = State.materialHash()
+  room.clearReqSupp = Catcher.total()
   room.clearSends = room.clearSends + 1
 end
 
@@ -142,12 +148,17 @@ local function requestItems(pool, roomTypeName, reason, force)
   local cands = peekCandidates(pool)
   if #cands == 0 then return end
   -- Candidates come from a fixed seed, so walking past the same room again would resend the
-  -- exact same question. Only re-ask when the candidates or the build changed.
+  -- exact same question. Only re-ask when the candidates or the player's state changed (a ranking
+  -- and its taunt written at floor start go stale), at most MAX_ITEM_SENDS times a floor.
   local key, ids = fkey("items", pool), {}
   for i, c in ipairs(cands) do ids[i] = tostring(c.id) end
-  local sig = table.concat(ids, ",") .. "|" .. Isaac.GetPlayer(0):GetCollectibleCount()
-  if not force and itemSigs[pool] == sig and (Bridge.isPending(key) or Bridge.peek(key)) then return end
+  local sig = table.concat(ids, ",") .. "|" .. State.materialHash()
+  if not force then
+    if itemSigs[pool] == sig and (Bridge.isPending(key) or Bridge.peek(key)) then return end
+    if (itemSends[pool] or 0) >= cfg.MAX_ITEM_SENDS then return end
+  end
   itemSigs[pool] = sig
+  itemSends[pool] = (itemSends[pool] or 0) + 1
   Bridge.request("item_choice", key, State.snapshot(), {
     reason = reason, pool = pool, room_type = roomTypeName, candidates = cands,
   }, 10000)
@@ -192,28 +203,49 @@ local function holdLayout(key, desc)
       if not res then return end
       if curIdx() ~= idx then return Bridge.effect(key, { "not applied: the player left the room" }) end
       Bridge.effect(key, Apply.roomLayout(res.decision, game:GetFrameCount() - entered))
-      if room and room.idx == idx then room.layoutApplied = true end
+      if room and room.idx == idx then
+        room.layoutApplied = true
+        Catcher.adopt(Bridge)
+      end
     end,
-    giveUp = function() reportFallback("room_layout", key, true) end,
+    giveUp = function()
+      reportFallback("room_layout", key, true)
+      if room and room.idx == idx then Catcher.adopt(Bridge) end
+    end,
   })
+end
+
+-- Drops still trailing in after this clear's reward is out: lost, and the clear's effect says so.
+local function lostAfterClear(key)
+  return function(name)
+    Bridge.effect(key, { Apply.count("-", 1, name) .. " (dropped as the room cleared, not replaced)" })
+  end
 end
 
 -- The room is clear and the DM's reward isn't in: the game's award was skipped (or, for a bonus,
 -- spawned without it), so drop the DM's where the game would have once it lands.
-local function holdClear(key, pos)
+local function holdClear(key, pos, caught)
   local idx, at = room.idx, Vector(pos.X, pos.Y)
   Loading.hold(key, {
     label = CLEAR_MODE[room.type] == "bonus" and "what else you get" or "your reward",
     ask = function()
-      if room and room.idx == idx then requestClear("the room was cleared before the DM answered", 0, 10000) end
+      if room and room.idx == idx then
+        requestClear("the room was cleared before the DM answered", 0, 10000, next(caught.counts) and caught.counts or nil)
+      end
     end,
     apply = function()
       local res = Bridge.take(key)
       if not res then return end
       if curIdx() ~= idx then return Bridge.effect(key, { "not applied: the player left the room" }) end
-      Bridge.effect(key, Apply.roomClear(res.decision, at))
+      Bridge.effect(key, Apply.roomClear(res.decision, at, caught.counts))
+      Catcher.settle(caught, lostAfterClear(key))
     end,
-    giveUp = function() reportFallback("room_clear", key, true) end,
+    giveUp = function()
+      Catcher.settle(caught)                         -- stop swallowing: nobody will account for them
+      local n = Catcher.release(caught)              -- the DM never answered: the game's drops come back
+      if n > 0 then Bridge.effect(key, { "the DM never answered: " .. n .. " swallowed drop(s) returned" }) end
+      reportFallback("room_clear", key, true)
+    end,
   })
 end
 
@@ -364,11 +396,13 @@ local function checkLevelChange()
   if sig == levelSig then return false end
   levelSig = sig
   floorNo = floorNo + 1
-  itemQueues, itemSigs, layoutSends, fallbackSent = {}, {}, {}, {}
+  itemQueues, itemSigs, itemSends, layoutSends, fallbackSent = {}, {}, {}, {}, {}
   drawn, swaps, toHold = nil, {}, {}
   Bridge.forget("layout:" .. (floorNo - 1))
   Bridge.forget("clear:" .. (floorNo - 1))
   Bridge.forget("items:" .. (floorNo - 1))
+  Catcher.reset()
+  Payouts.onNewLevel(floorNo)
   Cons.onNewFloor(floorNo)
   State.onNewFloor()
   return true
@@ -385,9 +419,14 @@ function Sched.onNewRoom()
     layoutApplied = false, layoutKeys = {}, wasClear = r:IsClear(),
     hpSamples = {}, dps = 0, startHp = nil, clearSends = 0, clearReqAt = nil,
     lastProbe = 0, lastNeighbourRefresh = Isaac.GetTime(), poolsAsked = {}, lastSourceScan = 0,
+    clearReqSupp = 0, clearSeenFrame = nil,
   }
+  -- Drops the game scatters while this room's fight runs are swallowed and handed to its clear reward.
+  Catcher.arm(room.idx, cfg.CONTROL_DROPS and cfg.CONTROL_ROOM_CLEAR and eligibleClearRoom(room.type)
+                        and not r:IsClear() and Bridge.ready())
 
   -- 1. Dress this room: now if the DM already decided how, else once it has (the game waits).
+  local layoutHeld = false
   if room.firstVisit and cfg.CONTROL_ROOM_LAYOUT then
     local key = fkey("layout", room.idx)
     local res = Bridge.take(key)
@@ -397,8 +436,10 @@ function Sched.onNewRoom()
     elseif Bridge.ready() and eligibleLayoutRoom(room.type)
         and room.idx ~= game:GetLevel():GetStartingRoomIndex() then   -- the start room is never dressed
       holdLayout(key, desc)
+      layoutHeld = true                -- adopts the room's own pickups once the layout lands
     end
   end
+  if not layoutHeld then Catcher.adopt(Bridge) end
 
   -- 2. Ask about every unvisited room the player could walk into next.
   if Bridge.ready() then
@@ -508,11 +549,17 @@ function Sched.update()
         end
       elseif room.clearSends <= cfg.MAX_REFRESHES
           and t - room.clearReqAt >= cfg.REFRESH_MIN_MS
-          and State.materialHash() ~= room.clearReqHash
+          and (State.materialHash() ~= room.clearReqHash or Catcher.total() ~= room.clearReqSupp)
           and eta > Bridge.latencyP90() then      -- only if the fresh answer can still land
-        requestClear("refresh: player state changed", eta)
+        requestClear("refresh: player state or the swallowed drops changed", eta)
       end
     end
+  end
+
+  -- A room that cleared without a clear award (nothing fired): give back what was swallowed.
+  if Catcher.isOpen() and r:IsClear() then
+    room.clearSeenFrame = room.clearSeenFrame or game:GetFrameCount()
+    if game:GetFrameCount() - room.clearSeenFrame > 90 then Catcher.release(Catcher.close()) end
   end
 
   -- Boss dead: re-plan the next floor with the post-fight state.
@@ -531,18 +578,24 @@ function Sched.onCleanAward(rng, pos)
   Bridge.event("room_cleared", { room = room.idx, seconds = secs, hits = hits })
   local key = fkey("clear", room.idx)
   local res = Bridge.take(key)
+  -- The reward is decided now, but the last kill's fallout can land a frame or two late: keep
+  -- swallowing a little longer, unless the game's own award (a bonus room, no backend) is coming.
+  local trail = (res or Bridge.ready()) and CLEAR_MODE[room.type] ~= "bonus" and cfg.CLEAR_TRAIL_FRAMES or 0
+  local caught = Catcher.close(trail)
   if res then
-    Bridge.effect(key, Apply.roomClear(res.decision, pos))
+    Bridge.effect(key, Apply.roomClear(res.decision, pos, caught.counts))
+    Catcher.settle(caught, lostAfterClear(key))
   elseif Bridge.ready() then
-    holdClear(key, pos)                               -- not in yet: the game waits, the DM's drop comes after
+    holdClear(key, pos, caught)                       -- not in yet: the game waits, the DM's drop comes after
   else
-    return nil                                        -- no backend: the game's own award
+    Catcher.release(caught)                           -- no backend: the game's own award, and its drops
+    return nil
   end
   if CLEAR_MODE[room.type] == "bonus" then return nil end   -- the game still spawns its own award
-  -- Documented API bug: returning true stops the award seed advancing.
-  local level = game:GetLevel()
-  local desc = level:GetRoomDesc(level:GetCurrentRoomIndex())
-  desc.AwardSeed = rng:GetSeed()
+  -- Documented API bug: returning true stops the award seed advancing. Not every build exposes the
+  -- field, and a throw here would let the game's own award through, so never let it escape.
+  local desc = game:GetLevel():GetCurrentRoomDesc()
+  pcall(function() desc.AwardSeed = rng:GetSeed() end)
   return true
 end
 
@@ -593,14 +646,17 @@ end
 
 function Sched.resetRun()
   floorNo, levelSig, room, itemQueues, floorPlanUsed, floorPlanKey, reseeds = 0, nil, nil, {}, nil, nil, 0
-  itemSigs, layoutSends, fallbackSent, floorPlanAsked = {}, {}, {}, false
+  itemSigs, itemSends, layoutSends, fallbackSent, floorPlanAsked = {}, {}, {}, {}, false
   floorPlanFor, latePlan, drawn, swaps, toHold = nil, nil, nil, {}, {}
   floorItemsRequestedFor = -1
+  Catcher.reset()
+  Payouts.reset()
   Cons.resetRun()
 end
 
-function Sched.init(config, bridge, state, apply, taunt, cons, loading)
+function Sched.init(config, bridge, state, apply, taunt, cons, loading, catcher, payouts)
   cfg, Bridge, State, Apply, Taunt, Cons, Loading = config, bridge, state, apply, taunt, cons, loading
+  Catcher, Payouts = catcher, payouts
   POOL_FOR_ROOM = {}
   CONTROLLED_POOL = {}
   local function map(rt, pool)
@@ -635,6 +691,9 @@ function Sched.init(config, bridge, state, apply, taunt, cons, loading)
   source(SLOT_POOLS, 13, "POOL_BATTERY_BUM", "battery_bum")
   source(SLOT_POOLS, 16, "POOL_CRANE_GAME", "crane_game")
   source(SLOT_POOLS, 18, "POOL_ROTTEN_BEGGAR", "rotten_beggar")
+
+  Payouts.init(cfg, Bridge, State, Apply, Taunt, function(pool) return (nextItem(pool, true)) end,
+               SLOT_POOLS, PICKUP_POOLS)
 
   CLEAR_MODE = {}
   for name, mode in pairs({ ROOM_DEFAULT = "replace", ROOM_MINIBOSS = "replace", ROOM_CURSE = "replace",

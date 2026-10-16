@@ -324,7 +324,8 @@ def test_generosity_ledger_counts_applied_gifts_against_vanilla():
     g = m.digest()["generosity"]
     assert g["this_floor"] == {"room_clears": 2, "drop_rate": 0.5, "pickups_from_clears": 3,
                                "vanilla_pickups_for_these_clears": 1.0, "bait_pickups_placed": 2,
-                               "luck_given": 2, "tinted_rocks_added": 1, "chests_given": 1}
+                               "luck_given": 2, "tinted_rocks_added": 1, "chests_given": 1,
+                               "swallowed_drops": 0, "machine_and_chest_pickups": 0}
     assert "5 pickups over vanilla" in g["verdict"] and "no more lucky pennies" in g["verdict"]
 
     # A new floor starts a fresh tally; last floor and the run keep the history.
@@ -596,3 +597,18 @@ def test_reconfigure_swaps_models_mid_run_and_keeps_the_run():
     assert coord.late_grace_s == 1.5 and coord.gate is None
     assert coord.receipt.path == path and coord.memory.run_id == "R1"
     assert [m["ok"] for m in sent if m["t"] == "res"] == [True, True]
+
+
+def test_ledger_counts_swallowed_drops_as_the_vanilla_baseline():
+    from memory import RunMemory
+
+    m = RunMemory()
+    m.note_issued("clear:1:1", "room_clear", {"rewards": [{"reward": "key", "count": 1}],
+                                              "suppressed": {"half_heart": 2, "key": 1}})
+    m.note_issued("payout:1:9", "payout_plan", {"schedule": [{"reward": "penny", "count": 1},
+                                                             {"reward": "nothing", "count": 1}]})
+    m.on_applied("clear:1:1")
+    m.on_applied("payout:1:9")
+    g = m.digest()["generosity"]["this_floor"]
+    assert g["swallowed_drops"] == 3 and g["vanilla_pickups_for_these_clears"] == 3.5
+    assert g["machine_and_chest_pickups"] == 1

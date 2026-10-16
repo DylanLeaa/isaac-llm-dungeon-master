@@ -52,7 +52,7 @@ URGENT, NEXT_DOOR, BACKGROUND = 0, 1, 2
 def _priority(kind: str, ctx: dict) -> int:
     if kind == "room_clear":
         return URGENT
-    if kind == "room_layout":
+    if kind in ("room_layout", "payout_plan"):
         return NEXT_DOOR
     if kind == "item_choice" and ctx.get("reason") != "floor start":
         return NEXT_DOOR

@@ -45,6 +45,7 @@ backend at all, the run is plain vanilla.
 | `room_clear` (the drop; normal, miniboss and curse rooms. In boss rooms it is a bonus on top of the game's own award) | **estimated time-to-clear** (remaining enemy HP ÷ your recent DPS) < `1.4 × p90 latency + 400ms`, or the room is nearly dead | you get hit or pick something up and there's still time for a new answer | `MC_PRE_SPAWN_CLEAN_AWARD` (late: the game's award is skipped, held, and the DM's dropped after) |
 | `item_choice` (ranked real candidates from the pool) | floor start, and again when you stand next to a treasure/shop/boss/devil/ultra secret/… room; chest and beggar pools when one shows up in your room | — | `MC_PRE_GET_COLLECTIBLE` (also catches D6 rerolls; late: the pedestal is swapped once the ranking lands) |
 | `consumables` (next cards/runes, next trinkets, an effect per pill colour in play) | floor start | a pill colour the plan doesn't cover appears (held or on the floor), or the card/trinket queues run dry | `MC_GET_CARD`, `MC_GET_TRINKET` (late: the pickup is swapped), `MC_GET_PILL_EFFECT` (the pill button holds until it's covered) |
+| `payout_plan` (per beggar/machine/chest: what each paid use yields, or what the chest holds) | the machine or chest shows up in your room; again when a schedule is used up | - | `MC_POST_PICKUP_INIT`: the game's own payout beside it is cancelled and the scheduled outcome paid (even "nothing", even when the game wouldn't pay) |
 | `floor_plan` (curses, treasure distance) | you enter the boss room | boss dies | `MC_POST_CURSE_EVAL` of the next floor (late: curses changed once the plan lands) |
 
 The planners start when the first request of a new run, or of a new floor (`stage` and
@@ -256,8 +257,17 @@ caught per callback and printed once to the console/`log.txt`, and that event fa
   true room placement — `floor_plan` is the place to add it.
 - Room dressing only touches normal rooms (not shops, bosses, challenge rooms). Player 1 only.
   Greed mode is left vanilla. Golden pills stay random.
-- Beggars and machines: the DM picks *which item* they pay out, not *whether* they pay.
-- Chest contents other than items (the pickups inside) are still vanilla.
+- Beggars, machines and chests follow a per-instance `payout_plan` schedule (`dm/payouts.lua`). A "use"
+  is spotted by the player's coins/keys/bombs dropping beside a machine, and an opening by the chest
+  changing, so unusual machines (fortune teller, blood donation, confessional) are left to the game.
+- Enemy-death drops and natural spawns in rooms whose clear the DM decides are swallowed
+  (`dm/dropcatcher.lua`) and handed to the `room_clear` request as `suppressed_drops`; what the DM
+  doesn't put back shows as e.g. `-1 key (would have dropped, not replaced)` in the effect. They come
+  back at once if the DM never answers. `CONTROL_DROPS`, `DROPS_NATURAL` and `CONTROL_PAYOUTS` switch
+  these off. Other room types (shops, challenge rooms...) still drop as the game does.
+- How the game spawns those pickups (spawner, timing, slot animation) is classified, not guaranteed:
+  with `LOG_SPAWNS` on, each pickup spawn is reported to the backend as a `spawn_log` event so the
+  classification can be checked against a real run.
 - Enemy IDs are referenced by `EntityType` enum name, so anything missing on your version is skipped.
 
 ## Extending
@@ -265,5 +275,4 @@ caught per callback and printed once to the console/`log.txt`, and that event fa
 Add a decision kind in four places: a tool schema + clamp branch (`schemas.py`), a mock answer
 (`dm_agent.py`), a request trigger (`scheduler.lua`, or its own module like `consumables.lua`)
 and an applier (`apply.lua`). Good next ones: devil vs angel room (`Level:InitializeDevilAngelRoom`),
-random pickup variants everywhere (`MC_POST_PICKUP_SELECTION`), swapping layout enemies
-(`MC_PRE_ROOM_ENTITY_SPAWN`), chest pickup contents and beggar payouts.
+swapping layout enemies (`MC_PRE_ROOM_ENTITY_SPAWN`).

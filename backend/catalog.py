@@ -45,6 +45,8 @@ REWARDS = {
     "card": "the next card/rune in your consumables plan",
     "trinket": "the next trinket in your consumables plan", "battery": "lil battery",
 }
+# Outcomes a payout_plan entry may use besides a reward: stiff the player, or hand out a pool item.
+PAYOUT_OUTCOMES = ("nothing", "item")
 LOW_VALUE = {"penny", "half_heart", "pill"}
 LUCK = {"lucky_penny": 1}                   # permanent luck each reward gives
 CHESTS = {"chest", "locked_chest", "red_chest", "spiked_chest", "mimic_chest"}
@@ -60,7 +62,7 @@ HEARTS = {"red_heart", "half_heart", "soul_heart", "black_heart", "eternal_heart
 
 # What happens to pickups that are already part of the room layout.
 LAYOUT_PICKUP_MODES = {
-    "keep": "leave layout pickups alone",
+    "keep": "leave layout pickups be: in a room whose clear you decide they are held with its drops, and you choose what is put back",
     "remove": "delete every layout pickup",
     "to_pennies": "turn every layout pickup into a single penny",
     "to_bombs": "turn every layout pickup into bombs",

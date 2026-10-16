@@ -8,6 +8,16 @@ local game = Game()
 local Taunt -- set by Apply.init
 local ZERO = Vector(0, 0)
 
+-- True while the mod itself is spawning: the drop catcher and payout hooks must leave those alone.
+Apply.spawning = false
+local function spawn(...)
+  Apply.spawning = true
+  local ok, e = pcall(Isaac.Spawn, ...)
+  Apply.spawning = false
+  if not ok then error(e, 0) end
+  return e
+end
+
 local function E(tbl, name)
   local t = _G[tbl]
   return t and t[name]
@@ -114,7 +124,7 @@ local function spawnTrollBomb(pos)
   local v = E("BombVariant", "BOMB_TROLL")
   if not v then return end
   if not farFromPlayer(pos, 90) then pos = randomFreePos(140) end
-  Isaac.Spawn(EntityType.ENTITY_BOMB, v, 0, pos, ZERO, nil)
+  spawn(EntityType.ENTITY_BOMB, v, 0, pos, ZERO, nil)
   return true
 end
 
@@ -125,12 +135,70 @@ function Apply.spawnReward(name, pos)
   if kind ~= "pickup" then return false end
   local room = game:GetRoom()
   local at = room:FindFreePickupSpawnPosition(pos, 0, true)
-  Isaac.Spawn(EntityType.ENTITY_PICKUP, variant, subtype, at, ZERO, nil)
+  spawn(EntityType.ENTITY_PICKUP, variant, subtype, at, ZERO, nil)
   return true
 end
 
+--- Put back a pickup the drop catcher swallowed (or hand out a pool item): exact variant and subtype.
+function Apply.spawnPickup(variant, subtype, pos)
+  local at = game:GetRoom():FindFreePickupSpawnPosition(pos, 0, true)
+  spawn(EntityType.ENTITY_PICKUP, variant, subtype, at, ZERO, nil)
+end
+
+-- What the game would have dropped, named like the DM's reward menu. Exact match with a REWARDS
+-- entry first; anything else gets its pickup family ("heart", "coin", ...).
+local byKind
+local function rewardIndex()
+  if byKind then return byKind end
+  byKind = {}
+  for name in pairs(REWARDS) do
+    local kind, variant, subtype = resolve(name)
+    if kind == "pickup" and subtype ~= 0 then byKind[variant .. ":" .. subtype] = name end
+  end
+  return byKind
+end
+
+local FAMILY_OF = {}
+for _, n in ipairs({ "penny", "double_penny", "nickel", "dime", "lucky_penny", "sticky_nickel" }) do FAMILY_OF[n] = "coin" end
+for _, n in ipairs({ "bomb", "double_bomb", "golden_bomb" }) do FAMILY_OF[n] = "bomb" end
+for _, n in ipairs({ "key", "double_key", "golden_key", "charged_key" }) do FAMILY_OF[n] = "key" end
+for _, n in ipairs({ "red_heart", "half_heart", "soul_heart", "black_heart", "eternal_heart" }) do FAMILY_OF[n] = "heart" end
+local function family(name) return FAMILY_OF[name] or name end
+
+local VARIANT_LABEL = { PICKUP_HEART = "heart", PICKUP_COIN = "coin", PICKUP_KEY = "key", PICKUP_BOMB = "bomb",
+                        PICKUP_TAROTCARD = "card", PICKUP_PILL = "pill", PICKUP_TRINKET = "trinket",
+                        PICKUP_LIL_BATTERY = "battery", PICKUP_GRAB_BAG = "grab_bag" }
+function Apply.rewardNameFor(variant, subtype)
+  local exact = rewardIndex()[variant .. ":" .. subtype]
+  if exact then return exact end
+  for k, label in pairs(VARIANT_LABEL) do
+    if PickupVariant[k] == variant then return label end
+  end
+  return "pickup"
+end
+
+-- What the DM's rewards leave uncovered of the drops the game would have made: a heart of any kind
+-- replaces a heart, a coin a coin. {name = n}, a list of lines like "-1 key (...)".
+local function shortfall(suppressed, rewards)
+  local have, names, out = {}, {}, {}
+  for _, r in ipairs(rewards or {}) do
+    local f = family(r.reward)
+    have[f] = (have[f] or 0) + math.max(1, math.min(4, tonumber(r.count) or 1))
+  end
+  for name in pairs(suppressed) do names[#names + 1] = name end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local f, lost = family(name), suppressed[name]
+    local covered = math.min(lost, have[f] or 0)
+    have[f] = (have[f] or 0) - covered
+    lost = lost - covered
+    if lost > 0 then out[#out + 1] = count("-", lost, name) .. " (would have dropped, not replaced)" end
+  end
+  return out
+end
+
 -- --------------------------------------------------------------- room clear
-function Apply.roomClear(decision, pos)
+function Apply.roomClear(decision, pos, suppressed)
   local effect = {}
   for _, r in ipairs(decision.rewards or {}) do
     local n = 0
@@ -141,6 +209,7 @@ function Apply.roomClear(decision, pos)
   end
   Taunt.show(decision.taunt)
   if #effect == 0 then effect[1] = "nothing dropped" end
+  for _, line in ipairs(shortfall(suppressed or {}, decision.rewards)) do effect[#effect + 1] = line end
   return effect
 end
 
@@ -267,7 +336,7 @@ local function enemies(decision, rng)
     if etype then
       local n = math.max(1, math.min(3, tonumber(spec.count) or 1))
       for _ = 1, n do
-        Isaac.Spawn(etype, tonumber(spec.variant) or 0, 0, randomFreePos(160), ZERO, nil)
+        spawn(etype, tonumber(spec.variant) or 0, 0, randomFreePos(160), ZERO, nil)
       end
       out[#out + 1] = count("+", n, spec.key or spec.etype) .. " spawned"
     end

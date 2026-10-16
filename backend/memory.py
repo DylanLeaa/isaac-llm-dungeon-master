@@ -58,7 +58,7 @@ class RunMemory:
         # Only schemes the game acted on are real plans; re-asks and unused answers are noise.
         _append_unique(self.schemes, d.get("scheme"))
         c = self.counters
-        if kind in ("room_clear", "room_layout"):
+        if kind in ("room_clear", "room_layout", "payout_plan"):
             for g in (self.gen_floor, self.gen_run):
                 _count_gifts(g, kind, d)
         if kind == "room_clear":
@@ -86,6 +86,9 @@ class RunMemory:
             if d.get("bonus_pickups"):
                 bits.append("bait:" + ",".join(d["bonus_pickups"]))
             self.events.append("room dressed: " + ("; ".join(bits) or "untouched"))
+        elif kind == "payout_plan":
+            got = ", ".join(f'{r["count"]}x {r["reward"]}' for r in d.get("schedule", [])) or "vanilla"
+            self.events.append(f"payout schedule fixed for a machine/chest: {got}")
         elif kind == "item_choice":
             self.events.append(f'item handed out from ranked list (top={d.get("order", ["?"])[0]})')
         elif kind == "floor_plan":
@@ -115,6 +118,8 @@ class RunMemory:
             self.events.append(f'{data.get("look")} pills are now {data.get("effect")} for the run ({who})')
         elif name in ("card_drawn", "trinket_drawn"):
             self.events.append(f'{name.split("_")[0]} handed out: {data.get("name")}')
+        elif name == "spawn_log":
+            pass                                  # diagnostics for the receipt, not for the DM's memory
         elif name == "death":
             self.events.append("PLAYER DIED")
         else:
@@ -143,7 +148,7 @@ class RunMemory:
 
 def _new_gen() -> dict[str, int]:
     return {"clears": 0, "clears_with_drop": 0, "clear_pickups": 0, "bait_pickups": 0,
-            "luck": 0, "tinted_rocks": 0, "chests": 0}
+            "luck": 0, "tinted_rocks": 0, "chests": 0, "swallowed": 0, "payout_pickups": 0}
 
 
 def _count_gifts(g: dict[str, int], kind: str, d: dict) -> None:
@@ -154,6 +159,11 @@ def _count_gifts(g: dict[str, int], kind: str, d: dict) -> None:
         g["clears"] += 1
         g["clears_with_drop"] += int(n > 0)
         g["clear_pickups"] += n
+        g["swallowed"] += sum((d.get("suppressed") or {}).values())
+    elif kind == "payout_plan":
+        given = [(r["reward"], int(r.get("count", 1))) for r in d.get("schedule", [])
+                 if r.get("reward") not in ("nothing", "item")]
+        g["payout_pickups"] += sum(c for _, c in given)
     else:
         given = [(r, 1) for r in d.get("bonus_pickups", [])]
         g["bait_pickups"] += len(given)
@@ -168,7 +178,10 @@ def _gen_view(g: dict[str, int]) -> dict:
         "room_clears": c,
         "drop_rate": round(g["clears_with_drop"] / c, 2) if c else None,
         "pickups_from_clears": g["clear_pickups"],
-        "vanilla_pickups_for_these_clears": round(c * VANILLA_PICKUPS_PER_CLEAR, 1),
+        # vanilla's clear award, plus the enemy-death and natural drops the engine swallowed
+        "vanilla_pickups_for_these_clears": round(c * VANILLA_PICKUPS_PER_CLEAR + g["swallowed"], 1),
+        "swallowed_drops": g["swallowed"],
+        "machine_and_chest_pickups": g["payout_pickups"],
         "bait_pickups_placed": g["bait_pickups"],
         "luck_given": g["luck"],
         "tinted_rocks_added": g["tinted_rocks"],
@@ -180,7 +193,7 @@ def _verdict(floor: dict[str, int], run: dict[str, int]) -> str:
     """Plain-language read of the tallies, so the model doesn't have to do the arithmetic."""
     # Every placed pickup and added tinted rock (loot inside) is on top of what vanilla drops.
     given = floor["clear_pickups"] + floor["bait_pickups"] + floor["tinted_rocks"]
-    excess = given - floor["clears"] * VANILLA_PICKUPS_PER_CLEAR
+    excess = given - (floor["clears"] * VANILLA_PICKUPS_PER_CLEAR + floor["swallowed"])
     if excess >= 3:
         out = f"this floor: {excess:.0f} pickups over vanilla - let the next clears drop nothing"
     elif excess >= 1:

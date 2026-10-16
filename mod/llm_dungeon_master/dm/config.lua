@@ -15,6 +15,11 @@ return {
   CONTROL_ITEMS       = true,
   CONTROL_FLOOR       = true,
   CONTROL_CONSUMABLES = true,   -- which cards/trinkets drop, what each pill colour does
+  CONTROL_PAYOUTS     = true,   -- what each beggar / machine use and each chest pays out (a fixed schedule)
+  CONTROL_DROPS       = true,   -- enemy-death drops are swallowed and handed to the room-clear decision
+  DROPS_NATURAL       = true,   -- ...and so are other unowned pickups spawned mid-fight (rock loot, etc.)
+  CLEAR_TRAIL_FRAMES  = 6,      -- ...and for this many frames after the clear (the last kill's fallout)
+  LOG_SPAWNS          = true,   -- tell the backend how each pickup spawn was classified (capped per run)
 
   -- Re-roll the floor (console `reseed`) until the treasure room distance matches the
   -- DM's preference. Uses a console command, which disables achievements for the run.
@@ -34,10 +39,13 @@ return {
   -- Hard cap on room_layout requests per room per floor (first ask + refreshes). A room the
   -- player keeps walking past is only re-asked when their state changed since the last ask.
   MAX_LAYOUT_SENDS = 3,
+  MAX_ITEM_SENDS = 3,      -- item_choice requests per pool per floor (re-asked when the player's state changes)
   ITEM_CANDIDATES = 6,
   TRINKET_CANDIDATES = 8,
   -- consumables requests per floor (floor start + re-asks for new pill colours / empty queues)
   MAX_CONSUMABLE_SENDS = 4,
+  -- payout_plan requests per machine (first ask + re-asks once its schedule is used up)
+  MAX_PAYOUT_SENDS = 4,
 
   -- Characters per line in Mod Config Menu > DM Settings > Last run. Lower it if lines get cut off.
   MENU_WIDTH = 32,

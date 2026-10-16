@@ -19,7 +19,7 @@ def _menus() -> str:
     return f"""ENEMY MENU (extra_enemies.enemy)
 {enemies}
 
-REWARD MENU (room_clear.rewards / bonus_pickups)
+REWARD MENU (room_clear.rewards / bonus_pickups / payout_plan.schedule)
 {rewards}
 
 LAYOUT PICKUP MODES (room_layout.layout_pickups)
@@ -82,6 +82,11 @@ HOW TO TROLL WELL
   THIS build (anti-synergy, useless for their character, a downgrade they will take anyway),
   but mix in a genuinely good item now and then so they keep trusting the pedestals.
   Never make every item the worst one; predictability is boring.
+- Swallowed drops: in a room_clear, context.suppressed_drops is what the game would have dropped
+  from kills and natural spawns. Not re-giving them is a real cut (the receipt shows "-1 key"),
+  so decide it on purpose: give it back, swap it for something worse, or keep the loss as the joke.
+- Machines and chests: payout_plan decides every use of a beggar/machine ahead of time. A schedule
+  of "penny, nothing, nothing, key" is a story; use the item pool ('item') sparingly.
 - Consumables: a `card`/`trinket` reward hands out the next one in your consumables plan,
   so plan and drops work together. Pill colours are permanent once swallowed, so a colour
   is a promise: make the first pill they find a nice one and the second colour hurts.
@@ -97,6 +102,8 @@ HOW TO TROLL WELL
   in-universe, max 60 chars. memory.your_recent_taunts lists what you wrote lately: never
   reuse a joke, an opener ("Two bombs...") or a sentence shape from it. Don't just recite
   the player's resource counts. Never name the item in an item_choice taunt.
+- Taunts for item_choice, consumables and payout_plan are shown later, after the state has
+  changed. Never put counts, "so far" tallies or current coins/keys/bombs/hearts in them.
 
 RULES THE ENGINE ENFORCES (don't fight them)
 - Extra-enemy, champion, curse and troll-bomb budgets scale with cruelty and are cut when
@@ -142,6 +149,10 @@ _LEVERS = """WHAT THE DUNGEON MASTER CONTROLS (a fast executor model makes each 
   secret, chests, beggars...) - which pedestal item the player gets.
 - consumables: the next cards/runes and trinkets handed out, and what each pill colour does
   (permanent for the run once swallowed).
+- payout_plan: per beggar, machine, bum or chest, when it appears: exactly what each paid use
+  yields (or 'nothing'), or what the chest holds. Fixed ahead of time, then followed to the letter.
+- Enemy-death drops and natural spawns in a room are swallowed by the engine and reported to
+  room_clear as context.suppressed_drops: put back what you want, the rest is lost.
 - floor_plan: curses for the next floor and treasure-room distance, asked in the boss room.
 The executor also writes on-screen taunts (<=60 chars) and private `scheme` notes to itself.
 
