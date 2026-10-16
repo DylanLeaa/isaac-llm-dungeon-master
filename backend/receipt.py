@@ -33,7 +33,7 @@ class Receipt:
     def __init__(self, directory: Path | None = None, keep_full: bool = False) -> None:
         self.dir = directory
         self.keep_full = keep_full                # also hold every whole entry and prompt (the app's views)
-        # Told ("run", {run, fresh, path}), ("entry", entry), ("update", {seq, status}) and
+        # Told ("run", {run, fresh, path}), ("entry", entry), ("update", {seq, status, ts}) and
         # ("effect", {seq, effect}): the app mirrors the run.
         self.listener: Callable[[str, dict], None] | None = None
         self.source: Path | None = None           # the file load() read
@@ -87,7 +87,7 @@ class Receipt:
             elif rec.get("type") == "entry":
                 self._ingest(rec)
             elif rec.get("type") == "update":
-                self._apply_update(rec.get("ref"), rec.get("status"))
+                self._apply_update(rec.get("ref"), rec.get("status"), rec.get("ts"))
             elif rec.get("type") == "effect":
                 self._apply_effect(rec.get("ref"), rec.get("effect"))
         if self.seq and self.source is None:
@@ -110,9 +110,10 @@ class Receipt:
         """A later outcome for entry `seq` (applied, replaced). False if there is no such entry."""
         if seq is None or seq not in self.status:
             return False
-        self._write({"type": "update", "ref": seq, "status": status, "ts": round(time.time(), 3)})
-        self._apply_update(seq, status)
-        self._tell("update", {"seq": seq, "status": status})
+        ts = round(time.time(), 3)
+        self._write({"type": "update", "ref": seq, "status": status, "ts": ts})
+        self._apply_update(seq, status, ts)
+        self._tell("update", {"seq": seq, "status": status, "ts": ts})
         return True
 
     def add_effect(self, seq: int | None, lines: Any) -> bool:
@@ -187,16 +188,18 @@ class Receipt:
         """The latest run narrative and floor brief (with its floor) written into this run's file."""
         return self.saved_narrative, self.saved_brief
 
-    def apply_update(self, seq, status) -> bool:
+    def apply_update(self, seq, status, ts=None) -> bool:
         """A later outcome recorded elsewhere. False if there is no such entry."""
-        return self._apply_update(seq, status)
+        return self._apply_update(seq, status, ts)
 
-    def _apply_update(self, seq, status) -> bool:
+    def _apply_update(self, seq, status, ts=None) -> bool:
         if seq not in self.status or not status:
             return False
         self.status[seq] = status
         if self.keep_full and seq in self.full:
             self.full[seq]["status"] = status
+            if status == "applied" and ts and "applied_ts" not in self.full[seq]:
+                self.full[seq]["applied_ts"] = ts     # when the game first used it
         return True
 
     def apply_effect(self, seq, lines) -> bool:
@@ -276,6 +279,8 @@ def compact(entry: dict) -> dict:
     u = llm.get("usage") or {}
     c = {"seq": entry["seq"], "time": time.strftime("%H:%M:%S", time.localtime(entry.get("ts", 0))),
          "what": entry["what"], "status": entry["status"]}
+    if entry.get("applied_ts"):
+        c["applied_time"] = time.strftime("%H:%M:%S", time.localtime(entry["applied_ts"]))
     for k in ("key", "ms", "intent", "taunt", "scheme", "result", "error"):
         if entry.get(k) not in (None, "", []):
             c[k] = entry[k]

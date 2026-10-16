@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "LLM Dungeon Master"
-DEFAULTS = {"openrouter_api_key": "", "use_claude_code": False}
+DEFAULTS = {"openrouter_api_key": "", "use_claude_code": False, "spoiler_mode": False}
 
 
 def frozen() -> bool:
