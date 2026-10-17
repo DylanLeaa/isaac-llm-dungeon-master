@@ -96,7 +96,13 @@ Changes apply to the running DM straight away, mid-run included. The window has 
   effect, the selected entry
   in full, and the run narrative and floor brief.
 - **History**: every past run's receipt in the same view.
-- **Settings**: the key and the Claude Code switch, plus the files the backend found.
+- **Settings**: the key, the Claude Code switch, the models, and the files the backend found. **Models** picks
+  three models from OpenRouter's live list, with their prices. **Major** writes the run narrative and floor briefs,
+  **Minor** makes every decision (only tool-capable models are listed), and the **re-ask gate** uses one of
+  OpenRouter's typed-decisions models. The list is sorted by intelligence (the Artificial Analysis index) by default.
+  Click a column heading to sort by it, and filter by name, provider, or scored models only. With Claude Code on,
+  its models are pinned to the top of the Major and Minor lists, so either role can run there. **Default** goes back
+  to Haiku / Sonnet / Mercury. The list is cached in `models.json`, so the pickers work offline.
 - **Log**: what the console used to show.
 
 The header shows whether the game is connected. Errors show in a dialog and the Log tab, and are
