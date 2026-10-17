@@ -560,35 +560,48 @@ class Engine:
 
 
 def build_dm(backend: str, api_key: str, *, cruelty: int, model: str | None = None,
-             narrative_model: str | None = None, floor_model: str | None = None,
+             narrative_model: str | None = None, floor_model: str | None = None, planner_backend: str | None = None,
              gate_model: str = GATE_DEFAULT_MODEL, gate_threshold: float = GATE_THRESHOLD, no_gate: bool = False,
              no_planners: bool = False, claude_bin: str | None = None,
              mock_latency: tuple[float, float] = (0.25, 1.2)) -> Engine:
-    """The DM, planners and gate for a backend: "openrouter", "claude-code" or "mock".
+    """The DM, planners and gate for a backend: "openrouter", "claude-code" or "mock". The planners can run
+    on another backend than the DM (planner_backend, default the DM's).
     ValueError, with a message for the player, when it can't be set up."""
     if backend == "mock":
         return Engine(MockDM(cruelty, latency=mock_latency), None if no_planners else MockPlanner(),
                       None if no_gate else MockGate(), label="MOCK (offline)")
+    planner_backend = planner_backend or backend
+    if not api_key and "openrouter" in (backend, None if no_planners else planner_backend):
+        raise ValueError("No OpenRouter API key: add one, or use Claude Code instead.")
+    try:
+        dm, model = _make_dm(backend, model, cruelty, api_key, claude_bin)
+        planner = None if no_planners else _make_planner(planner_backend, narrative_model, floor_model, api_key,
+                                                         claude_bin)
+    except SystemExit as e:                       # find_claude's message, for the CLI
+        raise ValueError(str(e)) from None
+    # The gate isn't a Claude model: it stays on OpenRouter, when there's a key for it.
+    gate = OpenRouterGate(gate_model, gate_threshold, api_key=api_key) if api_key and not no_gate else None
     if backend == "claude-code":
-        try:
-            model = model or CLAUDE_CODE_DM_MODEL
-            dm = ClaudeCodeDM(cruelty, model=model, claude_bin=claude_bin)
-            planner = None if no_planners else ClaudeCodePlanner(
-                narrative_model or CLAUDE_CODE_PLANNER_MODEL, floor_model or CLAUDE_CODE_PLANNER_MODEL,
-                claude_bin=claude_bin)
-        except SystemExit as e:                   # find_claude's message, for the CLI
-            raise ValueError(str(e)) from None
-        # The gate isn't a Claude model: it stays on OpenRouter, when there's a key for it.
-        gate = OpenRouterGate(gate_model, gate_threshold, api_key=api_key) if api_key and not no_gate else None
         return Engine(dm, planner, gate, CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_LATE_GRACE_S,
                       f"{model} via Claude Code ({dm.runner.bin})")
-    if not api_key:
-        raise ValueError("No OpenRouter API key: add one, or use Claude Code instead.")
+    return Engine(dm, planner, gate, label=f"{model} via OpenRouter")
+
+
+def _make_dm(backend: str, model: str | None, cruelty: int, api_key: str, claude_bin: str | None):
+    if backend == "claude-code":
+        model = model or CLAUDE_CODE_DM_MODEL
+        return ClaudeCodeDM(cruelty, model=model, claude_bin=claude_bin), model
     model = model or OPENROUTER_DEFAULT_MODEL
-    planner = None if no_planners else OpenRouterPlanner(
-        narrative_model or NARRATIVE_DEFAULT_MODEL, floor_model or FLOOR_DEFAULT_MODEL, api_key=api_key)
-    gate = None if no_gate else OpenRouterGate(gate_model, gate_threshold, api_key=api_key)
-    return Engine(OpenRouterDM(cruelty, model=model, api_key=api_key), planner, gate, label=f"{model} via OpenRouter")
+    return OpenRouterDM(cruelty, model=model, api_key=api_key), model
+
+
+def _make_planner(backend: str, narrative_model: str | None, floor_model: str | None, api_key: str,
+                  claude_bin: str | None):
+    if backend == "claude-code":
+        return ClaudeCodePlanner(narrative_model or CLAUDE_CODE_PLANNER_MODEL,
+                                 floor_model or CLAUDE_CODE_PLANNER_MODEL, claude_bin=claude_bin)
+    return OpenRouterPlanner(narrative_model or NARRATIVE_DEFAULT_MODEL, floor_model or FLOOR_DEFAULT_MODEL,
+                             api_key=api_key)
 
 
 def main() -> None:

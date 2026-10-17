@@ -3,7 +3,7 @@
 The same backend as server.py, with a window instead of a console:
   Current run   what the DM is doing this run: its bill, its work, every decision, its plans
   History       every past run's receipt
-  Settings      OpenRouter key or Claude Code, applied to the running DM straight away
+  Settings      OpenRouter key or Claude Code and the models, applied to the running DM straight away
   Log           what the console used to show
 
 Settings live in %APPDATA%/LLM Dungeon Master/config.json, the backend's log next to them.
@@ -34,6 +34,7 @@ from tkinter import messagebox, ttk
 import appdata
 import bridge
 import epilogue
+import model_catalog
 import receipt as receipts
 from claude_code import find_claude
 from receipt import Receipt
@@ -393,10 +394,178 @@ class RunView(ttk.Frame):
         set_text(self.plan_text, "\n\n\n".join(plan) or "No plans in this receipt (planners off, or not written yet).")
 
 
+def engine_text(engine: Engine) -> str:
+    """Who plays the DM, for the header: "DM: <model> via <backend>  |  planners: <model>"."""
+    text = "DM: " + engine.label.split(" (")[0]
+    if engine.planner:
+        text += f"  |  planners: {engine.planner.narrative_model}"
+    return text
+
+
 def _k(n: int) -> str:
     if n >= 1_000_000:
         return f"{n / 1_000_000:.2f}M"
     return f"{n / 1000:.1f}k" if n >= 10_000 else str(n)
+
+
+# ====================================================================== the model picker
+ROLE_NAMES = {"major": "Major", "minor": "Minor", "gate": "Re-ask gate"}
+PICKER_TITLES = {"major": "Major model: the run narrative and floor briefs",
+                 "minor": "Minor model: every decision the DM makes",
+                 "gate": "Re-ask gate model"}
+PICKER_HINTS = {
+    "major": "Called once per run and once per floor: it can afford to be slow and clever.",
+    "minor": "Only models that can be made to call a tool. Every decision is needed within seconds: models that "
+             "always reason are slower, and can run out of room (1024 tokens) before they answer.",
+    "gate": "OpenRouter's typed-decisions models: one yes/no answer, as a probability. They have no intelligence "
+            "score, so they're listed newest first.",
+}
+PINNED = "#d6a8ff"
+
+
+class ModelPicker(tk.Toplevel):
+    """Every model a role can use: filter, sort by any column (intelligence first), pick one.
+    Claude Code's models, when it's on, are pinned to the top whatever the sort."""
+
+    COLUMNS = (("name", "Model", 270), ("id", "ID", 250), ("intelligence", "Intelligence", 95),
+               ("prompt", "Input $/M", 85), ("completion", "Output $/M", 90), ("cache_read", "Cached $/M", 90),
+               ("context", "Context", 75), ("reasoning", "Reasoning", 80))
+    NUMERIC = ("intelligence", "prompt", "completion", "cache_read", "context")
+
+    def __init__(self, master, role: str, pinned: list, rows: list, current: str, on_pick) -> None:
+        super().__init__(master)
+        self.pinned, self.rows, self.current, self.on_pick = pinned, rows, current, on_pick
+        self.by_value = {m.value: m for m in pinned + rows}
+        scored = any(m.intelligence is not None for m in rows)
+        self.sort_key, self.desc = ("intelligence", True) if scored else ("created", True)
+        self.title(PICKER_TITLES[role])
+        self.transient(master)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{min(1180, sw - 80)}x{min(700, sh - 120)}")
+        self.minsize(760, 420)
+
+        body = ttk.Frame(self, padding=(14, 12))
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=PICKER_HINTS[role], foreground=MUTED, wraplength=1000, justify="left").pack(
+            anchor="w", pady=(0, 8))
+
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(bar, text="Search").pack(side="left")
+        self.query = tk.StringVar()
+        search = ttk.Entry(bar, textvariable=self.query, width=32)
+        search.pack(side="left", padx=(6, 14))
+        self.query.trace_add("write", lambda *_: self._fill())
+        self.author = tk.StringVar(value="All providers")
+        box = ttk.Combobox(bar, textvariable=self.author, state="readonly", width=22,
+                           values=["All providers", *sorted({m.author for m in pinned + rows})])
+        box.pack(side="left")
+        box.bind("<<ComboboxSelected>>", lambda _e: self._fill())
+        self.scored = tk.BooleanVar(value=False)
+        if scored:
+            ttk.Checkbutton(bar, text="Only models with an intelligence score", variable=self.scored,
+                            command=self._fill).pack(side="left", padx=14)
+        self.count = ttk.Label(bar, text="", foreground=MUTED)
+        self.count.pack(side="right")
+
+        table = ttk.Frame(body)
+        table.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(table, columns=[c[0] for c in self.COLUMNS], show="headings", selectmode="browse")
+        for key, label, width in self.COLUMNS:
+            self.tree.heading(key, text=label, command=lambda k=key: self._sort(k))
+            self.tree.column(key, width=width, stretch=key in ("name", "id"),
+                             anchor="e" if key in self.NUMERIC else "w")
+        if not scored:                            # the gate's decisions models: no score, priced on input only
+            self.tree.configure(displaycolumns=[c[0] for c in self.COLUMNS
+                                                if c[0] not in ("intelligence", "completion", "reasoning")])
+        self.tree.tag_configure("pinned", foreground=PINNED)
+        self.tree.tag_configure("current", foreground=GOOD)
+        bar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=bar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._show_selected())
+        self.tree.bind("<Double-1>", lambda _e: self._use())
+
+        self.about = ttk.Label(body, text="", foreground=MUTED, wraplength=1000, justify="left")
+        self.about.pack(fill="x", pady=(8, 0))
+        self.about.bind("<Configure>", lambda e: self.about.configure(wraplength=max(300, e.width - 8)))
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="Use this model", style="Accent.TButton", command=self._use).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left", padx=8)
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.bind("<Return>", lambda _e: self._use())
+
+        self._fill()
+        if self.tree.exists(current):
+            self.tree.selection_set(current)
+            self.after(100, self._reveal_current)
+        windows_look(self)
+        search.focus_set()
+        try:
+            self.grab_set()                       # modal, while it's open
+        except tk.TclError:
+            pass
+
+    def _reveal_current(self) -> None:
+        """Scroll to the current pick, only if it's out of sight (so the pinned rows stay in view)."""
+        if self.tree.exists(self.current) and not self.tree.bbox(self.current):
+            self.tree.see(self.current)
+
+    def _sort(self, key: str) -> None:
+        """Click a heading to sort by it, again to reverse. Scores and context high first, the rest low first."""
+        if key == self.sort_key:
+            self.desc = not self.desc
+        else:
+            self.sort_key, self.desc = key, key in ("intelligence", "context")
+        self._fill()
+
+    def _fill(self) -> None:
+        q = self.query.get()
+        author = "" if self.author.get() == "All providers" else self.author.get()
+        pinned = model_catalog.filter_rows(self.pinned, q, author, self.scored.get())
+        rows = model_catalog.sort_rows(model_catalog.filter_rows(self.rows, q, author, self.scored.get()),
+                                       self.sort_key, self.desc)
+        selected = self.tree.selection()
+        self.tree.delete(*self.tree.get_children())
+        for m in pinned + rows:
+            tags = ("current",) if m.value == self.current else ("pinned",) if m.backend == "claude-code" else ()
+            self.tree.insert("", "end", iid=m.value, values=self._row(m), tags=tags)
+        for key, label, _width in self.COLUMNS:
+            arrow = (" ▼" if self.desc else " ▲") if key == self.sort_key else ""
+            self.tree.heading(key, text=label + arrow)
+        if selected and self.tree.exists(selected[0]):
+            self.tree.selection_set(selected[0])
+        self.count.configure(text=f"{len(pinned) + len(rows)} of {len(self.pinned) + len(self.rows)} models")
+
+    @staticmethod
+    def _row(m: model_catalog.ModelInfo) -> tuple:
+        price = model_catalog.price
+        if m.backend == "claude-code":
+            prices = ("your plan",) * 3
+        else:
+            prices = (price(m.prompt), price(m.completion), price(m.cache_read))
+        if not m.context:
+            context = "-"
+        elif m.context >= 1_000_000:
+            context = f"{m.context / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+        else:
+            context = f"{m.context // 1000}K"
+        score = "-" if m.intelligence is None else f"{m.intelligence:g}"
+        return (m.name, m.id, score, *prices, context, m.reasoning or "-")
+
+    def _show_selected(self) -> None:
+        sel = self.tree.selection()
+        m = self.by_value.get(sel[0]) if sel else None
+        text = m.description if m else ""
+        self.about.configure(text=text[:600] + ("..." if len(text) > 600 else ""))
+
+    def _use(self) -> None:
+        sel = self.tree.selection()
+        if sel:
+            self.on_pick(sel[0])
+            self.destroy()
 
 
 # ====================================================================== the window
@@ -412,6 +581,12 @@ class App:
         self.current = Receipt(None, keep_full=True)
         self.dirty = False
         self.history_rows: dict[str, Path] = {}
+        # The model pickers: OpenRouter's catalogue (cached, refreshed in the background) and the unsaved picks.
+        self.catalog_raw = model_catalog.load_cache()
+        self.catalog = model_catalog.parse(self.catalog_raw)
+        self.catalog_error: str | None = None
+        self.fetching = False
+        self.model_picks = {role: self.cfg.get(f"{role}_model", "") for role in model_catalog.ROLES}
 
         root.title("LLM Dungeon Master")
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -428,6 +603,7 @@ class App:
         self._settings_tab()
         self._log_tab()
         root.protocol("WM_DELETE_WINDOW", self.close)
+        self.refresh_models()
 
         self.start_dm(first=True)
         self.refresh_history()
@@ -474,8 +650,11 @@ class App:
     def _engine(self, cfg: dict) -> Engine:
         if self.args.mock:
             return build_dm("mock", "", cruelty=DEFAULT_CRUELTY)
-        backend = "claude-code" if cfg.get("use_claude_code") else "openrouter"
-        return build_dm(backend, appdata.api_key(cfg), cruelty=DEFAULT_CRUELTY)
+        dm_backend, dm_model = model_catalog.resolve(cfg, "minor")
+        planner_backend, planner_model = model_catalog.resolve(cfg, "major")
+        return build_dm(dm_backend, appdata.api_key(cfg), cruelty=DEFAULT_CRUELTY, model=dm_model,
+                        planner_backend=planner_backend, narrative_model=planner_model, floor_model=planner_model,
+                        gate_model=model_catalog.resolve(cfg, "gate")[1])
 
     def start_dm(self, first: bool = False) -> None:
         try:
@@ -513,7 +692,7 @@ class App:
                 self.current = Receipt(None, keep_full=True)
                 self.run_view.show(None)
         if dm is not None:
-            self.dm_label.configure(text="DM: " + dm.engine.label.split(" (")[0])
+            self.dm_label.configure(text=engine_text(dm.engine))
         crashed = dm is not None and not dm.alive()
         if crashed and not self.restart.winfo_ismapped():
             self.restart.pack(side="left", padx=12)
@@ -640,9 +819,25 @@ class App:
 
     # ------------------------------------------------------------ settings
     def _settings_tab(self) -> None:
-        tab = ttk.Frame(self.tabs, padding=(20, 16))
-        self.settings = tab
-        self.tabs.add(tab, text="  Settings  ")
+        # Taller than the window can be: the page scrolls.
+        outer = ttk.Frame(self.tabs)
+        self.settings = outer
+        self.tabs.add(outer, text="  Settings  ")
+        canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0, bg=self.bg)
+        bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        tab = ttk.Frame(canvas, padding=(20, 16))
+        page = canvas.create_window(0, 0, window=tab, anchor="nw")
+        tab.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(page, width=e.width))
+
+        def wheel(e) -> None:
+            if str(e.widget).startswith(str(outer)) and canvas.yview() != (0.0, 1.0):
+                canvas.yview_scroll(int(-e.delta / 120), "units")
+        outer.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", wheel))
+        outer.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
 
         ttk.Label(tab, text="Who plays the Dungeon Master", style="Title.TLabel").pack(anchor="w")
         ttk.Label(tab, text="Changes apply to the running DM straight away: a run in progress carries on.",
@@ -663,7 +858,7 @@ class App:
         link.bind("<Button-1>", lambda _e: webbrowser.open(KEYS_URL))
         env = " (OPENROUTER_API_KEY is set in your environment: it's used while this is blank)" \
             if os.environ.get("OPENROUTER_API_KEY") else ""
-        ttk.Label(box, text="Pays for the DM (Claude Haiku) and its planners, usually a few cents a run." + env,
+        ttk.Label(box, text="Pays for the models below, a few cents a run with the defaults." + env,
                   foreground=MUTED).grid(row=2, column=1, sticky="w", padx=8, pady=(2, 0))
         box.columnconfigure(1, weight=1)
 
@@ -672,12 +867,35 @@ class App:
         self.cc_var = tk.BooleanVar(value=bool(self.cfg.get("use_claude_code")))
         ttk.Checkbutton(box, text="Use Claude Code instead of OpenRouter", variable=self.cc_var,
                         style="Switch.TCheckbutton", command=self._claude_status).pack(anchor="w")
-        ttk.Label(box, text="Every DM call runs through your own signed-in Claude Code (claude -p), billed to "
-                            "your Claude plan. Slower than OpenRouter.\nThe OpenRouter key is then optional: "
-                            "if set, it only runs the small model that skips needless re-asks.",
+        ttk.Label(box, text="Adds Claude Code's models to the top of the Major and Minor pickers below (the "
+                            "default for both while it's on). They run through your own\nsigned-in Claude Code "
+                            "(claude -p), billed to your Claude plan, and are slower than OpenRouter. With both on "
+                            "Claude Code, the OpenRouter key\nis optional: if set, it only runs the re-ask gate.",
                   foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
         self.cc_status = ttk.Label(box, text="")
         self.cc_status.pack(anchor="w", pady=(6, 0))
+
+        box = ttk.LabelFrame(tab, text=" Models ", padding=(14, 10))
+        box.pack(fill="x", pady=(14, 0))
+        ttk.Label(box, text="Major writes the run narrative and every floor brief: it can be slow and clever. Minor "
+                            "makes every decision in the game, within seconds,\nso it has to be fast. The re-ask gate "
+                            "skips asking the DM again when the answer wouldn't change.",
+                  foreground=MUTED, justify="left").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        self.model_lines: dict[str, ttk.Label] = {}
+        for i, role in enumerate(model_catalog.ROLES, start=1):
+            ttk.Label(box, text=ROLE_NAMES[role]).grid(row=i, column=0, sticky="w", pady=2)
+            self.model_lines[role] = ttk.Label(box, text="")
+            self.model_lines[role].grid(row=i, column=1, sticky="w", padx=12)
+            ttk.Button(box, text="Change...", command=lambda r=role: self.pick_model(r)).grid(row=i, column=2, pady=2)
+            ttk.Button(box, text="Default", command=lambda r=role: self._set_pick(r, "")).grid(
+                row=i, column=3, padx=(6, 0), pady=2)
+        box.columnconfigure(1, weight=1)
+        status = ttk.Frame(box)
+        status.grid(row=len(model_catalog.ROLES) + 1, column=0, columnspan=4, sticky="we", pady=(6, 0))
+        self.models_status = ttk.Label(status, text="", foreground=MUTED)
+        self.models_status.pack(side="left")
+        self.models_refresh = ttk.Button(status, text="Refresh list", command=self.refresh_models)
+        self.models_refresh.pack(side="left", padx=10)
         self._claude_status()
 
         row = ttk.Frame(tab)
@@ -711,6 +929,7 @@ class App:
                 ttk.Button(files, text="Open", command=lambda p=path: open_path(p)).grid(row=i, column=2, pady=2)
 
     def _claude_status(self) -> None:
+        self._show_models()                 # Claude Code's models come and go with the switch
         try:
             path = find_claude()
         except SystemExit:
@@ -718,6 +937,78 @@ class App:
                                      foreground=BAD if self.cc_var.get() else MUTED)
             return
         self.cc_status.configure(text=f"Found: {path}", foreground=GOOD if self.cc_var.get() else MUTED)
+
+    # ------------------------------------------------------------ the model pickers
+    def _show_models(self) -> None:
+        """Each role's pick (unsaved until Save and apply), and where the model list came from."""
+        cc = self.cc_var.get()
+        for role, line in self.model_lines.items():
+            pick = self.model_picks[role]
+            value = model_catalog.effective_value(pick, role, cc)
+            text = model_catalog.describe(self.catalog, value)
+            if value != pick:
+                text += "  (default)"
+            if pick.startswith(model_catalog.CLAUDE_CODE) and not cc:
+                text += "  - your Claude Code pick comes back when Claude Code is on"
+            line.configure(text=text)
+        n = len(self.catalog["text"]) + len(self.catalog["decisions"])
+        when = time.strftime("%d %b %H:%M", time.localtime(self.catalog_raw["fetched"])) \
+            if self.catalog_raw and self.catalog_raw.get("fetched") else None
+        if self.fetching:
+            text, colour = "Fetching the model list from OpenRouter...", MUTED
+        elif self.catalog_error:
+            text = f"Couldn't fetch the model list ({self.catalog_error})"
+            text += f": showing the one from {when}." if when else "."
+            colour = BAD
+        else:
+            text, colour = (f"{n} models from OpenRouter, fetched {when}." if when else "No model list yet."), MUTED
+        self.models_status.configure(text=text, foreground=colour)
+        self.models_refresh.configure(state="disabled" if self.fetching else "normal")
+
+    def _set_pick(self, role: str, value: str) -> None:
+        self.model_picks[role] = value
+        self._show_models()
+        self.settings_msg.configure(text="Press Save and apply to use it.", foreground=MUTED)
+
+    def refresh_models(self) -> None:
+        """Fetch OpenRouter's model list on a thread; the window carries on meanwhile."""
+        if self.fetching:
+            return
+        self.fetching, self.catalog_error = True, None
+        result: queue.Queue = queue.Queue()
+
+        def work() -> None:
+            try:
+                result.put((model_catalog.fetch(), None))
+            except Exception as e:                # noqa: BLE001 - shown in Settings, the cached list stays
+                result.put((None, f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, name="models", daemon=True).start()
+        self._show_models()
+        self.root.after(200, self._models_fetched, result)
+
+    def _models_fetched(self, result: queue.Queue) -> None:
+        try:
+            raw, error = result.get_nowait()
+        except queue.Empty:
+            self.root.after(200, self._models_fetched, result)
+            return
+        self.fetching, self.catalog_error = False, error
+        if raw:
+            self.catalog_raw, self.catalog = raw, model_catalog.parse(raw)
+            try:
+                model_catalog.save_cache(raw)
+            except OSError as e:
+                log.warning("couldn't save the model list: %s", e)
+        else:
+            log.warning("couldn't fetch the model list: %s", error)
+        self._show_models()
+
+    def pick_model(self, role: str) -> None:
+        cc = self.cc_var.get()
+        pinned, rows = model_catalog.candidates(self.catalog, role, cc)
+        current = model_catalog.effective_value(self.model_picks[role], role, cc)
+        ModelPicker(self.root, role, pinned, rows, current, lambda value: self._set_pick(role, value))
 
     def _set_spoilers(self) -> None:
         on = self.spoiler_var.get()
@@ -732,7 +1023,8 @@ class App:
 
     def save_settings(self) -> None:
         cfg = {"openrouter_api_key": self.key_var.get().strip(), "use_claude_code": self.cc_var.get(),
-               "spoiler_mode": self.spoiler_var.get()}
+               "spoiler_mode": self.spoiler_var.get(),
+               **{f"{role}_model": pick for role, pick in self.model_picks.items()}}
         try:
             engine = self._engine(cfg)
         except ValueError as e:
@@ -748,8 +1040,7 @@ class App:
             self.dm.apply(engine)
         else:
             self.start_dm()
-        self.settings_msg.configure(text="Saved. The DM is now " + engine.label.split(" (")[0] + ".",
-                                    foreground=GOOD)
+        self.settings_msg.configure(text=f"Saved. {engine_text(engine)}.", foreground=GOOD)
 
     # ------------------------------------------------------------ log
     def _log_tab(self) -> None:
