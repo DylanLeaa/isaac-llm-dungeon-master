@@ -97,6 +97,20 @@ def test_consumables_filter_and_bad_pill_cap():
     assert {p["color"]: p["effect"] for p in cruel["pills"]}[2] == "amnesia"
 
 
+def test_consumables_fill_the_drops_waiting_on_the_plan():
+    ctx = {"trinket_candidates": [{"id": 4}, {"id": 9}, {"id": 12}], "pill_colors_to_assign": [],
+           "drops_waiting": {"trinkets": 2, "cards": [{"runes_only": True}, {"runes": False, "playing": False}]}}
+    raw = {"cards": ["tower"], "trinkets": [9], "pills": [], "taunt": ""}
+    out = clamp("consumables", raw, st(), ctx, cruelty=6, counters={})
+    assert out["trinkets"] == [9, 4]                          # the DM's pick first, topped up from candidates
+    assert [c["cat"] for c in out["cards"]] == ["tarot", "rune"]   # tower serves the plain draw; a rune is added
+    assert out["guardrails"]
+    # Nothing waiting: an empty queue stays empty.
+    none = clamp("consumables", {"cards": [], "trinkets": [], "pills": [], "taunt": ""}, st(),
+                 {"trinket_candidates": [{"id": 4}]}, cruelty=6, counters={})
+    assert none["cards"] == [] and none["trinkets"] == []
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

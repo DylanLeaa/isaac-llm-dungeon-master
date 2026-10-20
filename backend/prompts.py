@@ -90,7 +90,8 @@ HOW TO TROLL WELL
 - Machines and chests: payout_plan decides every use of a beggar/machine ahead of time. A schedule
   of "penny, nothing, nothing, key" is a story; use the item pool ('item') sparingly.
 - Consumables: a `card`/`trinket` reward hands out the next one in your consumables plan,
-  so plan and drops work together. Pill colours are permanent once swallowed, so a colour
+  so plan and drops work together. An empty card/trinket queue can't stop one dropping: it is
+  held until you name it (context.drops_waiting), so plan one for each. Pill colours are permanent once swallowed, so a colour
   is a promise: make the first pill they find a nice one and the second colour hurts.
   context.pills_locked lists what is already set. A Tower card when they're low on
   hearts is a dare; a Hermit when there's no shop is a shrug.

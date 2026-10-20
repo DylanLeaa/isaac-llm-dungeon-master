@@ -474,6 +474,8 @@ class Coordinator:
         last = self.last_req.get(key)
         if self.gate is None or last is None:
             return False
+        if ctx.get("drops_waiting"):              # a card/trinket is held on the floor: the old plan didn't name it
+            return False
         campaign_changed = last["campaign"] != getattr(self.dm, "campaign", "")
         changes = diff({"state": last["state"], "ctx": last["ctx"]}, {"state": state, "ctx": ctx})
         fresh = new_events(last["events"], digest["recent_events"])
