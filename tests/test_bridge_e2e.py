@@ -118,9 +118,9 @@ def test_lua_bridge():
             cands = lua.table_from({"candidates": [{"id": 1, "quality": 3}, {"id": 2, "quality": 0},
                                                    {"id": 3, "quality": 1}]}, recursive=True)
             B.request("item_choice", "items:1:0", state, cands, 8000)
-            B.request("floor_plan", "floor:1:next", state, lua.table_from({}), 8000)
+            B.request("floor_plan", "curses:1", state, lua.table_from({}), 8000)
 
-            keys = ["clear:1:84", "layout:1:85", "items:1:0", "floor:1:next"]
+            keys = ["clear:1:84", "layout:1:85", "items:1:0", "curses:1"]
             assert pump(B, 6, lambda: all(B.peek(k) for k in keys)), "missing results"
             clear = B.peek("clear:1:84")
             assert clear.id == id2, f"expected superseding request {id2} to win, got {clear.id}"
@@ -200,6 +200,12 @@ def test_protocol():
             m.send({"t": "hello", "session": "OLD", "proto": PROTO + 1, "run": "R", "new_run": True})
             w = m.recv(lambda x: x["t"] == "welcome")
             assert w == {"t": "welcome", "session": "OLD", "proto": PROTO}, "mismatch: just the backend's protocol"
+            # A mod from before decks (PROTO 1: no `drawn`, one consumables plan) is told so, and not served.
+            assert PROTO == 2
+            m.save_own({"link": "OLD1", "cruelty": 9})
+            m.send({"t": "hello", "session": "OLD1", "proto": 1, "run": "R", "new_run": True})
+            w = m.recv(lambda x: x["t"] == "welcome" and x["session"] == "OLD1")
+            assert w == {"t": "welcome", "session": "OLD1", "proto": 2}
 
             m.save_own({"link": "S", "cruelty": 9, "pills": {"3": "x"}})
             m.send({"t": "hello", "session": "S", "proto": PROTO, "run": "R", "new_run": True, "cruelty": 9})

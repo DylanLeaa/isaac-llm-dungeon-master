@@ -74,18 +74,25 @@ def test_champion_color_and_boss_bonus_cap():
     assert sum(r["count"] for r in bonus["rewards"]) == 2      # the boss room keeps its own award too
 
 
-def test_consumables_filter_and_bad_pill_cap():
-    ctx = {"trinket_candidates": [{"id": 4}, {"id": 9}],
-           "pill_colors_to_assign": [{"color": 1}, {"color": 2}, {"color": 3}],
+def test_cards_trinkets_pills_filter_and_bad_pill_cap():
+    cards = clamp("cards", {"cards": ["tower", "suicide_king", "rune_jera"], "taunt": ""}, st(), {}, cruelty=0,
+                  counters={})
+    assert [c["key"] for c in cards["cards"]] == ["tower", "rune_jera"]
+    assert cards["cards"][1] == {"key": "rune_jera", "enum": "RUNE_JERA", "cat": "rune"}
+    short = clamp("cards", {"cards": ["tower", "fool", "rune_jera"], "taunt": ""}, st(), {"wanted": 2}, cruelty=0,
+                  counters={})
+    assert [c["key"] for c in short["cards"]] == ["tower", "fool"], "at most context.wanted entries"
+
+    trinkets = clamp("trinkets", {"trinkets": [9, 99, 9, "x", 4], "taunt": ""}, st(),
+                     {"trinket_candidates": [{"id": 4}, {"id": 9}]}, cruelty=0, counters={})
+    assert trinkets["trinkets"] == [9, 4]
+
+    ctx = {"pill_colors_to_assign": [{"color": 1}, {"color": 2}, {"color": 3}],
            "pills_locked": [{"color": 7, "effect": "bad_trip"}]}
-    raw = {"cards": ["tower", "suicide_king", "rune_jera"], "trinkets": [9, 99, 9, "x", 4],
-           "pills": [{"color": 1, "effect": "health_down"}, {"color": 2, "effect": "amnesia"},
+    raw = {"pills": [{"color": 1, "effect": "health_down"}, {"color": 2, "effect": "amnesia"},
                      {"color": 3, "effect": "health_up"}, {"color": 8, "effect": "full_health"},
                      {"color": 1, "effect": "luck_up"}], "taunt": ""}
-    out = clamp("consumables", raw, st(), ctx, cruelty=0, counters={})
-    assert [c["key"] for c in out["cards"]] == ["tower", "rune_jera"]
-    assert out["cards"][1] == {"key": "rune_jera", "enum": "RUNE_JERA", "cat": "rune"}
-    assert out["trinkets"] == [9, 4]
+    out = clamp("pills", raw, st(), ctx, cruelty=0, counters={})
     pills = {p["color"]: p for p in out["pills"]}
     assert set(pills) == {1, 2, 3}                              # colour 8 isn't open, colour 1 only once
     # cruelty 0: round(4 colours * 0.4) = 2 bad in the run; the locked Bad Trip uses one
@@ -93,22 +100,66 @@ def test_consumables_filter_and_bad_pill_cap():
     assert pills[2]["effect"] == "see_forever"                  # over the cap -> its good counterpart
     assert pills[3] == {"color": 3, "effect": "health_up", "enum": "PILLEFFECT_HEALTH_UP",
                         "false_phd": "PILLEFFECT_HEALTH_DOWN"}
-    cruel = clamp("consumables", raw, st(), ctx, cruelty=10, counters={})
+    cruel = clamp("pills", raw, st(), ctx, cruelty=10, counters={})
     assert {p["color"]: p["effect"] for p in cruel["pills"]}[2] == "amnesia"
 
 
-def test_consumables_fill_the_drops_waiting_on_the_plan():
-    ctx = {"trinket_candidates": [{"id": 4}, {"id": 9}, {"id": 12}], "pill_colors_to_assign": [],
-           "drops_waiting": {"trinkets": 2, "cards": [{"runes_only": True}, {"runes": False, "playing": False}]}}
-    raw = {"cards": ["tower"], "trinkets": [9], "pills": [], "taunt": ""}
-    out = clamp("consumables", raw, st(), ctx, cruelty=6, counters={})
-    assert out["trinkets"] == [9, 4]                          # the DM's pick first, topped up from candidates
-    assert [c["cat"] for c in out["cards"]] == ["tarot", "rune"]   # tower serves the plain draw; a rune is added
-    assert out["guardrails"]
-    # Nothing waiting: an empty queue stays empty.
-    none = clamp("consumables", {"cards": [], "trinkets": [], "pills": [], "taunt": ""}, st(),
-                 {"trinket_candidates": [{"id": 4}]}, cruelty=6, counters={})
-    assert none["cards"] == [] and none["trinkets"] == []
+def test_drops_keep_one_entry_per_kill_and_their_budgets():
+    raw = {"outcomes": [{"reward": "key"}, {"reward": "bogus"}, {"reward": "troll_bomb"}, {"reward": "nothing"},
+                        {"reward": "golden_key", "count": 2}, {"reward": "penny"}], "taunt": ""}
+    out = clamp("drops", raw, st(), {"wanted": 5}, cruelty=6, counters={})
+    names = [o["reward"] for o in out["outcomes"]]
+    assert names == ["key", "nothing", "troll_bomb", "nothing", "golden_key"], "unknown -> nothing, in place"
+    assert out["outcomes"][4]["count"] == 1
+    # cruelty 2: no troll bombs; at <= 1 heart, no traps either
+    assert [o["reward"] for o in clamp("drops", raw, st(), {"wanted": 3}, cruelty=2, counters={})["outcomes"]] \
+        == ["key", "nothing", "nothing"]
+    mercy = clamp("drops", {"outcomes": [{"reward": "mimic_chest"}, {"reward": "troll_bomb"}], "taunt": ""},
+                  st(hp_red=1), {"wanted": 2}, cruelty=10, counters={})
+    assert [o["reward"] for o in mercy["outcomes"]] == ["nothing", "nothing"] and mercy["guardrails"]
+    # the floor's kill drops are counted: 8 rooms x 0.5 x (1.5 - 0.48) ~ 4, three already dropped
+    spent = clamp("drops", {"outcomes": [{"reward": "penny"}] * 3, "taunt": ""}, st(), {"wanted": 3},
+                  cruelty=6, counters={"drops_floor": 3})
+    assert [o["reward"] for o in spent["outcomes"]] == ["penny", "nothing", "nothing"]
+
+
+def test_budget_trims_gifts_past_the_floor_economy():
+    from economy import Economy
+
+    econ = Economy()
+    econ.cruelty = 6
+    econ.observe({"level": {"stage": 1, "stage_type": 0, "room_types": {"default": 10}}})
+    econ.set_words((1, 0), {"keys": "starve"})
+    # keys: vanilla 10 x 0.22 + 0.8 = 3.0, starve 0.3, cruelty 6 x 0.96 -> 0.86, + slack 1.2 = cap 2.06
+    econ.commit("clear:1:85", "room_clear", {"rewards": [{"reward": "key", "count": 1}]}, {})
+    out = clamp("drops", {"outcomes": [{"reward": "key"}, {"reward": "double_key"}, {"reward": "key"}], "taunt": ""},
+                st(), {"wanted": 3}, cruelty=6, counters={}, budget=econ.budget("drops:1", "drops", {}))
+    assert [o["reward"] for o in out["outcomes"]] == ["key", "nothing", "nothing"]
+    assert "double_key -> nothing (keys over budget: clear:1:85 took the last one)" in out["guardrails"]
+    # A clear trims too, but its drought breaker still adds a key after the trim
+    econ.commit("drops:1", "drops", out, {})
+    clear = clamp("room_clear", {"rewards": [{"reward": "key"}], "taunt": ""}, st(keys=0, locked=1), {},
+                  cruelty=6, counters={"clears_since_key": 7}, budget=econ.budget("clear:1:86", "room_clear", {}))
+    assert clear["rewards"] == [{"reward": "key", "count": 1}]
+    assert clear["guardrails"][0].startswith("key -> nothing") and "drought breaker: key" in clear["guardrails"]
+    # Machines are exchanges: never trimmed by the budget
+    slot = clamp("payout_plan", {"schedule": [{"reward": "key"}], "taunt": ""}, st(), {"source_class": "slot"},
+                 cruelty=6, counters={}, budget=econ.budget("payout:1:7", "payout_plan", {"source_class": "slot"}))
+    assert slot["schedule"] == [{"reward": "key", "count": 1}]
+
+
+def test_machine_house_edge():
+    raw = {"schedule": [{"reward": "dime"}, {"reward": "key"}, {"reward": "key"}, {"reward": "item"},
+                        {"reward": "item"}, {"reward": "penny"}], "taunt": ""}
+    out = clamp("payout_plan", raw, st(), {"source_class": "slot", "source": "beggar", "has_item_pool": True},
+                cruelty=6, counters={})
+    names = [r["reward"] for r in out["schedule"]]
+    # a beggar is paid 1c a use and returns 70% at cruelty 6, plus 5c up front: no dime, one key, one item
+    assert names == ["nothing", "key", "nothing", "item", "penny"], names
+    assert any("house edge" in g for g in out["guardrails"])
+    rich = clamp("payout_plan", {"schedule": [{"reward": "key"}, {"reward": "key"}], "taunt": ""}, st(),
+                 {"source_class": "slot", "source": "key_master"}, cruelty=0, counters={})
+    assert [r["reward"] for r in rich["schedule"]] == ["key", "key"], "a key master is paid in keys"
 
 
 if __name__ == "__main__":
@@ -142,15 +193,11 @@ def test_clamp_diff_names_what_the_model_did_not_get():
     assert clamp_diff("item_choice", raw, out) == ["ignored ids not in the pool: 999"]
 
 
-def test_swallowed_drops_raise_the_clear_cap():
+def test_clear_cap_is_fixed():
     raw = {"rewards": [{"reward": "penny", "count": 3}, {"reward": "nickel", "count": 3},
                        {"reward": "key", "count": 3}], "taunt": ""}
-    plain = clamp("room_clear", raw, st(), {}, cruelty=5, counters={})
-    given = clamp("room_clear", raw, st(), {"suppressed_drops": {"half_heart": 2, "key": 1, "junk": "x"}},
-                  cruelty=5, counters={})
+    plain = clamp("room_clear", raw, st(), {"kills_dropped": ["key", "penny"]}, cruelty=5, counters={})
     assert sum(r["count"] for r in plain["rewards"]) == 4 and "suppressed" not in plain
-    assert sum(r["count"] for r in given["rewards"]) == 7
-    assert given["suppressed"] == {"half_heart": 2, "key": 1}
 
 
 def test_payout_schedule_rules():

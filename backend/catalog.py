@@ -41,9 +41,9 @@ REWARDS = {
     "red_chest": "red chest (gamble)", "spiked_chest": "spiked chest (hurts)",
     "mimic_chest": "chest that is secretly a trap",
     "grab_bag": "sack of random pickups",
-    "pill": "a pill (its colour's effect is whatever you assigned in your consumables plan)",
-    "card": "the next card/rune in your consumables plan",
-    "trinket": "the next trinket in your consumables plan", "battery": "lil battery",
+    "pill": "a pill (its colour's effect is whatever your pills deck assigned)",
+    "card": "the next card/rune in your cards deck",
+    "trinket": "the next trinket in your trinkets deck", "battery": "lil battery",
 }
 # Outcomes a payout_plan entry may use besides a reward: stiff the player, or hand out a pool item.
 PAYOUT_OUTCOMES = ("nothing", "item")
@@ -51,7 +51,7 @@ LOW_VALUE = {"penny", "half_heart", "pill"}
 LUCK = {"lucky_penny": 1}                   # permanent luck each reward gives
 CHESTS = {"chest", "locked_chest", "red_chest", "spiked_chest", "mimic_chest"}
 
-# Vanilla room clears, for the generosity ledger (matches the mod's VANILLA_PER_CLEAR).
+# Vanilla room clears (matches the mod's VANILLA_PER_CLEAR).
 VANILLA_DROP_RATE = 0.40                    # share of normal room clears that drop anything
 VANILLA_PICKUPS_PER_CLEAR = 0.5             # pickups per clear, empty clears included
 TRAPS = {"troll_bomb", "mimic_chest", "spiked_chest", "sticky_nickel"}
@@ -59,6 +59,50 @@ KEYS = {"key", "double_key", "golden_key", "charged_key"}
 BOMBS = {"bomb", "double_bomb", "golden_bomb"}
 COINS = {"penny", "double_penny", "nickel", "dime", "lucky_penny", "sticky_nickel"}
 HEARTS = {"red_heart", "half_heart", "soul_heart", "black_heart", "eternal_heart"}
+
+# ----------------------------------------------------------------- the economy (economy.py)
+# The resource families every deck's outcomes are budgeted in. Units are value, not pickup count:
+# coins in cents, hearts in half hearts, keys and bombs by count (a golden one is a fixed premium of 3),
+# cards / pills / trinkets by count, luck in points, power in item quality (+ stat pills).
+FAMILIES = ("keys", "bombs", "coins", "hearts", "cards", "pills", "trinkets", "luck", "traps", "power")
+UNITS = {
+    "penny": {"coins": 1}, "double_penny": {"coins": 2}, "nickel": {"coins": 5}, "dime": {"coins": 10},
+    "lucky_penny": {"coins": 1, "luck": 1}, "sticky_nickel": {"coins": 5, "traps": 1},
+    "bomb": {"bombs": 1}, "double_bomb": {"bombs": 2}, "golden_bomb": {"bombs": 3}, "troll_bomb": {"traps": 1},
+    "key": {"keys": 1}, "double_key": {"keys": 2}, "golden_key": {"keys": 3}, "charged_key": {"keys": 1},
+    "red_heart": {"hearts": 2}, "half_heart": {"hearts": 1}, "soul_heart": {"hearts": 2},
+    "black_heart": {"hearts": 2}, "eternal_heart": {"hearts": 2},
+    "spiked_chest": {"traps": 1}, "mimic_chest": {"traps": 1},
+    "pill": {"pills": 1}, "card": {"cards": 1}, "trinket": {"trinkets": 1},
+}
+# What vanilla hands out per normal room (its clear, its kills and its breakables together), in the
+# units above, plus a floor's fixed extras (chests, machines). A Basement floor of ~10 rooms comes to
+# about 8 cents and 3 keys. First estimates: the mod's roll audit (`rolls` events) is what calibrates them.
+VANILLA_PER_ROOM = {"keys": 0.22, "bombs": 0.22, "coins": 0.7, "hearts": 0.45, "cards": 0.06, "pills": 0.06,
+                    "trinkets": 0.03}
+VANILLA_PER_FLOOR = {"keys": 0.8, "bombs": 0.3, "coins": 1.0, "hearts": 0.5, "cards": 0.3, "pills": 0.3,
+                     "trinkets": 0.2, "power": 4.0}
+VANILLA_LUCK_PER_RUN = 1.0
+# The floor brief's word for a family -> a multiplier on vanilla.
+ECONOMY_WORDS = {"starve": 0.3, "lean": 0.6, "vanilla": 1.0, "generous": 1.5, "flood": 2.2}
+# How far over budget a deliberate gift may go, in each family's units (scaled down by cruelty).
+SLACK = {"keys": 1, "bombs": 1, "coins": 3, "hearts": 2, "cards": 1, "pills": 1, "trinkets": 1, "luck": 0,
+         "traps": 0, "power": 2}
+# Shop value in cents, for a machine's house edge (what it pays back per payment). "item" is a jackpot
+# outside the edge (one per schedule at most).
+SHOP_VALUE = {"penny": 1, "double_penny": 2, "nickel": 5, "dime": 10, "lucky_penny": 5, "sticky_nickel": 4,
+              "bomb": 5, "double_bomb": 10, "golden_bomb": 15, "troll_bomb": 0,
+              "key": 5, "double_key": 10, "golden_key": 15, "charged_key": 7,
+              "red_heart": 3, "half_heart": 2, "soul_heart": 5, "black_heart": 6, "eternal_heart": 8,
+              "chest": 6, "locked_chest": 8, "red_chest": 5, "spiked_chest": 3, "mimic_chest": 0, "grab_bag": 7,
+              "pill": 5, "card": 5, "trinket": 6, "battery": 5, "nothing": 0}
+# What one use of a machine costs the player, in cents (a heart-paid machine costs a red heart ~ 3c).
+PAYMENT = {"beggar": 1, "demon_beggar": 3, "shell_game": 1, "key_master": 5, "bomb_bum": 5, "battery_bum": 1,
+           "crane_game": 5, "rotten_beggar": 1, "slot_machine": 1, "hell_game": 3}
+# Pill effects that move a stat: they count as power (+1 good, -1 bad).
+STAT_PILLS = {"health_up": 1, "range_up": 1, "speed_up": 1, "tears_up": 1, "luck_up": 1, "shot_speed_up": 1,
+              "health_down": -1, "range_down": -1, "speed_down": -1, "tears_down": -1, "luck_down": -1,
+              "shot_speed_down": -1}
 
 # What happens to pickups that are already part of the room layout.
 LAYOUT_PICKUP_MODES = {
@@ -83,8 +127,8 @@ CURSES = {
 
 TREASURE_DISTANCE = ["any", "near", "far"]
 
-# Champion colours the DM may force (ChampionColor.* enum names). Only behaviours, not drops:
-# every colour has its own drop, and the game handles it.
+# Champion colours the DM may force (ChampionColor.* enum names). Only behaviours, not drops: a
+# champion's kill drops from the drops deck like any other.
 CHAMPION_COLORS = {
     "red": ("CHAMPION_RED", "double HP"),
     "yellow": ("CHAMPION_YELLOW", "faster"),

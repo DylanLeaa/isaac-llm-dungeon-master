@@ -1,8 +1,8 @@
 # LLM Dungeon Master for The Binding of Isaac: Repentance
 
-The RNG has been unplugged. Room-clear drops, which item sits on the pedestal (or comes out of
-a chest or a beggar), how a room is dressed (extra enemies, champion colours, tinted "secret"
-rocks, layout pickups), which card or trinket turns up, what each pill colour does and what
+The RNG has been unplugged. Room-clear drops, what each kill drops, which item sits on the pedestal
+(or comes out of a chest or a beggar), how a room is dressed (extra enemies, champion colours, tinted
+"secret" rocks, layout pickups), which card or trinket turns up, what each pill colour does and what
 curses the next floor carries are all decided by **Claude Haiku 5.5**, playing a gleeful, trolling tabletop
 DM. It sees your hearts, keys, bombs, coins, luck, build and what the floor still demands of
 you — and gives you twelve coins on a floor with no shop.
@@ -14,17 +14,59 @@ resources to starve or flood, how to dress rooms, its stance on items, a multi-r
 and a voice. Both go into Haiku's system prompt, so every decision serves the plan.
 
 ```
- Isaac (Lua mod)                                   backend (Python)
- ───────────────                                   ────────────────
-                                                     Campaign: Opus narrative (once per run)
-                                                               Sonnet brief (once per floor)
-                                                                   │ system prompt
- scheduler.lua  ── "decide clear:3:85" + snapshot ─▶ Coordinator ── Haiku 5.5 (tool call)
-   decides WHEN to ask                                 latest-wins per key     │
- bridge.lua     ◀─ clamped decision ───────────────  clamp() guardrails ◀──────┘
-   out: log.txt   in: the mod's save file            RunMemory (schemes, ledger)
- apply.lua      spawns / morphs / curses
+ Isaac (Lua mod)                                        backend (Python)
+ ───────────────                                        ────────────────
+ game callback ─▶ rolls.lua ─▶ causes.lua                 Campaign: Opus narrative (once per run)
+ (the roll)       one owner     "why now": a kill,                  Sonnet brief + ECONOMY (per floor)
+                  per roll      a chest, a slot use                     │ system prompt
+                     │                                    Coordinator ── Haiku 5.5 (tool call)
+                     ▼                                     latest-wins per key     │
+ decks.lua ── "decide drops:3" + snapshot + deck ───────▶ clamp() + the floor's ◀──┘
+   draw / owe / restock / rewrite the stale tail          economy (one budget for every deck)
+ streams/*.lua ◀── clamped deck ───── bridge.lua ◀──────  RunMemory (open decks, schemes, ledger)
+   what an outcome means; apply.lua spawns it  ── drawn ─▶  delivered, committed, bought
 ```
+
+## Rolls, streams and decks
+
+Every random roll the game makes is intercepted where it happens and owned by exactly one **stream**
+([dm/rolls.lua](mod/llm_dungeon_master/dm/rolls.lua)). A pickup the game spawns on its own is a *spawn
+roll*: [dm/causes.lua](mod/llm_dungeon_master/dm/causes.lua) says why (a kill, a chest opening, a slot
+use, a tinted rock or a poop breaking), using the real spawner first and what just happened nearby only
+without one. The stream that owns that cause cancels the game's spawn and pays its own outcome. What a
+pickup turns out to be (a card, a trinket, a pedestal's item, a pill's effect) is an *identity roll*,
+owned by its own stream. While a spawn that is being cancelled initialises, its identity rolls draw
+nothing, so one physical roll is never governed by two decisions.
+
+Each stream draws from a **deck** ([dm/decks.lua](mod/llm_dungeon_master/dm/decks.lua)): outcomes the DM
+wrote in advance, one per roll. A request carries `wanted` (the deck's size), `deck_left` (what is
+unused) and `drawn_so_far`, and its answer replaces the unused tail. The mod reports every draw to
+the backend (`drawn`), so the ledger counts what was actually handed out. When the snapshot a deck was
+written against moves (a hit, resources, an item), or another deck spends its budget (the backend's
+`stale` push), the unused tail is rewritten. The drawn entries stand. A deck that is empty when the
+game needs it is the one late-answer path (`Decks.owe`): the game is held until the answer lands.
+Adding a randomness source is one file in `dm/streams/`.
+
+## The floor's economy (one budget for every deck)
+
+Each deck is decided on its own, but the backend sees all of them ([backend/economy.py](backend/economy.py)).
+For each resource family (keys, bombs, coins in cents, hearts in half hearts, cards, pills, trinkets,
+traps; luck per run; power, meaning item quality and stat pills, is shown but not trimmed) it keeps,
+per floor, a **target**: what vanilla hands out on this floor's rooms, times the floor brief's word
+for the family (`ECONOMY: keys=starve coins=flood ...`: starve 0.3, lean 0.6, vanilla 1, generous 1.5,
+flood 2.2), shifted by cruelty. Alongside the target it keeps what has been **delivered** and what each
+open deck has **committed**.
+- Every request gets `ctx.economy`: per family the budget, what's given, what other decks promise
+  and what's left, with a one-line verdict. `memory.your_open_decks` shows those decks (what's left in
+  them, their intent and scheme), and `memory.in_flight` the decisions being made right now.
+- `clamp()` trims each answer against the budget and the backend commits it in the same step, so two
+  calls racing for the last coin are settled by which finishes first. The loser's coin becomes
+  "nothing" (`penny -> nothing (coins over budget: clear:3:85 took the last one)`), and it is re-asked
+  once to rewrite around it. Mercy and the drought breakers come after the trim and always win.
+- Chests and tinted rocks count once opened or bombed. Machines are exchanges: what they pay is
+  `bought`, never counted against the target, and a house edge (cruelty-scaled) caps what one pays
+  back for what it was paid.
+- A family pushed over budget anyway (a chest opened early) re-asks the other decks committed to it.
 
 ## The timing model (asking late, but not too late)
 
@@ -39,22 +81,25 @@ the DM if the backend is gone (`LOADING_CONNECT_MS`) or `HOLD_TIMEOUT_MS` passes
 it is (a skipped room-clear award stays skipped), and the receipt counts it under "DM gave up". With no
 backend at all, the run is plain vanilla.
 
-| Decision | Asked when | Refreshed when | Used at |
+| Stream (key) → kind | Asked when (its forecast) | Rewritten when | The roll |
 |---|---|---|---|
-| `room_layout` (enemies, champions, rocks, pickups) | you enter a room bordering an unvisited normal room | your HP / K-B-C / items change while you linger | `MC_POST_NEW_ROOM` of that room (held until the answer lands) |
-| `room_clear` (the drop; normal, miniboss and curse rooms. In boss rooms it is a bonus on top of the game's own award) | **estimated time-to-clear** (remaining enemy HP ÷ your recent DPS) < `1.4 × p90 latency + 400ms`, or the room is nearly dead | you get hit or pick something up and there's still time for a new answer | `MC_PRE_SPAWN_CLEAN_AWARD` (late: the game's award is skipped, held, and the DM's dropped after) |
-| `item_choice` (ranked real candidates from the pool) | floor start, and again when you stand next to a treasure/shop/boss/devil/ultra secret/… room; chest and beggar pools when one shows up in your room | — | `MC_PRE_GET_COLLECTIBLE` (also catches D6 rerolls; late: the pedestal is swapped once the ranking lands) |
-| `consumables` (next cards/runes, next trinkets, an effect per pill colour in play) | floor start | a pill colour the plan doesn't cover appears (held or on the floor), or the card/trinket queues run dry | `MC_GET_CARD`, `MC_GET_TRINKET` (late: the pickup is swapped), `MC_GET_PILL_EFFECT` (the pill button holds until it's covered) |
-| `payout_plan` (per beggar/machine/chest: what each paid use yields, or what the chest holds) | the machine or chest shows up in your room; again when a schedule is used up | - | `MC_POST_PICKUP_INIT`: the game's own payout beside it is cancelled and the scheduled outcome paid (even "nothing", even when the game wouldn't pay) |
-| `floor_plan` (curses, treasure distance) | you enter the boss room | boss dies | `MC_POST_CURSE_EVAL` of the next floor (late: curses changed once the plan lands) |
+| `layout:<f>:<room>` → `room_layout` (enemies, champions, rocks, pickups) | you enter a room bordering an unvisited normal room | your HP / K-B-C / items change while you linger | `MC_POST_NEW_ROOM` of that room (held until the answer lands) |
+| `clear:<f>:<room>` → `room_clear` (normal, miniboss and curse rooms; a bonus on top of the game's own award in boss rooms) | **estimated time-to-clear** (remaining enemy HP ÷ your recent DPS) < `1.4 × p90 latency + 400ms`, or the room is nearly dead | you get hit, pick something up, the kills drop something, or the economy moves, while there's still time | `MC_PRE_SPAWN_CLEAN_AWARD` (late: the game's award is skipped, held, and the DM's dropped after) |
+| `drops:<f>` → `drops` (one entry per kill or breakable) | you enter a room with enemies (sized to them + `DROPS_SPARE`) | your state or the economy moves | `MC_POST_NPC_DEATH`, or a poop/fire/urn/skull breaking: the game's own drop is cancelled in `MC_PRE_ENTITY_SPAWN` (empty deck: the game's drop stands, reported) |
+| `rock:<f>:<room>` (sticky, from the layout's `tinted_rock_loot`) | with the room's layout | — | a tinted rock breaking: its loot is cancelled and the DM's paid (no plan: the drops deck takes it) |
+| `items:<f>:<pool>` → `item_choice` (ranked real candidates) | floor start, and again when you stand next to a treasure/shop/boss/devil/ultra secret/… room; chest and beggar pools when one shows up in your room | your state changes while you're next to it (`MAX_ITEM_SENDS`) | `MC_PRE_GET_COLLECTIBLE` (also D6 rerolls; late: the pedestal is swapped once the ranking lands) |
+| `cards:<f>`, `trinkets:<f>` → `cards`, `trinkets` (`CARDS_DEPTH` / `TRINKETS_DEPTH` entries) | floor start, then whenever the deck runs out | — | `MC_GET_CARD`, `MC_GET_TRINKET` (late: the pickup is swapped once the answer lands) |
+| `pills:<f>` → `pills` (sticky: an effect per colour in play) | a colour no answer covers is in play (held or on the floor) | — | the first swallow of a colour locks it for the run; the pill button holds until it's covered |
+| `payout:<f>:<seed>` → `payout_plan` (per beggar/machine: one entry per paid use; per chest: its contents) | the machine or chest shows up in your room; again when one entry is left | never: a schedule is a story, it is only extended | a payment beside the machine, or the chest opening: the game's own payout is cancelled and the entry paid (even "nothing", even when the game wouldn't pay) |
+| `curses:<f>` → `floor_plan` (curses, treasure distance) | you enter the boss room | boss dies | `MC_POST_CURSE_EVAL` of the next floor (late: curses changed once the plan lands) |
 
 The planners start when the first request of a new run, or of a new floor (`stage` and
 `stage_type` from the snapshot), reaches the backend. A new run, and every new floor, opens on a
 **loading screen**: the mod sends `prepare`, input is blocked and you can't be hurt until the backend
 answers `ready` (the narrative, about 20–60s, on the first floor; the floor brief, about 5–15s) and the
 rooms next to the start room have their answers (their layouts, and the item ranking for any special
-room next door). The rest of the floor (its other item pools, the consumables plan) is asked in the
-background while you play. The screen can't be skipped, but it gives up by itself after
+room next door). The rest of the floor (its other item pools, the card/trinket/pill decks) is asked in
+the background while you play. The screen can't be skipped, but it gives up by itself after
 `LOADING_CONNECT_MS` with no backend or `LOADING_TIMEOUT_MS` / `LOADING_FLOOR_TIMEOUT_MS` without its
 plans, and it doesn't come up at all if no backend has answered since the game started
 (`LOADING_SCREEN = false` turns it off). The time spent there isn't counted in the run's clock. Decisions
@@ -78,6 +123,10 @@ Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the
   heart sneaks into the drop after a long heart drought.
 - **Drought breaker**: 0 keys + locked doors seen + 7 key-less clears → a key is added (same for bombs).
 - Item and trinket picks must come from the real candidates; unknown enemies/rewards/cards are dropped.
+- **The economy**: every deck spends the floor's budget per resource family (see above); past it, an
+  outcome becomes "nothing". Kill drops also have a per-floor count (from vanilla's clear rate and
+  cruelty). Machines keep a house edge: over its uses one pays back at most `1 - 0.05 × cruelty` of
+  what it was paid (at shop prices), plus one small win, and at most one item.
 - **Pills**: a colour's effect is locked the first time it's swallowed (saved with the run, so
   continues keep it). Bad pills are capped per run (40% of colours at cruelty 0, all at 10);
   PHD / Virgo / Lucky Foot and False PHD still flip them, and Bad Trip at ≤1 heart becomes Full Health.
@@ -180,7 +229,9 @@ write a real narrative and floor brief and hand them to the DM.
 ## Configuration
 
 `mod/llm_dungeon_master/dm/config.lua` toggles each control area, the prefetch lead factor,
-refresh limits, taunts, the debug HUD and `SHOW_EFFECTS` (what the DM just did, as icons in the
+refresh limits, deck sizes (`CARDS_DEPTH`, `TRINKETS_DEPTH`, `DROPS_SPARE`), the roll audit
+(`ROLL_REPORT_MS`, `LOG_SPAWNS`), how a cancelled spawn goes (`CANCEL_IN_PRE_SPAWN`), taunts, the debug
+HUD and `SHOW_EFFECTS` (what the DM just did, as icons in the
 bottom-right corner: "+1 bomb", "-1 penny", "+2 attack flies"). `ALLOW_LAYOUT_RESEED` lets the DM's treasure-room
 distance wish reroll the floor via the `reseed` console command — off by default because
 console commands disable achievements for that run.
@@ -202,16 +253,22 @@ In the app, each decision reads across as:
   `[clamped: champion chance 60% -> 18%; extra enemies 3x gaper -> 1x gaper]`.
 - **Effect**: what that actually did in the game, as the mod saw it when it applied the decision:
   `+1 bomb dropped`, `-1 key, -1 heart -> +2 pennies (layout pickups)`, `+2 champions (red, 30% of 5)`,
-  `+curse of darkness`, `item offered: Tech X (q4)`, `pill blue_blue = speed down`. Rankings and
-  consumables plans are used a bit at a time, so they gain a line per use (each pedestal, card, trinket
-  or pill). A decision that was never used has no effect.
+  `+curse of darkness`, `item offered: Tech X (q4)`, `pill blue_blue = speed down`,
+  `kill: +1 penny (instead of the game's key)`. Decks are used a bit at a time, so they gain a line per
+  use (each kill, pedestal, card, trinket, pill or machine use). A decision that was never used has no
+  effect.
 
 - **On disk**: `<started>_run-<seed>.jsonl` in `backend/receipts/` (from source) or
   `%APPDATA%\LLM Dungeon Master\receipts\` (the exe), one JSON object per line
   (`--receipts DIR` moves it, `--no-receipts` keeps it in memory only). System prompts are
   stored once per file and referenced by hash. Later outcomes (`applied`, or `replaced` when a
-  re-ask made an answer unused) are appended as `update` lines, and what an applied decision did as
-  `effect` lines. Continuing a run resumes its file, even after a backend restart.
+  re-ask made an answer unused) are appended as `update` lines, what an applied decision did as
+  `effect` lines, and every outcome the game drew from a deck as a `drawn` line. Continuing a run
+  resumes its file, even after a backend restart.
+- **The roll audit**: the mod counts every roll by hook, cause and owner and sends the counts every
+  `ROLL_REPORT_MS` (`rolls` entries in the receipt, with samples of what each spawn looked like when
+  `LOG_SPAWNS` is on). The backend log's summary and the app's Current run tab show controlled vs.
+  uncontrolled (vanilla) rolls per hook and cause, the most uncontrolled first.
 - **In the app**: the Current run and History tabs (see Setup). The game itself no longer shows the
   receipt.
 
@@ -227,9 +284,10 @@ then the DM's epitaph and its con. The note positions are measured constants at 
 
 - **You**: floor reached, run time, rooms cleared, damage taken, items, pills eaten and
   what hit you last. These come from the mod, so they appear at once, even with the backend offline.
-- **The DM**: rooms it dressed, extra enemies, keys/bombs/coins/hearts it dropped, troll bombs,
-  curses, bad pills, decisions it gave up on and the LLM bill. Only decisions the game actually
-  used count. They are tallied from the receipt, so a continued run still counts in full.
+- **The DM**: rooms it dressed, extra enemies, keys/bombs/coins/hearts it dropped (from clears,
+  kills, machines, chests and rocks), troll bombs, curses, bad pills, decisions it gave up on and the
+  LLM bill. Only what the game actually drew counts. It is tallied from the receipt, so a continued
+  run still counts in full.
 - The run's title from the Opus narrative, the DM's last taunt, the long con it was running
   (its private `scheme`, revealed at last) and an **epitaph** Haiku writes for the run. The
   epitaph arrives a second or two after the rest (`--no-epitaph` turns it off).
@@ -242,7 +300,12 @@ Mod Config Menu → **DM Settings → Last run** (if lines get cut off there, lo
 
 ## What's tested, and what isn't
 
-- `tests/test_clamp.py` — guardrails.
+- `tests/test_clamp.py` — guardrails: every kind, the budget trim, the house edge.
+- `tests/test_decks.py` — the deck store: draw, empty → owe → refill → fixup, sticky entries, stale
+  rewrites within their budget, the usable filter, skipping entries drawn while an answer was on its way.
+- `tests/test_coordinator.py` — also the economy: `drawn` → the ledger and the receipt, a deck trimmed
+  by what another promised, an overspend re-asking the other decks, machines paid for (`bought`), and
+  two concurrent decks racing for the last coin in either order.
 - `tests/test_bridge_e2e.py` — the real `bridge.lua` and `savefile.lua` under Lua 5.3 talking to the
   backend through a fake game folder (log.txt + save file), plus a Python stand-in for the mod:
   superseding, timeouts, chunked messages, acks, protocol mismatch, and each side's data surviving the
@@ -251,8 +314,10 @@ Mod Config Menu → **DM Settings → Last run** (if lines get cut off there, lo
   against the mock backend: prefetch → room dressed on entry → clear decision requested mid-fight
   and ready at the last kill → DM-picked treasure item → card/rune/trinket draws and a locked pill
   colour → golden-chest pool ranked on sight → boss-room floor plan and bonus clear → curse mask
-  → the receipt file on disk, with what each used decision did → death:
-  the stats screen, the DM's side and its epitaph in DM Settings → Last run.
+  → kills popping the drops deck with the game's drops cancelled (a cancelled card drop takes nothing
+  from the cards deck) → tinted rock, beggar, chests and a grab bag paying their schedules (a golden
+  chest's item drawn once, from its pool) → the roll audit with nothing covered left to vanilla → the
+  receipt file on disk → death: the stats screen, the DM's side and its epitaph in DM Settings → Last run.
 - `tests/test_receipt.py` — the receipt: call records, applied/replaced updates, effects, errors,
   planners, resuming a continued run.
 - `tests/test_epilogue.py` — the after-death stats: only applied decisions count, the epitaph
@@ -268,22 +333,31 @@ caught per callback and printed once to the console/`log.txt`, and that event fa
   true room placement — `floor_plan` is the place to add it.
 - Room dressing only touches normal rooms (not shops, bosses, challenge rooms). Player 1 only.
   Greed mode is left vanilla. Golden pills stay random.
-- Beggars, machines and chests follow a per-instance `payout_plan` schedule (`dm/payouts.lua`). A "use"
-  is spotted by the player's coins/keys/bombs dropping beside a machine, and an opening by the chest
-  changing, so unusual machines (fortune teller, blood donation, confessional) are left to the game.
-- Enemy-death drops and natural spawns in rooms whose clear the DM decides are swallowed
-  (`dm/dropcatcher.lua`) and handed to the `room_clear` request as `suppressed_drops`; what the DM
-  doesn't put back shows as e.g. `-1 key (would have dropped, not replaced)` in the effect. They come
-  back at once if the DM never answers. `CONTROL_DROPS`, `DROPS_NATURAL` and `CONTROL_PAYOUTS` switch
-  these off. Other room types (shops, challenge rooms...) still drop as the game does.
-- How the game spawns those pickups (spawner, timing, slot animation) is classified, not guaranteed:
-  with `LOG_SPAWNS` on, each pickup spawn is reported to the backend as a `spawn_log` event so the
-  classification can be checked against a real run.
+- Beggars, machines and chests follow a per-instance `payout_plan` schedule (`dm/streams/payouts.lua`).
+  A "use" is spotted by the player's coins/keys/bombs dropping beside a machine, and an opening by the
+  chest changing (`dm/causes.lua`). Left to the game, and reported by the roll audit: a machine blown
+  up, a beggar leaving, the fortune teller, blood donation and the confessional.
+- **The roll audit decides what is left.** How the vanilla API reports each source (whether kill drops,
+  chest contents, slot payouts and rock/poop loot carry their spawner and seed, which way of cancelling
+  a spawn is safe, the room-entity IDs of rocks and layout pickups) has to be read off a real run with
+  `LOG_SPAWNS` on: the open questions, and how the mod copes with either answer, are at the top of
+  `dm/rolls.lua`. Until then the mod removes a cancelled pickup as it initialises
+  (`CANCEL_IN_PRE_SPAWN = false`), which is what it did before decks.
+- Still vanilla, and counted as uncontrolled: boss deaths' own drops, shop stock, the colours of
+  pills that drop (`MC_POST_PICKUP_SELECTION` is only counted), what a pickup the game spawns for no
+  cause the tracker knows (`unknown`) turns out to be, and golden pills. Layout pickups and tinted rocks
+  are changed after the room loads rather than at `MC_PRE_ROOM_ENTITY_SPAWN` (counted there, not yet
+  replaced). These are the next streams to add, in the order the audit ranks them.
+- `CONTROL_DROPS`, `DROPS_NATURAL` and `CONTROL_PAYOUTS` switch the drops deck, its breakables and the
+  machines off.
 - Enemy IDs are referenced by `EntityType` enum name, so anything missing on your version is skipped.
 
 ## Extending
 
-Add a decision kind in four places: a tool schema + clamp branch (`schemas.py`), a mock answer
-(`dm_agent.py`), a request trigger (`scheduler.lua`, or its own module like `consumables.lua`)
-and an applier (`apply.lua`). Good next ones: devil vs angel room (`Level:InitializeDevilAngelRoom`),
-swapping layout enemies (`MC_PRE_ROOM_ENTITY_SPAWN`).
+A new randomness source is one stream file in `dm/streams/`: its deck (`Decks.define`: key, entries,
+usable, context, forecast via `wants`, refresh, what a draw reports) and the roll it owns
+(`Rolls.on` for an identity roll, `Rolls.claimSpawns` for a spawn cause, `Causes.on` for an event).
+A new decision kind also needs a tool schema + clamp branch (`schemas.py`, with `economy.deck_outcomes`
+if it hands out resources), a mock answer (`dm_agent.py`) and its line in `prompts.py`. Good next ones,
+from the roll audit: shop stock, dropped pill colours, layout pickups at `MC_PRE_ROOM_ENTITY_SPAWN`,
+devil vs angel room (`Level:InitializeDevilAngelRoom`).

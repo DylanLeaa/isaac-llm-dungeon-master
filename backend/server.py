@@ -31,9 +31,9 @@ from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_C
                          CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeDM, ClaudeCodePlanner)
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
-from memory import RunMemory
+from memory import RunMemory, kind_of
 from planners import (FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, NARRATIVE_WAIT_S, Campaign, MockPlanner, OpenRouterPlanner,
-                      floor_signature)
+                      floor_signature, parse_economy)
 from receipt import Receipt
 from schemas import KINDS, clamp
 
@@ -44,15 +44,16 @@ MAX_DEADLINE_S = 12.0      # never let a single decision hang longer than this (
 MIN_DEADLINE_S = 0.4
 EPITAPH_TIMEOUT_S = 20.0   # the stats screen shows without it; it only fills in the last line
 
-# Who gets the next free DM slot. A floor's start sends a burst of item rankings and consumables;
-# the room the player is about to walk into (or is about to clear) must not queue behind it.
+# Who gets the next free DM slot. A floor's start sends a burst of item rankings and card/trinket/pill
+# decks; the room the player is about to walk into (or is about to clear) must not queue behind it, and a
+# deck the game is frozen on (ctx.owed) goes first of all.
 URGENT, NEXT_DOOR, BACKGROUND = 0, 1, 2
 
 
 def _priority(kind: str, ctx: dict) -> int:
-    if kind == "room_clear":
+    if kind == "room_clear" or ctx.get("owed"):
         return URGENT
-    if kind in ("room_layout", "payout_plan"):
+    if kind in ("room_layout", "payout_plan", "drops"):
         return NEXT_DOOR
     if kind == "item_choice" and ctx.get("reason") != "floor start":
         return NEXT_DOOR
@@ -133,15 +134,22 @@ class Coordinator:
         self.receipt = receipt or Receipt()
         self.receipt_seq: dict[str, int] = {}     # key -> receipt entry of the answer the game holds
         self.used_seq: dict[str, int] = {}        # key -> receipt entry of the answer the game last used
+        self.answer_seq: dict[tuple[str, int], int] = {}   # (key, request id) -> its answer's receipt entry
+        self.drawn_seqs: set[int] = set()         # answers the game has drawn from (marked applied)
+        self.trim_stale: set[str] = set()         # keys already re-asked once for losing a budget race
+        # Every roll the game made, by (hook, cause, owner): what the DM controls and what it doesn't.
+        self.coverage: Counter = Counter()
         self.bg: set[asyncio.Task] = set()
         self.inflight: dict[str, tuple[int, asyncio.Task]] = {}
+        self.inflight_kind: dict[str, str] = {}
         self.sem = PrioritySemaphore(max_concurrency)
         # Per decision kind: req, ok, late, superseded, timeout, error, replaced, applied, fallback.
         self.stats: dict[str, Counter] = defaultdict(Counter)
         self.usage = Counter()                    # in / cached / out tokens, cost, calls
         # Opus narrative once per run + Sonnet brief once per floor, fed to the DM's system prompt.
         self.campaign = Campaign(planner, getattr(dm, "set_campaign", lambda _text: None), self.stats, self.usage,
-                                 self._record)
+                                 self._record, on_brief=self._brief_written)
+        self.memory.economy.cruelty = cruelty
 
     def summary(self) -> None:
         """Log how many answers were requested, paid for, and actually used, per kind."""
@@ -158,6 +166,8 @@ class Coordinator:
         if u["calls"]:
             log.info("        tokens in=%d (cached %d, %.0f%%) out=%d  cost=$%.4f over %d calls",
                      u["in"], u["cached"], 100 * u["cached"] / max(1, u["in"]), u["out"], u["cost"], u["calls"])
+        for line in coverage_lines(self.coverage):
+            log.info("        %s", line)
 
     def reconfigure(self, engine: "Engine") -> None:
         """Swap in other models mid-run (the app's Settings). The run, its receipt, memory and plans carry
@@ -204,6 +214,10 @@ class Coordinator:
                     self.campaign.restore(*self.receipt.saved_plans())
                 self.receipt_seq.clear()
                 self.used_seq.clear()
+                self.answer_seq.clear()
+                self.drawn_seqs.clear()
+                self.trim_stale.clear()
+                self.coverage = Counter(self.receipt.coverage)   # a continue carries its tally on
                 self.last_req.clear()
                 if self.receipt.path:
                     log.info("receipt -> %s", self.receipt.path)
@@ -218,15 +232,13 @@ class Coordinator:
             self._prepare(msg, send)
         elif t == "req":
             self._start(msg, send)
-        elif t == "applied":
-            entry = self.memory.issued.get(str(msg.get("key")))
-            if entry:
-                self.stats[entry["kind"]]["applied"] += 1
-            self.memory.on_applied(str(msg.get("key")))
-            seq = self.receipt_seq.pop(str(msg.get("key")), None)
-            if seq is not None:
-                self.used_seq[str(msg.get("key"))] = seq
-            self.receipt.update(seq, "applied")
+        elif t == "drawn":
+            await self._drawn(str(msg.get("key")), msg.get("id"), msg.get("outcome"), msg.get("cause"), send)
+        elif t == "applied":                      # PROTO 1's whole-answer use: one draw of all of it
+            await self._drawn(str(msg.get("key")), None, None, None, send)
+        elif t == "abandon":
+            # The player left a room whose deck was never used: nothing in it is promised any more.
+            self.memory.forget(str(msg.get("key")))
         elif t == "effect":
             # What a used answer actually did in the game. It follows the answer's "applied".
             key = str(msg.get("key"))
@@ -240,6 +252,8 @@ class Coordinator:
             why = "no answer while the game waited" if data.get("asked") else "never asked"
             log.info("%-11s %-14s %s -> game went ahead without the DM", data.get("kind"), data.get("key"), why)
             self._record(str(data.get("kind")), "fallback", key=data.get("key"), result=f"DM gave up ({why})")
+        elif t == "event" and msg.get("name") == "rolls":
+            self._rolls(msg.get("data") or {})
         elif t == "event" and msg.get("name") in ("death", "victory"):
             self.memory.on_game_event(str(msg.get("name")), msg.get("data") or {})
             await self._run_over(str(msg["name"]), msg.get("data") or {}, send)
@@ -260,6 +274,71 @@ class Coordinator:
             self._record("cruelty", "set", result=f"{self.cruelty} -> {cruelty}")
             self.cruelty = cruelty
             self.dm.set_cruelty(cruelty)
+        self.memory.economy.cruelty = self.cruelty
+
+    # ------------------------------------------------------------------ decks
+    def _observe(self, state: dict) -> None:
+        """Every snapshot the game sends: a new floor starts its economy ledger (synchronously, before any
+        of its draws can come in), then the planners, whose floor brief sees last floor against vanilla."""
+        if self.memory.economy.observe(state):
+            log.info("economy     new floor ledger (%d normal rooms)", self.memory.economy.rooms)
+        self.campaign.observe(state, {**self.memory.digest(), "economy": self.memory.report()}, self.cruelty)
+
+    def _brief_written(self, sig: tuple, text: str) -> None:
+        """A floor brief is in: its ECONOMY block sets that floor's budgets."""
+        words = parse_economy(text)
+        self.memory.economy.set_words(sig, words)
+        if words:
+            log.info("economy     %s", " ".join(f"{f}={w}" for f, w in words.items()))
+
+    async def _drawn(self, key: str, rid, outcome, cause, send: Send) -> None:
+        """The game handed out one outcome of deck `key`. The first draw from an answer is its "applied";
+        a family pushed over budget re-asks the other decks still promising it."""
+        try:
+            rid = int(rid) if rid is not None else None
+        except (TypeError, ValueError):
+            rid = None
+        kind = (self.memory.issued.get(key) or {}).get("kind")
+        first, overs, counted = self.memory.on_drawn(key, rid, outcome, cause)
+        seq = self.answer_seq.get((key, rid)) if rid is not None else None
+        if seq is None:
+            seq = self.receipt_seq.get(key) if first else self.used_seq.get(key)
+        if seq is not None and seq not in self.drawn_seqs:
+            self.drawn_seqs.add(seq)
+            self.stats[kind or kind_of(key)]["applied"] += 1
+            self.receipt.update(seq, "applied")
+            if self.receipt_seq.get(key) == seq:
+                self.receipt_seq.pop(key, None)
+        if seq is not None:
+            self.used_seq[key] = seq
+        self.receipt.add_drawn(seq, key, kind or kind_of(key), counted, cause)
+        if overs:
+            keys = self.memory.economy.stale_keys(overs, exclude=key)
+            log.info("%-26s drew past the %s budget -> re-ask %s", key, "/".join(overs), ", ".join(keys) or "nothing")
+            if keys:
+                await self._send_quietly(send, {"t": "stale", "session": self.session, "keys": keys,
+                                                "why": "/".join(overs) + " over budget"})
+
+    def _rolls(self, data: dict) -> None:
+        """The mod's roll audit: how many of the game's rolls each owner took, and which no stream did. With
+        LOG_SPAWNS it carries samples of what spawns looked like (spawner, seed, cause): kept in the receipt."""
+        rows, counts = [], data.get("counts")
+        for c in counts if isinstance(counts, list) else []:
+            if not isinstance(c, dict):
+                continue
+            try:
+                n = int(c.get("n") or 0)
+            except (TypeError, ValueError):
+                continue
+            row = (str(c.get("hook")), str(c.get("cause") or "-"), str(c.get("owner") or "uncontrolled"))
+            if n > 0:
+                self.coverage[row] += n
+                rows.append([*row, n])
+        if rows:
+            free = sum(r[3] for r in rows if r[2] == "uncontrolled")
+            samples = data.get("samples") if isinstance(data.get("samples"), list) else None
+            self._record("rolls", "tally", result=f"{sum(r[3] for r in rows) - free} controlled, {free} uncontrolled",
+                         rolls=rows, **({"samples": samples[:100]} if samples else {}))
 
     # ------------------------------------------------------------------ receipt
     def _record(self, what: str, status: str, **fields) -> int:
@@ -319,7 +398,7 @@ class Coordinator:
         when this floor's plans are in, i.e. the run narrative and the floor brief. Safe to repeat (the
         game re-sends after a reconnect): each plan is only ever written once."""
         state = msg.get("state") or {}
-        self.campaign.observe(state, self.memory.digest(), self.cruelty)
+        self._observe(state)
         session, floor = self.session, msg.get("floor")
         task = asyncio.create_task(self._announce_ready(session, floor, send, self.campaign.narrative_waiter(),
                                                         floor_signature(state)))
@@ -346,7 +425,7 @@ class Coordinator:
             log.warning("unknown kind %r", kind)
             return
         self.stats[kind]["req"] += 1
-        self.campaign.observe(msg.get("state") or {}, self.memory.digest(), self.cruelty)
+        self._observe(msg.get("state") or {})
         old = self.inflight.get(key)
         if old and old[0] < rid and not old[1].done():
             old[1].cancel()                      # latest-wins: newer context supersedes
@@ -354,6 +433,7 @@ class Coordinator:
             log.debug("%-11s %-14s superseded by a fresher request", kind, key)
         task = asyncio.create_task(self._run(msg, send))
         self.inflight[key] = (rid, task)
+        self.inflight_kind[key] = kind
         task.add_done_callback(lambda _t, k=key, r=rid: self._cleanup(k, r))
 
     def _cleanup(self, key: str, rid: int) -> None:
@@ -385,8 +465,9 @@ class Coordinator:
         asked_ctx = ctx                           # before the previous answer is mixed in: this is what the gate diffs
         if prev:                                  # a re-ask replaces this answer; show it so the model restates it
             ctx = {**ctx, "your_previous_answer": _compact(prev)}
+        ctx = {**ctx, "economy": self.memory.economy.view(key)}
         deadline = max(MIN_DEADLINE_S, min(MAX_DEADLINE_S, float(msg.get("deadline_ms", 4000)) / 1000))
-        digest = self.memory.digest()
+        digest = self.memory.digest(exclude=key, in_flight=self._in_flight(key))
         # What the receipt keeps of the request: the user message is exactly these, as JSON.
         rec = {"key": key, "req_id": rid, "deadline_ms": int(deadline * 1000),
                **({"brief_wait_ms": waited} if waited >= 50 else {}),
@@ -398,7 +479,14 @@ class Coordinator:
         campaign = ""
         try:
             if prev and await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
-                await send({**base, "ok": True, "ms": _ms(t0), "decision": prev})
+                # The same deck answers this request too: what is left of it, and how many draws that
+                # already accounts for (the mod skips only draws made since).
+                self.memory.reissue(key, rid)
+                seq = self.receipt_seq.get(key, self.used_seq.get(key))
+                if seq is not None:
+                    self.answer_seq[(key, rid)] = seq
+                await send({**base, "ok": True, "ms": _ms(t0), "decision": prev,
+                            "drawn_base": self.memory.drawn_total.get(key, 0)})
                 return
             # the deadline counts from here: queueing for a slot isn't the DM's time
             async with self.sem.slot(_priority(kind, ctx)):
@@ -406,7 +494,10 @@ class Coordinator:
                 raw, late = await self._decide(kind, key, state, ctx, digest, deadline, t0)
             usage = raw.pop("_usage", None)
             call = raw.pop("_call", None)
-            decision = clamp(kind, raw, state, ctx, self.cruelty, self.memory.counters)
+            # Trimmed against the economy as it is now, and committed in the same step below: no other
+            # answer can land in between, so the first to finish takes the last coin.
+            budget = self.memory.economy.budget(key, kind, ctx)
+            decision = clamp(kind, raw, state, ctx, self.cruelty, self.memory.counters, budget)
         except asyncio.CancelledError:
             # Superseded; the newer request will answer. A call already in flight may still be billed.
             self._record(kind, "superseded", ms=_ms(t0), **rec)
@@ -429,11 +520,11 @@ class Coordinator:
         if late:
             self.stats[kind]["late"] += 1
         old_seq = self.receipt_seq.get(key)
-        if self.memory.note_issued(key, kind, decision):
+        if self.memory.note_issued(key, kind, decision, ctx, rid):
             self.stats[kind]["replaced"] += 1    # paid for an answer the game never used
             self.receipt.update(old_seq, "replaced")
-        self.receipt_seq[key] = self._record(kind, "ok", ms=ms, llm=call, raw=raw, decision=decision,
-                                             **({"late": True} if late else {}), **rec)
+        self.receipt_seq[key] = self.answer_seq[(key, rid)] = self._record(
+            kind, "ok", ms=ms, llm=call, raw=raw, decision=decision, **({"late": True} if late else {}), **rec)
         self.last_req[key] = {"state": state, "ctx": asked_ctx, "events": digest["recent_events"],
                               "campaign": campaign}
         tok = ""
@@ -447,6 +538,20 @@ class Coordinator:
         if decision.get("guardrails"):
             log.info("%28s guardrails: %s", "", "; ".join(decision["guardrails"]))
         await send({**base, "ok": True, "ms": ms, "decision": decision})
+        if budget.trimmed and key not in self.trim_stale:
+            # Lost a race for the budget: its deck may now be a worse story. One re-ask, which sees the
+            # winner in your_open_decks (and the gate drops it if nothing meaningful changed).
+            self.trim_stale.add(key)
+            await self._send_quietly(send, {"t": "stale", "session": self.session, "keys": [key],
+                                            "why": "trimmed to the budget"})
+
+    def _in_flight(self, key: str) -> list[tuple[str, str]]:
+        """Decisions being made right now (no answer yet), other than `key`."""
+        out = []
+        for k, (_rid, task) in self.inflight.items():
+            if k != key and not task.done():
+                out.append((k, self.inflight_kind.get(k, "?")))
+        return out
 
     async def _decide(self, kind: str, key: str, state: dict, ctx: dict, digest: dict, deadline: float,
                       t0: float) -> tuple[dict, bool]:
@@ -474,7 +579,7 @@ class Coordinator:
         last = self.last_req.get(key)
         if self.gate is None or last is None:
             return False
-        if ctx.get("drops_waiting"):              # a card/trinket is held on the floor: the old plan didn't name it
+        if ctx.get("owed"):                       # the game is frozen on this deck: the old answer didn't cover it
             return False
         campaign_changed = last["campaign"] != getattr(self.dm, "campaign", "")
         changes = diff({"state": last["state"], "ctx": last["ctx"]}, {"state": state, "ctx": ctx})
@@ -522,6 +627,25 @@ async def _close_later(models: list, after_s: float = 60.0) -> None:
 
 def _ms(t0: float) -> int:
     return int((time.perf_counter() - t0) * 1000)
+
+
+def coverage_table(coverage: Counter) -> list[tuple[str, str, int, int]]:
+    """The roll audit per hook and cause: (hook, cause, controlled, uncontrolled), most uncontrolled first."""
+    by: dict[tuple[str, str], Counter] = defaultdict(Counter)
+    for (hook, cause, owner), n in coverage.items():
+        by[(hook, cause)]["uncontrolled" if owner == "uncontrolled" else "controlled"] += n
+    rows = [(h, c, n["controlled"], n["uncontrolled"]) for (h, c), n in by.items()]
+    return sorted(rows, key=lambda r: (-r[3], -r[2], r[0], r[1]))
+
+
+def coverage_lines(coverage: Counter) -> list[str]:
+    """The roll audit as log lines (Coordinator.summary)."""
+    rows = coverage_table(coverage)
+    if not rows:
+        return []
+    out = [f"rolls {'hook/cause':<34} {'controlled':>10} {'uncontrolled':>12}"]
+    out += [f"      {h + '/' + c:<34} {ctl:>10} {free:>12}" for h, c, ctl, free in rows]
+    return out
 
 
 def _summary_msg(session: str | None, summary: dict) -> dict:

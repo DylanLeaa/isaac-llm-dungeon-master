@@ -187,9 +187,10 @@ class MockDM:
                     "taunt": r.choice(["", "A penny for your thoughts.", "Earned it. Barely."])}
         if kind == "payout_plan":
             chest = ctx.get("source_class") == "chest"
+            inside = ["item", "half_heart"] if ctx.get("has_item_pool") else ["half_heart", "bomb"]
             return {"intent": "mock: a machine with moods",
                     "schedule": [{"reward": n, "count": 1} for n in
-                                 (["half_heart", "bomb"] if chest else ["key", "nothing", "penny"])],
+                                 (inside if chest else ["key", "nothing", "penny"])],
                     "taunt": "", "scheme": "mock scheme"}
         if kind == "item_choice":
             cands = sorted(ctx.get("candidates", []), key=lambda c: c.get("quality", 2))
@@ -199,11 +200,20 @@ class MockDM:
             return {"intent": "mock: dim the lights", "add_curses": ["darkness"],
                     "strip_vanilla_curses": False, "treasure_distance": r.choice(TREASURE_DISTANCE),
                     "taunt": "Watch your step."}
-        if kind == "consumables":
+        if kind == "cards":
             return {"intent": "mock: tower first, then whatever",
                     "cards": ["tower", "rune_hagalaz", *r.sample(list(CARDS), 2)],
-                    "trinkets": [c["id"] for c in ctx.get("trinket_candidates", [])][:2],
-                    "pills": [{"color": c["color"], "effect": r.choice(list(PILLS))}
-                              for c in ctx.get("pill_colors_to_assign", [])],
                     "taunt": "Pick a card. Any card."}
+        if kind == "trinkets":
+            return {"intent": "mock: the first candidates", "taunt": "Shiny.",
+                    "trinkets": [c["id"] for c in ctx.get("trinket_candidates", [])][:max(2, len(ctx.get("owed") or []))]}
+        if kind == "pills":
+            return {"intent": "mock: whatever", "taunt": "Swallow it.",
+                    "pills": [{"color": c["color"], "effect": r.choice(list(PILLS))}
+                              for c in ctx.get("pill_colors_to_assign", [])]}
+        if kind == "drops":
+            n = max(1, int(ctx.get("wanted") or 3))
+            outcomes = [{"reward": "nothing"} for _ in range(n)]
+            outcomes[min(1, n - 1)] = {"reward": r.choice(["penny", "half_heart", "key", "bomb"]), "count": 1}
+            return {"intent": "mock: one kill pays", "outcomes": outcomes, "taunt": ""}
         raise ValueError(kind)

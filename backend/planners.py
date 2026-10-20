@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from collections import Counter
 from typing import Callable
@@ -49,6 +50,24 @@ def loadout(state: dict) -> str:
             f"active item: {p.get('active_item') or 'none'}; pocket active: {p.get('pocket_active') or 'none'}; "
             f"trinkets: {p.get('trinkets') or 'none'}; pocket: {p.get('pocket') or 'none'}; "
             f"items: {', '.join(items) or 'none'}{progress}")
+
+
+ECONOMY_RE = re.compile(r"^\s*ECONOMY\s*:(.*?)(?=^\s*[A-Z][A-Z &]+:|\Z)", re.M | re.S)
+FAMILY_RE = re.compile(r"\b(keys?|bombs?|coins?|hearts?|cards?|pills?|trinkets?|luck|power)\s*[=:-]\s*"
+                       r"(starve|lean|vanilla|generous|flood)\b", re.I)
+
+
+def parse_economy(brief: str | None) -> dict[str, str]:
+    """The brief's ECONOMY block as {family: starve | lean | vanilla | generous | flood}. Families it leaves
+    out (or a brief without the block) stay vanilla."""
+    m = ECONOMY_RE.search(brief or "")
+    if not m:
+        return {}
+    out = {}
+    for fam, word in FAMILY_RE.findall(m.group(1)):
+        fam = fam.lower()
+        out[fam if fam in ("luck", "power") or fam.endswith("s") else fam + "s"] = word.lower()
+    return out
 
 
 def floor_signature(state: dict) -> tuple | None:
@@ -139,7 +158,9 @@ class MockPlanner:
     async def floor_brief(self, state, narrative, digest, prev_brief, cruelty) -> tuple[str, dict]:
         await asyncio.sleep(self.rng.uniform(*self.latency))
         name = (state.get("level") or {}).get("name", "this floor")
-        return (f"ARC BEAT: {name} lulls them.\nRESOURCES: starve keys\nROOMS: light\n"
+        return (f"ARC BEAT: {name} lulls them.\nRESOURCES: starve keys\n"
+                "ECONOMY: keys=starve bombs=vanilla coins=generous hearts=lean cards=vanilla pills=vanilla "
+                "trinkets=vanilla luck=lean power=vanilla\nROOMS: light\n"
                 "ITEMS & CONSUMABLES: one good item\nSET-PIECE: key drought, then key by a troll bomb\n"
                 "VOICE: smug"), {"_call": {"model": "mock"}}
 
@@ -148,9 +169,11 @@ class Campaign:
     """Starts the planners at the right moments and pushes their text to the DM."""
 
     def __init__(self, planner, push: Callable[[str], None], stats: dict[str, Counter], usage: Counter,
-                 record: Callable[..., None] = lambda what, status, **fields: None) -> None:
+                 record: Callable[..., None] = lambda what, status, **fields: None,
+                 on_brief: Callable[[tuple, str], None] = lambda sig, text: None) -> None:
         self.planner, self.push, self.stats, self.usage = planner, push, stats, usage
         self.record = record                          # receipt.add-like: (what, status, **fields)
+        self.on_brief = on_brief                      # (floor signature, brief text): the economy's targets
         self.run_token = 0
         self.tasks: set[asyncio.Task] = set()
         self._clear()
@@ -184,6 +207,7 @@ class Campaign:
             sig, self.floor_name, self.brief = brief
             self.floor_sig = tuple(sig)
             self.stats["floor_brief"]["reused"] += 1
+            self.on_brief(self.floor_sig, self.brief)
         if narrative or brief:
             log.info("continued run: reusing its %s", " and ".join(
                 what for what, have in (("narrative", narrative), (f"brief for {self.floor_name}", brief)) if have))
@@ -315,6 +339,7 @@ class Campaign:
                     floor=list(sig), floor_name=self.floor_name)   # what a continue restores it by
         self._account("floor_brief", usage)
         self.brief = text
+        self.on_brief(sig, text)
         log.info("floor_brief %s [%s]\n%s", self.floor_name, self.planner.floor_model, _indent(text))
         self._push()
 

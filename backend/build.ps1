@@ -9,7 +9,7 @@ try {
     python -m PyInstaller --noconfirm --clean --onefile --windowed --name "LLM Dungeon Master" `
         --collect-data sv_ttk app.py
     if (-not $?) { throw "PyInstaller failed" }
-    Write-Host "Built: $PSScriptRoot\dist\LLM Dungeon Master.exe"
+    Write-Host "Built: $PSScriptRoot\dist\LLM Dungeon Master - Rework.exe"
 } finally {
     Pop-Location
 }

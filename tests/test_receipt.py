@@ -66,7 +66,9 @@ def test_decisions_are_stored_with_their_call_and_what_they_did(tmp_path):
     entries = {r["seq"]: r for r in recs if r["type"] == "entry"}
     first, second, fallback, failed = entries[1], entries[2], entries[3], entries[4]
     assert first["llm"]["model"] == CALL["model"] and len(first["llm"]["system"]) == 2
-    assert first["request"]["ctx"] == {"reason": "almost clear"} and "memory" in first["request"]
+    ctx = first["request"]["ctx"]
+    assert {k: v for k, v in ctx.items() if k != "economy"} == {"reason": "almost clear"} and "memory" in first["request"]
+    assert "verdict" in ctx["economy"], "every request carries the floor's economy"
     assert first["decision"]["rewards"] == [{"reward": "key", "count": 1}] and first["raw"]["intent"] == "one key"
     assert "your_previous_answer" in second["request"]["ctx"]
     updates = [(r["ref"], r["status"]) for r in recs if r["type"] == "update"]
@@ -203,8 +205,9 @@ def test_listener_and_load_mirror_the_file(tmp_path):
         await coord.handle({"t": "effect", "key": "nobody:1", "effect": ["lost"]}, send)   # never asked: ignored
 
     asyncio.run(go())
-    assert [e[0] for e in events] == ["run", "entry", "update", "effect"]
-    assert events[3][1] == {"seq": 1, "effect": ["+1 key dropped"]}
+    assert [e[0] for e in events] == ["run", "entry", "update", "drawn", "effect"]
+    assert events[3][1]["outcome"] == {"rewards": answer["rewards"]} and events[3][1]["ref"] == 1
+    assert events[4][1] == {"seq": 1, "effect": ["+1 key dropped"]}
     assert events[0][1]["run"] == "SEED 1" and events[0][1]["fresh"] and events[0][1]["path"] == coord.receipt.path
     assert events[1][1]["what"] == "room_clear"
     assert events[2][1]["seq"] == 1 and events[2][1]["status"] == "applied" and events[2][1]["ts"] > 0

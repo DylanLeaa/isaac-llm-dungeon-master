@@ -1,6 +1,9 @@
 -- LLM Dungeon Master
 -- Every "random" event worth trolling about is decided by an LLM (Claude Haiku 5.5)
 -- running in a local backend, reached through the game's log and this mod's save file.
+--
+-- Every roll the game makes goes through dm/rolls.lua to exactly one stream (dm/streams/*.lua), which
+-- draws the DM's answer from its deck (dm/decks.lua). dm/causes.lua says why the game rolled.
 local mod = RegisterMod("LLM Dungeon Master", 1)
 
 local cfg    = include("dm.config")
@@ -11,22 +14,38 @@ local Taunt  = include("dm.taunt")
 local Apply  = include("dm.apply")
 local Sched  = include("dm.scheduler")
 local Settings = include("dm.settings")
-local Cons   = include("dm.consumables")
 local Death  = include("dm.deathscreen")
 local Loading = include("dm.loading")
-local Catcher = include("dm.dropcatcher")
-local Payouts = include("dm.payouts")
-local Rocks  = include("dm.rockloot")
 local EffectHud = include("dm.effecthud")
+local Rolls  = include("dm.rolls")
+local Causes = include("dm.causes")
+local Decks  = include("dm.decks")
+
+-- The streams, in the order their hooks run: a room is dressed before its drops are asked for, and
+-- a planned tinted rock is the rock deck's before the drops deck can take it as a breakable.
+local D = { cfg = cfg, Bridge = Bridge, State = State, Apply = Apply, Taunt = Taunt, Loading = Loading,
+            Rolls = Rolls, Causes = Causes, Decks = Decks, Sched = Sched }
+D.Layout   = include("dm.streams.layout")
+D.Rocks    = include("dm.streams.rocks")
+D.Drops    = include("dm.streams.drops")
+D.Clear    = include("dm.streams.clear")
+D.Items    = include("dm.streams.items")
+D.Payouts  = include("dm.streams.payouts")
+D.Cards    = include("dm.streams.cards")
+D.Trinkets = include("dm.streams.trinkets")
+D.Pills    = include("dm.streams.pills")
+D.Curses   = include("dm.streams.curses")
+local STREAMS = { D.Layout, D.Rocks, D.Drops, D.Clear, D.Items, D.Payouts, D.Cards, D.Trinkets, D.Pills, D.Curses }
 
 Taunt.enabled = cfg.SHOW_TAUNTS
 Apply.init(Taunt)
 EffectHud.init(cfg, Apply)
-Cons.init(cfg, Bridge, State, Taunt, Loading)
-Catcher.init(cfg, Apply)
-Catcher.setExempt(Payouts.near)
-Rocks.init(Apply, Bridge)
-Sched.init(cfg, Bridge, State, Apply, Taunt, Cons, Loading, Catcher, Payouts, Rocks)
+Causes.init()
+Rolls.init(cfg, Bridge, Apply, Causes)
+Decks.init(cfg, Bridge, State, Loading, Taunt)
+for _, s in ipairs(STREAMS) do s.init(D) end
+Sched.init(D, STREAMS)
+local Pills = D.Pills
 
 local game = Game()
 
@@ -49,11 +68,12 @@ end
 -- Saved DM Settings (cruelty) go out with the first hello.
 SaveFile.init(mod)
 Settings.init(SaveFile, cfg, Bridge, Death)
-Death.init(cfg, Bridge, State, Cons, Settings)
+Death.init(cfg, Bridge, State, Pills, Settings)
 Bridge.setSummaryHandler(Death.handle)
 Loading.init(cfg, Bridge, State, Taunt, Sched)
 Bridge.setReadyHandler(Loading.handle)
 Bridge.setEffectHandler(EffectHud.push)
+Bridge.setStaleHandler(Decks.markStale)
 
 -- Connect as soon as the mod loads so the DM is warm by the time a run starts.
 Bridge.init(cfg, SaveFile, "menu")
@@ -80,14 +100,14 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function
   Loading.start()
   EffectHud.clear()
   -- Pill colours the DM fixed earlier in this run must stay fixed after a continue.
-  Cons.onLock = function(locked)
+  Pills.onLock = function(locked)
     local pills = {}                       -- string keys: colours are a sparse int table
     for c, e in pairs(locked) do pills[tostring(c)] = e end
     Settings.save({ seed = seed, pills = pills })
   end
   if continued then
     local saved = Settings.load()
-    if saved.seed == seed then Cons.restore(saved.pills) end
+    if saved.seed == seed then Pills.restore(saved.pills) end
     local stats = saved.run_stats            -- so the stats screen counts the whole run
     if type(stats) == "table" and stats.seed == seed then State.restoreRun(stats) end
   end
@@ -104,10 +124,7 @@ local lastQueued
 mod:AddCallback(ModCallbacks.MC_POST_UPDATE, safe("update", function()
   Apply.update()
   Sched.update()
-  Payouts.update()
-  Rocks.update()
-  Catcher.update()
-  Loading.updateHolds()     -- after the scheduler, which may have started one
+  Loading.updateHolds()     -- after the decks, which may have started one
   -- Item pickup detection (for the DM's memory).
   local p = Isaac.GetPlayer(0)
   local q = p.QueuedItem and p.QueuedItem.Item
@@ -135,55 +152,22 @@ end))
 mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, Loading.blockInput)
 mod:AddCallback(ModCallbacks.MC_PRE_NPC_UPDATE, safe("hold_npc", Loading.holdNpc))
 mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, safe("block_pill", function(_, ent, hook, action)
-  return Cons.blockPill(ent, hook, action)
+  return Pills.blockPill(ent, hook, action)
 end))
 
--- Pickups the game filled without the DM's answer, to be swapped once it lands.
--- Payouts first (a scheduled machine/chest cancels the game's), then tinted rock loot, then the drop catcher.
-mod:AddCallback(ModCallbacks.MC_POST_PICKUP_INIT, safe("pickup_init", function(_, pickup)
-  if Payouts.onPickupInit(pickup) then return end
-  if Rocks.onPickupInit(pickup) then return end
-  if Catcher.onPickupInit(pickup, Bridge) then return end
-  Sched.onPickupInit(pickup)
-  Cons.onPickupInit(pickup)
-end))
-
-mod:AddCallback(ModCallbacks.MC_POST_PICKUP_UPDATE, safe("pickup_update", function(_, pickup)
-  Payouts.onPickupUpdate(pickup)
-end))
-
-mod:AddCallback(ModCallbacks.MC_POST_NPC_DEATH, safe("npc_death", function(_, npc)
-  Catcher.onNpcDeath(npc)
-end))
-
-mod:AddCallback(ModCallbacks.MC_PRE_SPAWN_CLEAN_AWARD, safe("clean_award", function(_, rng, pos)
-  return Sched.onCleanAward(rng, pos)
-end))
-
-mod:AddCallback(ModCallbacks.MC_PRE_GET_COLLECTIBLE, safe("get_collectible", function(_, pool, decrease, seed)
-  return Sched.onGetCollectible(pool, decrease, seed)
-end))
-
-mod:AddCallback(ModCallbacks.MC_GET_CARD, safe("get_card", function(_, rng, card, playing, runes, onlyRunes)
-  return Cons.onGetCard(rng, card, playing, runes, onlyRunes)
-end))
-
-mod:AddCallback(ModCallbacks.MC_GET_TRINKET, safe("get_trinket", function(_, trinket, rng)
-  return Cons.onGetTrinket(trinket, rng)
-end))
-
-mod:AddCallback(ModCallbacks.MC_GET_PILL_EFFECT, safe("get_pill_effect", function(_, effect, color)
-  return Cons.onGetPillEffect(effect, color)
-end))
+-- Every roll the game makes: spawns, kills, the clear award, pedestals, cards, trinkets, pills, curses.
+Rolls.register(mod, safe)
 
 mod:AddCallback(ModCallbacks.MC_USE_PILL, safe("use_pill", function(_, effect)
-  Cons.onUsePill(effect)
+  Causes.notePlayerUse()
+  Pills.onUsePill(effect)
   State.onPillUsed()
 end))
-
-mod:AddCallback(ModCallbacks.MC_POST_CURSE_EVAL, safe("curse_eval", function(_, curses)
-  return Sched.onCurseEval(curses)
-end))
+for _, name in ipairs({ "MC_USE_CARD", "MC_USE_ITEM" }) do
+  if ModCallbacks[name] then
+    mod:AddCallback(ModCallbacks[name], safe(name:lower(), function() Causes.notePlayerUse() end))
+  end
+end
 
 mod:AddCallback(ModCallbacks.MC_ENTITY_TAKE_DMG, safe("take_dmg", function(_, ent, amount, flags, source)
   local p = ent:ToPlayer()

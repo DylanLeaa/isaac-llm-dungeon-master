@@ -3,6 +3,10 @@
 The model is free to be as nasty as it likes *inside* the schema; `clamp()` is
 the referee that keeps every decision legal for the game and keeps runs
 beatable. The mod trusts whatever comes out of clamp().
+
+Most kinds are decks: a short list of outcomes the mod draws from as the game rolls (ctx.wanted entries,
+replacing the unconsumed ctx.deck_left). clamp() also holds every answer to the floor's economy
+(economy.Budget): outcomes past a family's budget become "nothing".
 """
 from __future__ import annotations
 
@@ -10,9 +14,14 @@ import re
 from typing import Any
 
 from catalog import (BOMBS, CARDS, CHAMPION_COLORS, COINS, CURSES, ENEMIES, HEARTS, KEYS,
-                     LAYOUT_PICKUP_MODES, PAYOUT_OUTCOMES, PILLS, REWARDS, TRAPS, TREASURE_DISTANCE)
+                     LAYOUT_PICKUP_MODES, PAYMENT, PAYOUT_OUTCOMES, PILLS, REWARDS, SHOP_VALUE, TRAPS,
+                     TREASURE_DISTANCE, VANILLA_PICKUPS_PER_CLEAR)
+from economy import Budget, normal_rooms
 
-KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "consumables", "payout_plan")
+KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "cards", "trinkets", "pills", "drops",
+         "payout_plan")
+_DECK = ("context.wanted is how many entries to write; context.deck_left is what is still unused, and your "
+         "answer replaces it; context.drawn_so_far is what was already handed out. ")
 
 _TAUNT = {"type": "string", "maxLength": 60,
           "description": "Shown on screen. <=60 chars, plain ASCII, empty string for silence."}
@@ -64,9 +73,8 @@ TOOLS: dict[str, dict[str, Any]] = {
         "name": "decide_room_clear",
         "description": "Decide the room-clear reward that drops when the last enemy dies. "
                        "When context.mode is 'bonus' (boss rooms) the game still drops its own reward "
-                       "and the boss item; yours is extra. context.suppressed_drops lists what the game would "
-                       "have dropped in this room (enemy deaths and natural spawns, which the engine "
-                       "swallowed): anything you do not put back in `rewards` is lost to the player.",
+                       "and the boss item; yours is extra. context.kills_dropped is what this room's kills "
+                       "already dropped from your drops deck.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -117,25 +125,53 @@ TOOLS: dict[str, dict[str, Any]] = {
             "required": ["intent", "add_curses", "treasure_distance", "taunt"],
         },
     },
-    "consumables": {
-        "name": "decide_consumables",
-        "description": "Plan the random consumables for this floor: the next cards/runes and trinkets the "
-                       "game hands out (from any source: your drops, chests, layouts, machines), and the "
-                       "effect of each pill colour in context.pill_colors_to_assign. A pill colour keeps "
-                       "its effect for the rest of the run once it is swallowed. The taunt appears the "
-                       "first time anything from this plan is used.",
+    "cards": {
+        "name": "decide_cards",
+        "description": "Write the next cards/runes the game hands out on this floor, from any source (drops, "
+                       "chests, machines, rooms), in order. " + _DECK + "context.owed lists draws the game is "
+                       "already waiting on (it is frozen until you answer): cover each one first. A runes_only "
+                       "draw takes only a rune, runes false forbids runes, playing false forbids playing and "
+                       "special cards; a draw takes the first card that fits. The taunt shows when the first "
+                       "card of this deck is handed out.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "intent": _INTENT,
                 "cards": {"type": "array", "maxItems": 5, "items": {"type": "string", "enum": list(CARDS)},
-                          "description": "Handed out in this order. Draws that only allow runes (or "
-                                         "forbid them) take the first card that fits."},
+                          "description": "Handed out in this order."},
+                "taunt": _TAUNT, "scheme": _SCHEME,
+            },
+            "required": ["intent", "cards", "taunt"],
+        },
+    },
+    "trinkets": {
+        "name": "decide_trinkets",
+        "description": "Write the next trinkets the game hands out on this floor, from any source, in order: "
+                       "ids from context.trinket_candidates. " + _DECK + "context.owed counts trinkets already "
+                       "on the floor waiting on you (the game is frozen): write at least that many. The taunt "
+                       "shows when the first trinket of this deck is handed out.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intent": _INTENT,
                 "trinkets": {"type": "array", "maxItems": 4, "items": {"type": "integer"},
-                             "description": "Ids from context.trinket_candidates, in hand-out order. An empty "
-                                            "queue doesn't stop trinkets dropping: each one is held until a plan "
-                                            "names it. context.drops_waiting counts the cards and trinkets "
-                                            "already on the floor: plan at least one for each."},
+                             "description": "Ids from context.trinket_candidates, in hand-out order."},
+                "taunt": _TAUNT, "scheme": _SCHEME,
+            },
+            "required": ["intent", "trinkets", "taunt"],
+        },
+    },
+    "pills": {
+        "name": "decide_pills",
+        "description": "Decide what each pill colour in context.pill_colors_to_assign does. A colour keeps its "
+                       "effect for the rest of the run once it is swallowed (context.pills_locked lists those), "
+                       "so a colour is a promise. context.owed lists colours the player is trying to swallow "
+                       "right now (the game is frozen until you answer). The taunt shows when the first pill "
+                       "of this answer is swallowed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intent": _INTENT,
                 "pills": {"type": "array", "maxItems": 13,
                           "items": {"type": "object", "properties": {
                               "color": {"type": "integer"},
@@ -144,7 +180,30 @@ TOOLS: dict[str, dict[str, Any]] = {
                           "description": "One entry per colour in context.pill_colors_to_assign."},
                 "taunt": _TAUNT, "scheme": _SCHEME,
             },
-            "required": ["intent", "cards", "trinkets", "pills", "taunt"],
+            "required": ["intent", "pills", "taunt"],
+        },
+    },
+    "drops": {
+        "name": "decide_drops",
+        "description": "Write what each kill (and each poop, fire, urn or skull the player breaks) drops in "
+                       "the room the player just entered, one entry per kill, in the order they happen. The "
+                       "engine cancels the game's own drop for every one of them and drops your entry instead. "
+                       + _DECK + "Vanilla drops nothing for most kills: 'nothing' is the normal entry. Keys, "
+                       "bombs, coins and hearts here come out of the same floor budget as room-clear rewards "
+                       "and chests (context.economy).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intent": _INTENT,
+                "outcomes": {"type": "array", "maxItems": 8,
+                             "items": {"type": "object", "properties": {
+                                 "reward": {"type": "string", "enum": [*REWARDS, "nothing"]},
+                                 "count": {"type": "integer", "minimum": 1, "maximum": 2}},
+                                 "required": ["reward"]},
+                             "description": "One per kill, in order."},
+                "taunt": _TAUNT, "scheme": _SCHEME,
+            },
+            "required": ["intent", "outcomes", "taunt"],
         },
     },
     "payout_plan": {
@@ -154,7 +213,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                        "paid use, in order: what the 1st, 2nd, 3rd... use yields; an entry may be "
                        "'nothing' (it takes the payment and stiffs the player). For a chest "
                        "(source_class 'chest') `schedule` is everything it holds when opened. 'item' means "
-                       "a pedestal item from the source's item pool (only if context.has_item_pool).",
+                       "a pedestal item from the source's item pool (only if context.has_item_pool). A "
+                       "machine is an exchange: what it pays back per payment is capped by a house edge, and "
+                       "it never spends the floor's budget. A chest's contents count against the budget once "
+                       "it is opened. Asked again with context.uses_so_far when a schedule runs low: extend "
+                       "the story, the uses already paid stand.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -197,53 +260,24 @@ def mercy_active(state: dict) -> bool:
     return _hp_half_hearts(state) <= 2
 
 
-def _card_fits(cat: str, draw: dict) -> bool:
-    """The mod's cardFits: whether a card of `cat` can be handed out by this draw."""
-    if draw.get("runes_only"):
-        return cat == "rune"
-    if cat == "rune":
-        return bool(draw.get("runes"))
-    if cat in ("playing", "special"):
-        return bool(draw.get("playing"))
-    return True
-
-
-def _fill_waiting(out: dict, trinkets: list[int], ctx: dict, notes: list[str]) -> None:
-    """Cards and trinkets already on the floor (context.drops_waiting) are held until the plan says what
-    they become. An empty queue can't stop them dropping, so it is topped up until each has one."""
-    waiting = ctx.get("drops_waiting") or {}
+def _int(v: Any, default: int) -> int:
     try:
-        need = max(0, min(4, int(waiting.get("trinkets") or 0)))
+        return int(v)
     except (TypeError, ValueError):
-        need = 0
-    added = 0
-    for c in ctx.get("trinket_candidates", []):
-        if len(trinkets) >= need:
-            break
-        i = c.get("id")
-        if isinstance(i, int) and i not in trinkets:
-            trinkets.append(i)
-            added += 1
-    if added:
-        notes.append(f"trinket queue +{added} (a trinket is waiting on it)")
-    cards, free, added = out["cards"], list(range(len(out["cards"]))), 0
-    for draw in waiting.get("cards") or []:
-        if not isinstance(draw, dict):
-            continue
-        hit = next((i for i in free if _card_fits(cards[i]["cat"], draw)), None)
-        if hit is not None:
-            free.remove(hit)
-            continue
-        key = next((k for k, (_, cat, _) in CARDS.items() if _card_fits(cat, draw)), None)
-        if key and len(cards) < 5:
-            cards.append({"key": key, "enum": CARDS[key][0], "cat": CARDS[key][1]})
-            added += 1
-    if added:
-        notes.append(f"card queue +{added} (a card is waiting on it)")
+        return default
 
 
-def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: dict) -> dict:
+def _wanted(ctx: dict, default: int, cap: int) -> int:
+    """How many entries a deck answer may hold: context.wanted, within the schema's maximum."""
+    return max(1, min(cap, _int(ctx.get("wanted"), default)))
+
+
+def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: dict,
+          budget: Budget | None = None) -> dict:
+    """The legal, fair version of `raw`. With a `budget` (the floor's economy, less this key's own row),
+    gifts past a family's budget are trimmed, in deck order; mercy and the drought breakers come after."""
     cruelty = max(0, min(10, int(cruelty)))
+    budget = budget or Budget(None, None)
     mercy = mercy_active(state)
     floor_trolls = int(counters.get("troll_bombs_floor", 0))
     troll_budget = 0 if (mercy or cruelty < 4) else max(0, 1 + cruelty // 4 - floor_trolls)
@@ -253,6 +287,12 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         "scheme": _clean_text(raw.get("scheme"), 160),
     }
     notes: list[str] = []
+
+    def afford(name: str, n: int) -> int:
+        n, note = budget.allow(name, n)
+        if note:
+            notes.append(note)
+        return n
 
     if kind == "room_layout":
         cap = min(0.6, 0.06 * cruelty)
@@ -264,17 +304,17 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         if color in CHAMPION_COLORS:
             out["champion_enum"] = CHAMPION_COLORS[color][0]
 
-        budget = round(cruelty / 3.3)                       # 0..3 extra enemies
+        budget_n = round(cruelty / 3.3)                     # 0..3 extra enemies
         if mercy:
-            budget = min(budget, 1)
+            budget_n = min(budget_n, 1)
         if ctx.get("first_room_of_floor"):
-            budget = 0
+            budget_n = 0
         extras, spent = [], 0
         for e in raw.get("extra_enemies") or []:
             spec = ENEMIES.get(e.get("enemy"))
-            if not spec or spent >= budget:
+            if not spec or spent >= budget_n:
                 continue
-            n = max(1, min(int(e.get("count") or 1), budget - spent))
+            n = max(1, min(int(e.get("count") or 1), budget_n - spent))
             spent += n
             extras.append({"key": e["enemy"], "etype": spec["etype"], "variant": spec["variant"], "count": n})
         out["extra_enemies"] = extras
@@ -301,10 +341,11 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
                     continue
                 troll_budget -= 1
                 room_trolls += 1
-            bonus.append(r)
+            if afford(r, 1):
+                bonus.append(r)
         out["bonus_pickups"] = bonus
 
-        # What every tinted rock in the room drops. Empty = the game's own loot.
+        # What every tinted rock in the room drops. Empty = the game's own loot. Only charged when bombed.
         asked = raw.get("tinted_rock_loot") if isinstance(raw.get("tinted_rock_loot"), list) else []
         loot: list[str] = []
         for r in [r for r in asked if isinstance(r, str) and r in REWARDS][:2]:
@@ -322,11 +363,7 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         out["tinted_rock_loot"] = loot
 
     elif kind == "room_clear":
-        supp = _suppressed(ctx)
-        # boss rooms keep their own reward too; swallowed drops may be put back on top of the budget
-        cap = (2 if ctx.get("mode") == "bonus" else 4) + min(sum(supp.values()), 3)
-        if supp:
-            out["suppressed"] = supp
+        cap = 2 if ctx.get("mode") == "bonus" else 4       # boss rooms keep their own reward too
         rewards, total = [], 0
         for r in (raw.get("rewards") or [])[:3]:
             name = r.get("reward")
@@ -344,6 +381,9 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
             n = min(n, cap - total)
             if n <= 0:
                 break
+            n = afford(name, n)
+            if n <= 0:
+                continue
             total += n
             rewards.append({"reward": name, "count": n})
         # Drought breaker: the house may starve you, but not soft-lock you.
@@ -362,6 +402,41 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
             rewards.append({"reward": "half_heart", "count": 1})
             notes.append("mercy: half heart")
         out["rewards"] = rewards
+
+    elif kind == "drops":
+        wanted = _wanted(ctx, 8, 8)
+        # Kill drops are rare in vanilla: a floor-wide count, scaled from the clear rate and cruelty.
+        floor_cap = round(normal_rooms(state) * VANILLA_PICKUPS_PER_CLEAR * max(0.5, 1.5 - 0.08 * cruelty))
+        left = max(0, floor_cap - int(counters.get("drops_floor", 0)))
+        outcomes = []
+        for r in (raw.get("outcomes") or [])[:wanted]:
+            name = r.get("reward") if isinstance(r, dict) else None
+            n = max(1, min(2, _int(r.get("count") if isinstance(r, dict) else 1, 1)))
+            if name not in REWARDS:
+                name = "nothing"                           # every entry is one kill: keep its place
+            if name == "troll_bomb":
+                if troll_budget <= 0:
+                    notes.append("troll_bomb -> nothing (budget/mercy)")
+                    name = "nothing"
+                else:
+                    n, troll_budget = 1, troll_budget - 1
+            elif name in TRAPS and mercy:
+                notes.append(f"{name} -> nothing (mercy)")
+                name = "nothing"
+            if name in ("golden_key", "golden_bomb", "eternal_heart"):
+                n = 1
+            if name != "nothing":
+                if left <= 0:
+                    notes.append(f"{name} -> nothing (this floor's kill drops are spent)")
+                    name = "nothing"
+                else:
+                    n = afford(name, n)
+                    if n <= 0:
+                        name, n = "nothing", 1
+                    else:
+                        left -= 1
+            outcomes.append({"reward": name, "count": n if name != "nothing" else 1})
+        out["outcomes"] = outcomes
 
     elif kind == "payout_plan":
         out["schedule"] = _clamp_schedule(raw.get("schedule") or [], ctx, cruelty, mercy, troll_budget, notes)
@@ -395,9 +470,11 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         td = raw.get("treasure_distance")
         out["treasure_distance"] = td if td in TREASURE_DISTANCE else "any"
 
-    elif kind == "consumables":
+    elif kind == "cards":
         out["cards"] = [{"key": c, "enum": CARDS[c][0], "cat": CARDS[c][1]}
-                        for c in (raw.get("cards") or [])[:5] if c in CARDS]
+                        for c in (raw.get("cards") or [])[:_wanted(ctx, 5, 5)] if c in CARDS]
+
+    elif kind == "trinkets":
         cands = {int(c["id"]) for c in ctx.get("trinket_candidates", []) if "id" in c}
         trinkets: list[int] = []
         for i in raw.get("trinkets") or []:
@@ -405,10 +482,11 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
                 i = int(i)
             except (TypeError, ValueError):
                 continue
-            if i in cands and i not in trinkets and len(trinkets) < 4:
+            if i in cands and i not in trinkets and len(trinkets) < _wanted(ctx, 4, 4):
                 trinkets.append(i)
-        _fill_waiting(out, trinkets, ctx, notes)
         out["trinkets"] = trinkets
+
+    elif kind == "pills":
         out["pills"] = _clamp_pills(raw.get("pills") or [], ctx, cruelty, notes)
 
     else:
@@ -419,34 +497,23 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
     return out
 
 
-def _suppressed(ctx: dict) -> dict[str, int]:
-    """context.suppressed_drops as clean {name: count}: the pickups the engine swallowed in this room."""
-    raw = ctx.get("suppressed_drops")
-    out: dict[str, int] = {}
-    if isinstance(raw, dict):
-        for name, n in raw.items():
-            try:
-                n = int(n)
-            except (TypeError, ValueError):
-                continue
-            if n > 0:
-                out[str(name)[:24]] = n
-    return out
-
-
 def _clamp_schedule(raw: list, ctx: dict, cruelty: int, mercy: bool, troll_budget: int,
                     notes: list[str]) -> list[dict]:
-    """A beggar/machine's per-use payouts, or a chest's contents, held to the same rules as a clear."""
+    """A beggar/machine's per-use payouts, or a chest's contents, held to the same rules as a clear.
+    A machine also keeps a house edge: over its uses it pays back at most this share of what it was paid
+    (shop prices), plus one small win up front; at most one 'item' jackpot, outside the edge."""
     chest = ctx.get("source_class") == "chest"
     has_item = bool(ctx.get("has_item_pool"))
     limit = 4 if chest else 6
     max_nothing = 0 if cruelty < 3 else 1 + cruelty // 4    # consecutive stiffed uses; 0 = it always pays
-    out, run, pickups = [], 0, 0
+    payment = PAYMENT.get(str(ctx.get("source")), 1)
+    ratio = 1.0 - 0.05 * cruelty
+    out, run, pickups, paid, items = [], 0, 0, 0.0, 0
     for r in raw[:limit] if isinstance(raw, list) else []:
         if not isinstance(r, dict):
             continue
         name = r.get("reward")
-        if name == "item" and not has_item:
+        if name == "item" and (not has_item or items >= 1):
             continue
         if name not in REWARDS and name not in PAYOUT_OUTCOMES:
             continue
@@ -454,6 +521,11 @@ def _clamp_schedule(raw: list, ctx: dict, cruelty: int, mercy: bool, troll_budge
             n = max(1, min(2, int(r.get("count") or 1)))
         except (TypeError, ValueError):
             n = 1
+        if not chest and name not in ("nothing", "item"):
+            allowed = ratio * payment * (len(out) + 1) + 5
+            if paid + SHOP_VALUE.get(name, 5) * n > allowed + 1e-9:
+                notes.append(f"use {len(out) + 1}: {name} -> nothing (house edge)")
+                name, n = "nothing", 1
         if name == "nothing":
             if mercy:
                 name, n = "half_heart", 1
@@ -468,7 +540,7 @@ def _clamp_schedule(raw: list, ctx: dict, cruelty: int, mercy: bool, troll_budge
         if name != "nothing":
             run = 0
         if name == "item":
-            n = 1
+            n, items = 1, items + 1
         elif name == "troll_bomb":
             n = min(n, troll_budget, 1)
             troll_budget -= n
@@ -482,6 +554,8 @@ def _clamp_schedule(raw: list, ctx: dict, cruelty: int, mercy: bool, troll_budge
             if n <= 0:
                 break
             pickups += n if name != "nothing" else 0
+        if name != "item":
+            paid += SHOP_VALUE.get(name, 5) * n
         out.append({"reward": name, "count": n})
     return out
 
@@ -584,10 +658,14 @@ def clamp_diff(kind: str, raw: Any, out: Any) -> list[str]:
         check("curses", listed(raw.get("add_curses")), listed(out.get("add_curses")))
         if raw.get("treasure_distance") not in (None, "any"):
             check("treasure", str(raw["treasure_distance"]), str(out.get("treasure_distance")))
-    elif kind == "consumables":
+    elif kind == "drops":
+        check("outcomes", counted(raw.get("outcomes"), "reward"), counted(out.get("outcomes"), "reward"))
+    elif kind == "cards":
         check("cards", listed(raw.get("cards")), listed(c["key"] for c in out.get("cards") or []))
+    elif kind == "trinkets":
         check("trinkets", listed(raw.get("trinkets")), listed(out.get("trinkets")))
-        asked = {str(p.get("color")): p.get("effect") for p in raw.get("pills") or [] if isinstance(p, dict)}
+    elif kind == "pills":
+        asked ={str(p.get("color")): p.get("effect") for p in raw.get("pills") or [] if isinstance(p, dict)}
         got = {str(p["color"]): p["effect"] for p in out.get("pills") or []}
         for color, effect in asked.items():
             if got.get(color) != effect:
