@@ -132,7 +132,10 @@ TOOLS: dict[str, dict[str, Any]] = {
                           "description": "Handed out in this order. Draws that only allow runes (or "
                                          "forbid them) take the first card that fits."},
                 "trinkets": {"type": "array", "maxItems": 4, "items": {"type": "integer"},
-                             "description": "Ids from context.trinket_candidates, in hand-out order."},
+                             "description": "Ids from context.trinket_candidates, in hand-out order. An empty "
+                                            "queue doesn't stop trinkets dropping: each one is held until a plan "
+                                            "names it. context.drops_waiting counts the cards and trinkets "
+                                            "already on the floor: plan at least one for each."},
                 "pills": {"type": "array", "maxItems": 13,
                           "items": {"type": "object", "properties": {
                               "color": {"type": "integer"},
@@ -192,6 +195,51 @@ def _hp_half_hearts(state: dict) -> int:
 def mercy_active(state: dict) -> bool:
     """Player is one or two hits from death: the DM may sneer, not execute."""
     return _hp_half_hearts(state) <= 2
+
+
+def _card_fits(cat: str, draw: dict) -> bool:
+    """The mod's cardFits: whether a card of `cat` can be handed out by this draw."""
+    if draw.get("runes_only"):
+        return cat == "rune"
+    if cat == "rune":
+        return bool(draw.get("runes"))
+    if cat in ("playing", "special"):
+        return bool(draw.get("playing"))
+    return True
+
+
+def _fill_waiting(out: dict, trinkets: list[int], ctx: dict, notes: list[str]) -> None:
+    """Cards and trinkets already on the floor (context.drops_waiting) are held until the plan says what
+    they become. An empty queue can't stop them dropping, so it is topped up until each has one."""
+    waiting = ctx.get("drops_waiting") or {}
+    try:
+        need = max(0, min(4, int(waiting.get("trinkets") or 0)))
+    except (TypeError, ValueError):
+        need = 0
+    added = 0
+    for c in ctx.get("trinket_candidates", []):
+        if len(trinkets) >= need:
+            break
+        i = c.get("id")
+        if isinstance(i, int) and i not in trinkets:
+            trinkets.append(i)
+            added += 1
+    if added:
+        notes.append(f"trinket queue +{added} (a trinket is waiting on it)")
+    cards, free, added = out["cards"], list(range(len(out["cards"]))), 0
+    for draw in waiting.get("cards") or []:
+        if not isinstance(draw, dict):
+            continue
+        hit = next((i for i in free if _card_fits(cards[i]["cat"], draw)), None)
+        if hit is not None:
+            free.remove(hit)
+            continue
+        key = next((k for k, (_, cat, _) in CARDS.items() if _card_fits(cat, draw)), None)
+        if key and len(cards) < 5:
+            cards.append({"key": key, "enum": CARDS[key][0], "cat": CARDS[key][1]})
+            added += 1
+    if added:
+        notes.append(f"card queue +{added} (a card is waiting on it)")
 
 
 def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: dict) -> dict:
@@ -359,6 +407,7 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
                 continue
             if i in cands and i not in trinkets and len(trinkets) < 4:
                 trinkets.append(i)
+        _fill_waiting(out, trinkets, ctx, notes)
         out["trinkets"] = trinkets
         out["pills"] = _clamp_pills(raw.get("pills") or [], ctx, cruelty, notes)
 

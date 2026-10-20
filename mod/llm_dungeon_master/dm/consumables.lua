@@ -71,10 +71,27 @@ local function trinketCandidates()
   return out
 end
 
+-- The cards and trinkets already on the floor, held until a plan says what they become.
+local function dropsWaiting()
+  local trinkets, cards = 0, {}
+  for _, s in ipairs(swaps) do
+    local d = s.d
+    if d.kind == "trinket" then trinkets = trinkets + 1
+    else cards[#cards + 1] = { runes = d.runes and true or false, playing = d.playing and true or false,
+                               runes_only = d.onlyRunes and true or false } end
+  end
+  if trinkets == 0 and #cards == 0 then return nil end
+  return { trinkets = trinkets, cards = cards }
+end
+
 --- force: the game is waiting on this plan, so the per-floor cap doesn't apply.
 local function request(reason, force)
   if sends >= cfg.MAX_CONSUMABLE_SENDS and not force then return end
   sends, lastAskAt = sends + 1, Isaac.GetTime()
+  local waiting = dropsWaiting()
+  if waiting then
+    reason = "a card or trinket just dropped and is waiting on your queue (context.drops_waiting)"
+  end
   local colors, lockedList = {}, {}
   askedColors = {}
   for c in pairs(seenColors) do
@@ -85,7 +102,7 @@ local function request(reason, force)
   for c, l in pairs(locked) do lockedList[#lockedList + 1] = { color = c, look = look(c), effect = l.effect } end
   Bridge.request("consumables", key(), State.snapshot(), {
     reason = reason, pill_colors_to_assign = colors, pills_locked = lockedList,
-    trinket_candidates = trinketCandidates(),
+    trinket_candidates = trinketCandidates(), drops_waiting = waiting,
   }, 10000)
 end
 
