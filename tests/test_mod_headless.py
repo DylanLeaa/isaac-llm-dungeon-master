@@ -1,8 +1,9 @@
 """Headless run of the whole mod (main.lua + dm/*) on a fake Isaac API, against server.py --mock.
 
-Walks a tiny floor: start room -> fight in a normal room -> treasure item -> consumables ->
-a golden chest -> boss room, and checks the prefetch timing: the room-clear decision must be
-requested *during* the fight (not at the end) and be ready when the last enemy dies.
+Walks a tiny floor: start room -> fight in a normal room -> treasure item -> card, trinket and pill
+decks -> a golden chest -> boss room -> kills that pop the drops deck -> machines and chests, and checks
+the prefetch timing (the room-clear decision must be requested *during* the fight, not at the end, and
+be ready when the last enemy dies) and the roll audit (nothing this walk covers went to vanilla).
 """
 import json
 import subprocess
@@ -98,9 +99,22 @@ def run(tmp, game):
         return M""")
     g.ModConfigMenu = mcm
     lua.execute(open(MOD / "main.lua").read())
-    Bridge, Sched = modules["dm.bridge"], modules["dm.scheduler"]
+    Bridge, Sched, Decks = modules["dm.bridge"], modules["dm.scheduler"], modules["dm.decks"]
     MC = g.ModCallbacks
     t0 = time.monotonic()
+
+    def reqs(key):
+        return [m for m in sent(game) if m.get("t") == "req" and m.get("key") == key]
+
+    def drawn(key):
+        return [m for m in sent(game) if m.get("t") == "drawn" and m.get("key") == key]
+
+    def deck_of(key):
+        res = Bridge.peek(key)
+        return to_py(res.decision) if res else None
+
+    def rolls_sent():
+        return sum(1 for m in sent(game) if m.get("t") == "event" and m.get("name") == "rolls")
 
     def tick(n=1):
         for _ in range(n):
@@ -158,7 +172,7 @@ def run(tmp, game):
     W.enemies = enemies
     before = len(W.spawned) + len(W.removedGrid)
     W.enter(85)
-    assert Bridge.peek("layout:1:85") is None, "layout decision should have been consumed"
+    assert Decks.left("layout", 85) == 0 and drawn("layout:1:85"), "the room's layout deck was drawn on entry"
     tick()
     changes = len(W.spawned) + len(W.removedGrid) + len(W.gridSpawned) - before
     champs = sum(1 for i in range(1, 4) if enemies[i].champion)
@@ -202,26 +216,27 @@ def run(tmp, game):
     print(f"6. treasure pedestal -> item {got} (quality {q.get(got)}); removed from pool: {W.removedItem}")
     assert got is not None and W.removedItem == got
 
-    # --- consumables: floor plan, then a pill colour the plan doesn't cover ------
-    def plan():
-        res = Bridge.peek("cons:1")
-        return to_py(res.decision) if res else None
+    # --- card, trinket and pill decks: stocked from floor start, then a pill colour none covers -----
+    def pills():
+        return (deck_of("pills:1") or {}).get("pills") or []
 
-    wait(plan, 6, "consumables plan")
+    wait(lambda: deck_of("cards:1") and deck_of("trinkets:1"), 6, "the card and trinket decks")
+    assert reqs("cards:1")[0]["ctx"]["wanted"] == 2 and reqs("cards:1")[0]["ctx"]["deck_left"] in ([], {})
     W.heldPill = 5
-    wait(lambda: any(int(p["color"]) == 5 for p in (plan() or {}).get("pills") or []), 8,
-         "a re-asked plan covering the held pill colour")
-    pill5 = next(p for p in plan()["pills"] if int(p["color"]) == 5)
+    wait(lambda: any(int(p["color"]) == 5 for p in pills()), 8, "a pills answer covering the held colour")
+    pill5 = next(p for p in pills() if int(p["color"]) == 5)
+    trinkets = list(deck_of("trinkets:1")["trinkets"])
     rng = g.RNG()
     card = W.fire(MC.MC_GET_CARD, rng, 0, True, True, False)
     rune = W.fire(MC.MC_GET_CARD, rng, 0, True, True, True)
-    print(f"7. consumables plan: card draw -> {card}, rune-only draw -> {rune}")
+    print(f"7. cards deck: card draw -> {card}, rune-only draw -> {rune}")
     assert card == g.Card.CARD_TOWER and rune == g.Card.RUNE_HAGALAZ
+    assert [m["outcome"]["card"] for m in drawn("cards:1")] == ["tower", "rune_hagalaz"]
     trinket = W.fire(MC.MC_GET_TRINKET, 0, rng)
     golden = W.fire(MC.MC_GET_TRINKET, 32768, rng)
     print(f"   trinket draws -> {trinket}, golden {golden}; removed from pool: {W.removedTrinket}")
-    assert trinket == plan()["trinkets"][0] and W.removedTrinket == golden - 32768
-    assert golden == plan()["trinkets"][1] | 32768
+    assert trinket == trinkets[0] and W.removedTrinket == golden - 32768
+    assert golden == trinkets[1] | 32768
 
     effect = W.fire(MC.MC_GET_PILL_EFFECT, 0, 5)
     W.fire(MC.MC_USE_PILL, effect)
@@ -245,25 +260,28 @@ def run(tmp, game):
     boss = lua.table_from([W.makeEnemy(100)])
     W.enemies = boss
     W.enter(86)
-    wait(lambda: Bridge.peek("floor:1:next"), 6, "floor plan")
+    wait(lambda: Bridge.peek("curses:1"), 6, "floor plan")
     fight(boss, 1, "clear:1:86", 30)
     ready = Bridge.peek("clear:1:86") is not None
     ret = W.fire(MC.MC_PRE_SPAWN_CLEAN_AWARD, g.RNG(), g.Vector(320, 280))
     print(f"10. boss dead; bonus decision ready={ready}; PRE_SPAWN_CLEAN_AWARD returned {ret}"
           " (the game keeps its own boss award)")
-    assert ready and ret is None and Bridge.peek("clear:1:86") is None
+    assert ready and ret is None and Decks.left("clear", 86) == 0
     mask = W.fire(MC.MC_POST_CURSE_EVAL, 0)
     print(f"11. curse mask for floor 2 = {mask}")
     assert mask == 1
 
     # --- holds: whatever the DM hasn't answered yet, the game freezes for instead of deciding ---
-    Hold, Cons = modules["dm.loading"], modules["dm.consumables"]
+    Hold, Pills = modules["dm.loading"], modules["dm.streams.pills"]
     FREEZE = g.EntityFlag.FLAG_FREEZE
     W.rooms[87] = lua.table_from({"SafeGridIndex": 87, "GridIndex": 87, "VisitedCount": 0, "AwardSeed": 1,
                                   "Data": lua.table_from({"Type": g.RoomType.ROOM_DEFAULT, "Shape": 1, "Difficulty": 1})})
     W.adj[87] = lua.table_from([86])
     imp = W.makeEnemy(5)
     W.enemies = lua.table_from([imp])
+    # The room's own penny, spawned as it loads (MC_PRE_ROOM_ENTITY_SPAWN), and a rock (a grid entity).
+    W.roomEntities[87] = lua.table_from([lua.table_from([g.EntityType.ENTITY_PICKUP, g.PickupVariant.PICKUP_COIN, 1, 30]),
+                                         lua.table_from([1000, 0, 0, 31])])
     W.enter(87)                                    # never prefetched (not next to anywhere the player stood)
     assert Hold.active() and Hold.holding("layout:1:87"), "walking into an undressed room holds the game"
     assert Bridge.isPending("layout:1:87"), "...and asks for the room right then"
@@ -275,7 +293,7 @@ def run(tmp, game):
     tick()
     assert imp.flags & FREEZE, "a freeze the game cleared is put back"
     wait(lambda: not Hold.active(), 8, "the late room layout")
-    assert Bridge.peek("layout:1:87") is None and not imp.flags & FREEZE, "layout taken, enemies free again"
+    assert Decks.left("layout", 87) == 0 and not imp.flags & FREEZE, "layout drawn, enemies free again"
     assert W.fire(MC.MC_PRE_NPC_UPDATE, imp) is None, "enemy AI runs again"
     print("12. undressed room: game held until its layout came in, then dressed it")
 
@@ -286,7 +304,7 @@ def run(tmp, game):
     assert ret is True and Hold.holding("clear:1:87"), "the game's award is skipped and the game waits"
     assert Bridge.isPending("clear:1:87"), "the reward is asked for the moment the room clears"
     wait(lambda: not Hold.active(), 8, "the late room-clear reward")
-    assert Bridge.peek("clear:1:87") is None, "the late reward was taken"
+    assert Decks.left("clear", 87) == 0 and drawn("clear:1:87"), "the late reward was drawn"
     print("13. instant clear: award held until the DM's reward came in")
 
     devil = g.ItemPoolType.POOL_DEVIL              # never ranked
@@ -301,107 +319,80 @@ def run(tmp, game):
     print(f"14. unranked pedestal: held, then swapped to the DM's pick {pedestal.SubType}")
 
     W.heldPill = 7                                 # a colour no plan has covered
-    assert Cons.blockPill(g.Isaac.GetPlayer(0), g.InputHook.IS_ACTION_PRESSED, g.ButtonAction.ACTION_PILLCARD) is False
+    assert Pills.blockPill(g.Isaac.GetPlayer(0), g.InputHook.IS_ACTION_PRESSED, g.ButtonAction.ACTION_PILLCARD) is False
     W.pillPressed = True
-    assert Cons.blockPill(g.Isaac.GetPlayer(0), g.InputHook.IS_ACTION_TRIGGERED, g.ButtonAction.ACTION_PILLCARD) is False
+    assert Pills.blockPill(g.Isaac.GetPlayer(0), g.InputHook.IS_ACTION_TRIGGERED, g.ButtonAction.ACTION_PILLCARD) is False
     W.pillPressed = False
-    assert Hold.holding("cons:1"), "pressing the pill button holds the game for the plan"
-    wait(lambda: not Hold.active(), 8, "a plan covering the pill")
-    assert any(int(p["color"]) == 7 for p in plan()["pills"])
-    assert Cons.blockPill(g.Isaac.GetPlayer(0), g.InputHook.IS_ACTION_PRESSED, g.ButtonAction.ACTION_PILLCARD) is None
+    assert Hold.holding("pills:1"), "pressing the pill button holds the game for the pills deck"
+    owed = reqs("pills:1")[-1]["ctx"]["owed"]
+    assert [int(o["color"]) for o in owed] == [7], owed
+    wait(lambda: not Hold.active(), 8, "an answer covering the pill")
+    assert any(int(p["color"]) == 7 for p in pills())
+    assert Pills.blockPill(g.Isaac.GetPlayer(0), g.InputHook.IS_ACTION_PRESSED, g.ButtonAction.ACTION_PILLCARD) is None
     W.heldPill = 5
     print("15. uncovered pill: button held until the plan covered it, then free")
 
-    # --- drops the game would scatter mid-fight are swallowed and handed to the room clear -------
-    KEYS, SPAWN0 = g.KeySubType, len(W.spawned)
-    foe = W.makeEnemy(10)
-    W.enemies = lua.table_from([foe])
-    W.enter(85)                                    # a room the DM decides the clear of, armed on entry
-    PV = g.PickupVariant
-    heart = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_HEART, g.HeartSubType.HEART_HALF)
-    key = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_KEY, KEYS.KEY_NORMAL)
-    coin = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, 500, 100)
-    mine = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY)
-    item = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COLLECTIBLE, 2)
-    W.fire(MC.MC_POST_NPC_DEATH, foe)              # a kill: the heart and key it drops are swallowed
-    for p in (heart, key, coin, item):
-        W.fire(MC.MC_POST_PICKUP_INIT, p)
-    assert heart.removed and key.removed and coin.removed, "enemy-death and natural drops are swallowed"
-    assert not item.removed, "item pedestals are never touched"
-    # loot from a tinted rock the player bombs is theirs, even mid-fight (grid 22 stands at 360,40)
-    rock_loot = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_HEART, g.HeartSubType.HEART_SOUL, 360, 40)
-    tick()                                         # the rock is seen standing
-    W.gridState[22] = 2
-    W.fire(MC.MC_POST_PICKUP_INIT, rock_loot)
-    assert not rock_loot.removed, "a broken tinted rock's loot is never swallowed"
-    W.gridState[22] = None
-    g.Apply = modules["dm.apply"]
-    modules["dm.apply"].spawning = True            # the mod's own spawn must pass through
-    W.fire(MC.MC_POST_PICKUP_INIT, mine)
-    modules["dm.apply"].spawning = False
-    assert not mine.removed
-    foe.HitPoints = 0
+    # --- the drops deck: every kill pops it, and the game's own drop is cancelled ---------------
+    PV, KEYS = g.PickupVariant, g.KeySubType
+    Drops = modules["dm.streams.drops"]
+    REWARD_VARIANT = {"penny": PV.PICKUP_COIN, "half_heart": PV.PICKUP_HEART, "key": PV.PICKUP_KEY,
+                      "bomb": PV.PICKUP_BOMB}
+    wait(lambda: Decks.left("cards", 1) > 0, 6, "the cards deck restocked")
+    foes = [W.makeEnemy(10, 200, 200), W.makeEnemy(10, 420, 220), W.makeEnemy(10, 260, 340)]
+    W.enemies = lua.table_from(foes)
+    asks0 = len(reqs("drops:1"))
+    W.enter(85)                                    # back in room 85: its drops are asked on the way in
+    wait(lambda: len(reqs("drops:1")) > asks0 and not Bridge.isPending("drops:1"), 6, "the drops deck for this room")
+    req = reqs("drops:1")[-1]
+    assert req["ctx"]["wanted"] == 3 + 2 and req["ctx"]["enemies_left"] == 3, req["ctx"]
+    deck = [dict(o) for o in deck_of("drops:1")["outcomes"]]
+    assert Decks.left("drops", 1) == len(deck) >= 3, deck
+    d0, n0 = len(drawn("drops:1")), len(W.spawned)
+    # kill 1: its drop names the enemy as its spawner
+    W.kill(foes[0])
+    heart = W.spawnPickup(PV.PICKUP_HEART, g.HeartSubType.HEART_HALF, 200, 200, foes[0])
+    assert heart.removed, "the kill's own drop is cancelled"
+    # kill 2: a random pickup with no spawner, beside the kill (its variant chosen as it initialises)
+    W.kill(foes[1])
+    W.randomPickup = PV.PICKUP_KEY
+    key = W.spawnPickup(0, 0, 430, 220)
+    assert key.removed and key.Variant == PV.PICKUP_KEY, "a drop beside a kill is the kill's"
+    # kill 3 drops a blank card. Regression: its card used to be drawn from the cards deck, then the
+    # drop swallowed: the planned card was lost. A cancelled spawn's card is never drawn.
+    cards0 = (len(drawn("cards:1")), Decks.left("cards", 1))
+    W.kill(foes[2])
+    card = W.spawnPickup(PV.PICKUP_TAROTCARD, 0, 260, 340, foes[2])
+    assert card.removed and (len(drawn("cards:1")), Decks.left("cards", 1)) == cards0, \
+        "a cancelled kill drop takes nothing from the cards deck"
+    Apply = modules["dm.apply"]
+    Apply.spawning = True                          # the DM's own card (a "card" entry) draws exactly once
+    mine = W.spawnPickup(PV.PICKUP_TAROTCARD, 0, 260, 340)
+    Apply.spawning = False
+    assert not mine.removed and len(drawn("cards:1")) == cards0[0] + 1 and mine.SubType == g.Card.CARD_TOWER
+    tick(2)
+    assert len(drawn("drops:1")) == d0 + 3, "each kill drew one entry"
+    paid = [s.v for s in list(W.spawned.values())[n0:]]
+    want = [REWARD_VARIANT[e["reward"]] for e in deck[:3] for _ in range(int(e.get("count") or 1))
+            if e["reward"] != "nothing"]
+    assert paid == want, (paid, deck)
+    kills = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == "drops:1" for l in m["effect"]]
+    assert len(kills) == 3 and all("instead of the game's" in l for l in kills), kills
+    # the clear: decided with what the kills dropped
     tick()
     ret = W.fire(MC.MC_PRE_SPAWN_CLEAN_AWARD, g.RNG(), g.Vector(320, 280))
-    assert ret is True and Hold.holding("clear:1:85")
-    W.frame += 1                                   # the last kill's fallout, a frame after the clear
-    fallout = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_TRINKET, 133)
-    W.fire(MC.MC_POST_PICKUP_INIT, fallout)
-    assert fallout.removed, "a drop just after the clear is still swallowed, into the clear's tally"
-    wait(lambda: not Hold.active(), 8, "the clear reward that sees the swallowed drops")
-    req = [m for m in sent(game) if m.get("t") == "req" and m.get("key") == "clear:1:85"][-1]
-    assert req["ctx"]["suppressed_drops"] == {"half_heart": 1, "key": 1, "penny": 1}, req["ctx"]
-    eff = [m for m in sent(game) if m.get("t") == "effect" and m.get("key") == "clear:1:85"][-1]["effect"]
-    assert any("would have dropped, not replaced" in line for line in eff), eff
-    assert any("trinket" in line for line in eff), eff
-    W.frame += 30
-    late = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_HEART, g.HeartSubType.HEART_HALF)
-    W.fire(MC.MC_POST_PICKUP_INIT, late)
-    assert not late.removed, "once the clear has settled, drops pass through"
-    # The reward already out when the fallout lands: it is lost, and the clear says so.
-    Catcher, lost = modules["dm.dropcatcher"], []
-    Catcher.arm(999, True)
-    entry = Catcher.close(6)
-    Catcher.settle(entry, lambda name: lost.append(name))
-    W.frame += 2
-    fallout2 = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_TRINKET, 133)
-    W.fire(MC.MC_POST_PICKUP_INIT, fallout2)
-    assert fallout2.removed and len(lost) == 1 and entry.total == 0, (lost, entry.total)
-    W.frame += 10
-    late2 = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_TRINKET, 133)
-    W.fire(MC.MC_POST_PICKUP_INIT, late2)
-    assert not late2.removed and len(lost) == 1, "the trail ends a few frames after the clear"
-    # The room's own pickups spawn as it loads, before the catcher is armed: adopted once armed,
-    # unless the layout already removed or morphed them.
-    W.frame += 10
-    loaded = [W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_KEY, KEYS.KEY_NORMAL),
-              W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_BOMB, 1),
-              W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY)]
-    for p in loaded:
-        W.fire(MC.MC_POST_PICKUP_INIT, p)
-    assert not any(p.removed for p in loaded), "nothing is catching yet: they stay"
-    Catcher.arm(998, True)
-    loaded[1].removed = True                       # the layout removed this one
-    loaded[2].Variant, loaded[2].SubType = PV.PICKUP_HEART, 2   # and morphed this one
-    assert Catcher.adopt(modules["dm.bridge"]) == 1 and loaded[0].removed
-    assert dict(Catcher.counts().items()) == {"key": 1}, dict(Catcher.counts().items())
-    Catcher.release(Catcher.close())
-    stale = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_KEY, KEYS.KEY_NORMAL)
-    W.fire(MC.MC_POST_PICKUP_INIT, stale)
-    W.frame += 5
-    Catcher.arm(997, True)                         # a later room: last room's strays aren't its layout
-    assert Catcher.adopt(modules["dm.bridge"]) == 0 and not stale.removed
-    Catcher.close()
-    print("15b. kill drops swallowed, reward decided with them, shortfall reported:", eff, "| lost after the reward:", list(lost))
+    assert ret is True
+    wait(lambda: not Hold.active(), 8, "the clear reward")
+    paid_names = [e["reward"] for e in deck[:3] if e["reward"] != "nothing"]
+    assert list(reqs("clear:1:85")[-1]["ctx"].get("kills_dropped") or []) == paid_names
+    print("15b. kills drew the drops deck, the game's drops were cancelled:", kills)
 
     # --- a tinted rock holds what the room's layout planned, not the game's loot ---
-    Rocks = modules["dm.rockloot"]
+    Rocks = modules["dm.streams.rocks"]
     Rocks.plan(85, "layout:1:85", lua.table_from(["key", "penny"]))
     tick()                                         # grid 22 (at 360,40) is seen standing
     n0 = len(W.spawned)
     W.gridState[22] = 2                            # bombed: the game drops its soul heart
-    vanilla = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_HEART, g.HeartSubType.HEART_SOUL, 360, 40)
-    W.fire(MC.MC_POST_PICKUP_INIT, vanilla)
+    vanilla = W.spawnPickup(PV.PICKUP_HEART, g.HeartSubType.HEART_SOUL, 360, 40)
     assert vanilla.removed, "the game's loot from a planned rock is cancelled"
     tick(3)
     paid = [s.v for s in list(W.spawned.values())[n0:]]
@@ -410,6 +401,8 @@ def run(tmp, game):
     assert len(W.spawned) == n0 + 2, "a rock pays once"
     reff = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == "layout:1:85" for l in m["effect"]]
     assert "tinted rock bombed: +1 key, +1 penny (instead of the game's 1 soul heart)" in reff, reff
+    assert drawn("rock:1:85")[-1]["outcome"]["rewards"] == [{"reward": "key", "count": 1},
+                                                           {"reward": "penny", "count": 1}]
     W.gridState[22] = None
     print("15b2. tinted rock paid the DM's loot instead of the game's:", reff[-1])
 
@@ -430,8 +423,8 @@ def run(tmp, game):
         W.coins -= 1
         frames(10)
         if vanilla:
-            p = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, 330, 330)
-            W.fire(MC.MC_POST_PICKUP_INIT, p)
+            p = W.spawnPickup(PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, 330, 330, beggar)
+            frames(1)
             return p
     SPAWN0 = len(W.spawned)
     v1 = payout(True)
@@ -444,22 +437,32 @@ def run(tmp, game):
     assert W.spawned[len(W.spawned)].v == PV.PICKUP_COIN, "use 3: the game paid nothing, the scheduled penny is paid anyway"
     effects = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == pkey for l in m["effect"]]
     assert any("use 1" in l and "+1 key" in l for l in effects) and any("use 2: nothing" in l for l in effects), effects
+    assert [m["cause"] for m in drawn(pkey)] == ["slot_use"] * 3
     print("15c. beggar paid on its schedule:", effects)
 
-    # --- a golden chest's contents are fixed when it appears and paid when it opens ---
+    # --- a golden chest's contents are fixed when it appears and paid when it opens. Regression: its item
+    # was taken from the item ranking, and then the payout removed that pedestal and paid the schedule. ---
     chest = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_LOCKEDCHEST, 1, 400, 300)
     W.pickups = lua.table_from([chest])
     frames(60)                                     # the beggar is gone: its payout window can't claim the loot
     ckey = f"payout:1:{int(chest.InitSeed)}"
-    wait(lambda: Bridge.peek(ckey), 6, "the chest's contents")
-    n0 = len(W.spawned)
-    chest.SubType = 0                              # opened
-    W.fire(MC.MC_POST_PICKUP_UPDATE, chest)
-    loot = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_KEY, KEYS.KEY_NORMAL, 410, 330)
-    W.fire(MC.MC_POST_PICKUP_INIT, loot)
-    assert loot.removed and [s.v for s in list(W.spawned.values())[n0:]] == [PV.PICKUP_HEART, PV.PICKUP_BOMB]
+    gkey = f"items:1:{golden_pool}"
+    wait(lambda: Bridge.peek(ckey) and Bridge.peek(gkey), 6, "the chest's contents and its pool's ranking")
+    assert [r["reward"] for r in deck_of(ckey)["schedule"]] == ["item", "half_heart"]
+    rank = list(deck_of(gkey)["order"])
+    n0, g0 = len(W.spawned), len(drawn(gkey))
+    chest.SubType = 0                              # opened: the game spawns its own item and a key
+    W.spawnPool = golden_pool
+    pedestal = W.spawnPickup(PV.PICKUP_COLLECTIBLE, 0, 410, 330, chest)
+    W.spawnPool = None
+    loot = W.spawnPickup(PV.PICKUP_KEY, KEYS.KEY_NORMAL, 410, 330, chest)
+    assert pedestal.removed and loot.removed, "the chest's own contents are cancelled"
+    frames(1)
+    got = [(s.v, s.s) for s in list(W.spawned.values())[n0:]]
+    assert got == [(PV.PICKUP_COLLECTIBLE, rank[0]), (PV.PICKUP_HEART, g.HeartSubType.HEART_HALF)], (got, rank)
+    assert len(drawn(gkey)) == g0 + 1, "one draw from the pool: the schedule's item, not the game's pedestal"
     W.pickups = lua.table_from([])
-    print("15d. chest paid its scheduled contents instead of the game's")
+    print("15d. golden chest paid its schedule; its item came from the pool's deck, once")
 
     # --- chests with no item pool are scheduled too, and two side by side each pay their own plan:
     # the spiked chest opens inside the bomb chest's payout window, its loot within reach of both ---
@@ -471,27 +474,45 @@ def run(tmp, game):
     for c, x in ((stone, 400), (spiked, 460)):
         n0 = len(W.spawned)
         c.SubType = 0                              # opened (the bomb chest blown open)
-        W.fire(MC.MC_POST_PICKUP_UPDATE, c)
-        loot = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, x, 300)
-        W.fire(MC.MC_POST_PICKUP_INIT, loot)
+        loot = W.spawnPickup(PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, x, 300)
+        frames(1)
         assert loot.removed and [s.v for s in list(W.spawned.values())[n0:]] == [PV.PICKUP_HEART, PV.PICKUP_BOMB], \
-            f"variant {c.Variant}: its own plan pays out, not swallowed by its neighbour's"
+            f"variant {c.Variant}: its own plan pays out, not claimed by its neighbour's"
     W.pickups = lua.table_from([])
     print("15d2. bomb chest and spiked chest side by side each paid their own scheduled contents")
 
-    # --- a grab bag is a chest: its contents are scheduled, and its spawns are never classed as natural ---
+    # --- a grab bag is a chest: its contents are scheduled ---
     bag = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_GRAB_BAG, 1, 340, 300)
     W.pickups = lua.table_from([bag])
     bkey = f"payout:1:{int(bag.InitSeed)}"
     wait(lambda: Bridge.peek(bkey), 6, "the grab bag's contents")
     n0 = len(W.spawned)
     bag.removed = True                             # taken: gone, the game fills it with its own pickups
-    spilled = W.makePickup(g.EntityType.ENTITY_PICKUP, PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, 345, 300)
-    spilled.SpawnerEntity = bag
-    W.fire(MC.MC_POST_PICKUP_INIT, spilled)
+    spilled = W.spawnPickup(PV.PICKUP_COIN, g.CoinSubType.COIN_PENNY, 345, 300, bag)
+    frames(1)
     assert spilled.removed and len(W.spawned) > n0, "the bag's own contents are replaced by its schedule"
     W.pickups = lua.table_from([])
     print("15e. grab bag paid its scheduled contents")
+
+    # --- the roll audit: nothing this walk covers went to vanilla ---
+    rolls0 = rolls_sent()
+    wait(lambda: rolls_sent() > rolls0, 6, "the roll counts")
+    tally = {}
+    for m in sent(game):
+        if m.get("t") == "event" and m.get("name") == "rolls":
+            for c in m["data"]["counts"]:
+                k = (c["hook"], c["cause"], c["owner"])
+                tally[k] = tally.get(k, 0) + c["n"]
+    covered = ("get_card", "get_trinket", "get_collectible", "clean_award", "npc_death", "slot_use", "chest_open")
+    loose = {k: n for k, n in tally.items() if k[2] == "uncontrolled" and (
+        k[0] in covered or (k[0] == "spawn" and k[1] in ("enemy_death", "chest_open", "slot_payout", "rock_break")))}
+    assert not loose, loose
+    assert tally.get(("room_entity", "coin", "layout"), 0) == 1, "a room's own pickups are counted as it loads"
+    assert not [k for k in tally if k[0] == "pickup_selection"], "a cancelled spawn's selection is no roll"
+    assert tally.get(("npc_death", "-", "drops"), 0) == 3 and tally.get(("spawn", "enemy_death", "drops"), 0) == 3, tally
+    assert any(m.get("t") == "event" and m.get("name") == "rolls" and m["data"].get("samples") for m in sent(game)), \
+        "LOG_SPAWNS samples go with the counts"
+    print("15f. roll audit:", {f"{h}/{c}": n for (h, c, o), n in tally.items() if o != "uncontrolled"})
 
     # --- the receipt: on disk for the app, no longer in the game's menu ----------------
     assert not [e for e in menu if e.sub == "Receipt"], "the receipt lives in the app, not the menu"
@@ -507,6 +528,9 @@ def run(tmp, game):
     icons = {W.drawn[i].file for i in range(1, len(W.drawn) + 1)}
     assert any(f.startswith("gfx/005.") for f in icons), "used decisions show in the corner, as pickup icons"
     assert any(r.get("what") == "cruelty" and r.get("result") == "6 -> 3" for r in recs)
+    audits = [r for r in recs if r.get("what") == "rolls"]
+    assert audits and any(r.get("samples") for r in audits), "the roll audit is in the receipt"
+    assert any(r["type"] == "drawn" and r["key"] == "drops:1" for r in recs), "every draw is in the receipt"
     print(f"16. receipt file {files[0].name}: {len(recs)} records, {len(calls)} LLM calls, "
           f"{len(effects)} effect lines")
 
@@ -526,13 +550,13 @@ def run(tmp, game):
     tick()
     assert Loading.active(), "a ready for another floor doesn't end this floor's wait"
     # Only the start room's neighbours gate the screen: room 85's layout and treasure room 71's pool.
-    # The boss pool (room 86 isn't next door) and the consumables plan go in the background.
+    # The boss pool (room 86 isn't next door) and the card/trinket decks go in the background.
     gated = sorted(Sched.floorReadyKeys().values())
     assert gated == ["items:2:0", "layout:2:85"], gated
     asks = [m["ctx"]["reason"] for m in sent(game) if m.get("t") == "req" and m.get("key") == "items:2:0"]
     assert asks == ["player is next to this room"], f"the gated pool is asked as next door (not floor start): {asks}"
     assert Bridge.isPending("items:2:2") or Bridge.settled("items:2:2"), "boss pool still asked, in the background"
-    wait(lambda: Bridge.isPending("cons:2") or Bridge.settled("cons:2"), 2, "consumables asked, in the background")
+    wait(lambda: Bridge.isPending("cards:2") or Bridge.settled("cards:2"), 2, "the cards deck asked, in the background")
     wait(lambda: not Loading.active(), 8, "floor 2's plans and the start room's neighbours")
     opening = [k for k in ("layout:2:85", "items:2:0") if Bridge.settled(k)]
     assert opening == ["layout:2:85", "items:2:0"], opening
@@ -547,18 +571,18 @@ def run(tmp, game):
     recs = [json.loads(l) for l in files[0].read_text().splitlines()]
     brief2 = next(i for i, r in enumerate(recs) if r.get("what") == "floor_brief" and "Basement II" in r.get("key", ""))
     early = [r["key"] for r in recs[:brief2] if r.get("type") == "entry" and str(r.get("key", "")).startswith(
-        ("layout:2:", "items:2:", "cons:2"))]
+        ("layout:2:", "items:2:", "cards:2", "trinkets:2", "pills:2", "drops:2"))]
     assert not early, f"floor 2 decisions made before its brief: {early}"
     print("17. floor 2: loading screen held until its brief and the start room's neighbours were in"
-          " (layout:2:85, items:2:0); boss pool and consumables in the background; none made before the brief")
+          " (layout:2:85, items:2:0); boss pool and decks in the background; none made before the brief")
 
     # --- the next floor is generated before its plan lands: its curses change once it does ---
     W.enter(86)
-    assert Bridge.isPending("floor:2:next")
+    assert Bridge.isPending("curses:2")
     W.curses = 0
     assert W.fire(MC.MC_POST_CURSE_EVAL, 0) is None, "nothing to apply yet"
     tick()
-    assert Hold.holding("floor:2:next"), "the new floor holds for its plan"
+    assert Hold.holding("curses:2"), "the new floor holds for its plan"
     wait(lambda: not Hold.active(), 8, "the late floor plan")
     assert W.curses == 1, W.curses
     print("18. late floor plan: held, then the floor's curses were changed to the DM's")

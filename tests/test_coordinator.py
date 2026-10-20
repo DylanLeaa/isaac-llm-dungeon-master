@@ -308,36 +308,6 @@ def test_prepare_reports_a_failed_narrative_and_ignores_an_abandoned_run():
     assert not [m for m in sent if m["t"] == "ready"]            # the old run's wait is dropped
 
 
-def test_generosity_ledger_counts_applied_gifts_against_vanilla():
-    from memory import RunMemory
-
-    m = RunMemory()
-    m.note_issued("clear:1:1", "room_clear", {"rewards": [{"reward": "lucky_penny", "count": 1},
-                                                          {"reward": "penny", "count": 2}]})
-    m.note_issued("clear:1:2", "room_clear", {"rewards": []})
-    m.note_issued("layout:1:3", "room_layout", {"bonus_pickups": ["lucky_penny", "locked_chest"],
-                                                "tinted_rocks": 1})
-    m.note_issued("clear:1:4", "room_clear", {"rewards": [{"reward": "dime", "count": 1}]})
-    for key in ("clear:1:1", "clear:1:2", "layout:1:3"):                 # clear:1:4 never used
-        m.on_applied(key)
-
-    g = m.digest()["generosity"]
-    assert g["this_floor"] == {"room_clears": 2, "drop_rate": 0.5, "pickups_from_clears": 3,
-                               "vanilla_pickups_for_these_clears": 1.0, "bait_pickups_placed": 2,
-                               "luck_given": 2, "tinted_rocks_added": 1, "chests_given": 1,
-                               "swallowed_drops": 0, "machine_and_chest_pickups": 0}
-    assert "5 pickups over vanilla" in g["verdict"] and "no more lucky pennies" in g["verdict"]
-
-    # A new floor starts a fresh tally; last floor and the run keep the history.
-    m.on_game_event("new_level", {"stage": 2, "name": "Basement II"})
-    g = m.digest()["generosity"]
-    assert g["this_floor"]["room_clears"] == 0 and g["last_floor"]["luck_given"] == 2
-    assert g["run"]["luck_given"] == 2 and g["verdict"].startswith("this floor: about vanilla")
-
-    m.reset("R2")
-    assert m.digest()["generosity"]["run"]["luck_given"] == 0
-
-
 class SlowDM(ScriptedDM):
     """Answers after `delay` seconds; counts how many calls were cancelled."""
 
@@ -521,7 +491,11 @@ def test_urgent_asks_get_the_next_slot_before_background_work():
     assert _priority("room_layout", {"reason": "player entered an adjacent room"}) == NEXT_DOOR
     assert _priority("item_choice", {"reason": "player is next to this room"}) == NEXT_DOOR
     assert _priority("item_choice", {"reason": "floor start"}) == BACKGROUND
-    assert _priority("consumables", {}) == BACKGROUND
+    assert _priority("drops", {"reason": "player entered the room"}) == NEXT_DOOR
+    for kind in ("cards", "trinkets", "pills"):
+        assert _priority(kind, {"reason": "restock"}) == BACKGROUND
+    for kind in ("cards", "trinkets", "pills", "item_choice"):
+        assert _priority(kind, {"owed": [{"runes": True}]}) == URGENT, "the game is frozen on it"
 
     order = []
 
@@ -598,17 +572,227 @@ def test_reconfigure_swaps_models_mid_run_and_keeps_the_run():
     assert coord.receipt.path == path and coord.memory.run_id == "R1"
     assert [m["ok"] for m in sent if m["t"] == "res"] == [True, True]
 
+# ------------------------------------------------- decks, draws and the floor's economy
+FLOOR = {"stage": 1, "stage_type": 0, "name": "Basement I", "room_types": {"default": 10}}
 
-def test_ledger_counts_swallowed_drops_as_the_vanilla_baseline():
-    from memory import RunMemory
 
-    m = RunMemory()
-    m.note_issued("clear:1:1", "room_clear", {"rewards": [{"reward": "key", "count": 1}],
-                                              "suppressed": {"half_heart": 2, "key": 1}})
-    m.note_issued("payout:1:9", "payout_plan", {"schedule": [{"reward": "penny", "count": 1},
-                                                             {"reward": "nothing", "count": 1}]})
-    m.on_applied("clear:1:1")
-    m.on_applied("payout:1:9")
-    g = m.digest()["generosity"]["this_floor"]
-    assert g["swallowed_drops"] == 3 and g["vanilla_pickups_for_these_clears"] == 3.5
-    assert g["machine_and_chest_pickups"] == 1
+def econ_req(rid, key, kind, ctx=None, keys=1):
+    return {"t": "req", "id": rid, "key": key, "kind": kind, "deadline_ms": 4000,
+            "state": {"player": {"hp": {"red": 6}, "resources": {"keys": keys, "bombs": 1, "coins": 0}},
+                      "level": FLOOR},
+            "ctx": {"reason": "test", **(ctx or {})}}
+
+
+def _starve_keys(coord):
+    coord.memory.economy.observe({"level": FLOOR})
+    coord._brief_written((1, 0), "ARC BEAT: x\nECONOMY: keys=starve coins=starve\nROOMS: y")
+
+
+def test_drawn_counts_what_was_handed_out_and_marks_the_answer_applied(tmp_path):
+    from receipt import Receipt
+    dm = ScriptedDM([{"intent": "a key", "rewards": [{"reward": "key", "count": 1}], "taunt": "", "scheme": "s1"},
+                     {"intent": "kills", "outcomes": [{"reward": "nothing"}, {"reward": "bomb"}], "taunt": ""}])
+    coord = Coordinator(dm, cruelty=6, receipt=Receipt(tmp_path))
+    coord.receipt.start_run("R", fresh=True)
+    coord.memory.counters["clears_since_bomb"] = 3
+    _run_coord(coord, [econ_req(1, "drops:1", "drops", {"wanted": 2}), econ_req(2, "clear:1:85", "room_clear"),
+                       {"t": "drawn", "key": "drops:1", "id": 1, "outcome": {"reward": "nothing"}, "cause": "enemy_death"},
+                       {"t": "drawn", "key": "drops:1", "id": 1, "outcome": {"reward": "bomb", "count": 1},
+                        "cause": "enemy_death"},
+                       {"t": "drawn", "key": "clear:1:85", "id": 2,
+                        "outcome": {"rewards": [{"reward": "key", "count": 1}]}}])
+    c = coord.memory.counters
+    assert c["clears"] == 1 and c["clears_since_key"] == 0
+    assert c["clears_since_bomb"] == 0, "a bomb from a kill since the last clear counts for the drought"
+    assert c["drops_floor"] == 1
+    assert coord.stats["drops"]["applied"] == 1 and coord.stats["room_clear"]["applied"] == 1, "once per answer"
+    assert coord.memory.economy.delivered["keys"] == 1 and coord.memory.economy.delivered["bombs"] == 1
+    assert list(coord.memory.schemes) == ["s1"]
+    assert any(e == "kill dropped: 1x bomb" for e in coord.memory.events)
+    assert coord.receipt.drawn == [("drops", {"reward": "nothing"}), ("drops", {"reward": "bomb", "count": 1}),
+                                   ("room_clear", {"rewards": [{"reward": "key", "count": 1}]})]
+    assert sorted(coord.receipt.status.values()).count("applied") == 2
+    assert "drops:1" not in coord.memory.issued, "a deck drawn to the end is used up"
+
+
+def test_a_concurrent_deck_sees_and_is_trimmed_by_what_another_promised():
+    dm = ScriptedDM([{"intent": "a key", "rewards": [{"reward": "key", "count": 1}], "taunt": "", "scheme": "keys coming"},
+                     {"intent": "keys", "outcomes": [{"reward": "key"}, {"reward": "key"}, {"reward": "nothing"}],
+                      "taunt": ""}])
+    coord = Coordinator(dm, cruelty=6)
+    _starve_keys(coord)                         # keys: cap ~2.06 this floor
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle(econ_req(1, "clear:1:85", "room_clear"), send)
+        await asyncio.sleep(0.05)
+        await coord.handle(econ_req(2, "drops:1", "drops", {"wanted": 3}), send)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    ctx, memory = dm.seen[1]
+    keys = ctx["economy"]["keys"]
+    assert keys["committed_elsewhere"] == 1 and keys["promised_by"] == {"clear:1:85": 1} and keys["remaining"] == 1.1
+    assert "keys: 0 given, 1 promised by clear:1:85" in ctx["economy"]["verdict"]
+    assert memory["your_open_decks"][0]["key"] == "clear:1:85" and memory["your_open_decks"][0]["scheme"] == "keys coming"
+    drops = [m for m in sent if m.get("t") == "res" and m["key"] == "drops:1"][0]["decision"]
+    assert [o["reward"] for o in drops["outcomes"]] == ["key", "nothing", "nothing"]
+    assert "key -> nothing (keys over budget: clear:1:85 took the last one)" in drops["guardrails"]
+    assert [m for m in sent if m.get("t") == "stale"] == [
+        {"t": "stale", "session": None, "keys": ["drops:1"], "why": "trimmed to the budget"}]
+
+
+def test_an_overspend_re_asks_the_other_decks_committed_to_that_family():
+    dm = ScriptedDM([{"intent": "kills", "outcomes": [{"reward": "key"}], "taunt": ""},
+                     {"intent": "loaded", "schedule": [{"reward": "key", "count": 2}, {"reward": "key", "count": 2}],
+                      "taunt": ""}])
+    coord = Coordinator(dm, cruelty=6)
+    _starve_keys(coord)
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle(econ_req(1, "drops:1", "drops", {"wanted": 1}), send)
+        await asyncio.sleep(0.05)
+        await coord.handle(econ_req(2, "payout:1:7", "payout_plan", {"source_class": "chest", "source": "chest"}), send)
+        await asyncio.sleep(0.05)
+        e = coord.memory.economy
+        assert e.contingent["payout:1:7"]["keys"] == 4 and e.delivered["keys"] == 0, "a chest counts once opened"
+        version = e.version
+        for _ in range(2):
+            await coord.handle({"t": "drawn", "key": "payout:1:7", "id": 2, "cause": "chest_open",
+                                "outcome": {"reward": "key", "count": 2}}, send)
+        assert e.delivered["keys"] == 4 and e.version > version
+
+    asyncio.run(go())
+    stale = [m for m in sent if m.get("t") == "stale"]
+    assert stale and stale[0]["keys"] == ["drops:1"] and "keys over budget" in stale[0]["why"]
+
+
+def test_machine_winnings_are_bought_and_never_trim_the_drops():
+    dm = ScriptedDM([{"intent": "pays", "schedule": [{"reward": "key"}, {"reward": "key"}], "taunt": ""},
+                     {"intent": "kills", "outcomes": [{"reward": "key"}, {"reward": "key"}], "taunt": ""}])
+    coord = Coordinator(dm, cruelty=6)
+    _starve_keys(coord)
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle(econ_req(1, "payout:1:9", "payout_plan", {"source_class": "slot", "source": "key_master"}),
+                           send)
+        await asyncio.sleep(0.05)
+        for _ in range(2):
+            await coord.handle({"t": "drawn", "key": "payout:1:9", "id": 1, "cause": "slot_use",
+                                "outcome": {"reward": "key", "count": 1}}, send)
+        await coord.handle(econ_req(2, "drops:1", "drops", {"wanted": 2}), send)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    e = coord.memory.economy
+    assert e.bought["keys"] == 2 and e.delivered["keys"] == 0
+    assert dm.seen[1][0]["economy"]["keys"]["bought"] == 2
+    drops = [m for m in sent if m.get("t") == "res" and m["key"] == "drops:1"][0]["decision"]
+    assert [o["reward"] for o in drops["outcomes"]] == ["key", "key"], "the machine's keys were paid for"
+
+
+def test_abandoning_a_deck_frees_what_it_promised():
+    dm = ScriptedDM([{"intent": "a key", "rewards": [{"reward": "key", "count": 1}], "taunt": ""}])
+    coord = Coordinator(dm, cruelty=6)
+    _run_coord(coord, [econ_req(1, "clear:1:85", "room_clear")])
+    assert coord.memory.economy.elsewhere("keys", None) == 1
+    _run_coord(coord, [{"t": "abandon", "key": "clear:1:85"}])
+    assert coord.memory.economy.elsewhere("keys", None) == 0 and "clear:1:85" not in coord.memory.issued
+
+
+class GatedDM(ScriptedDM):
+    """Each key's answer waits for its own event, so a test decides which call finishes first."""
+
+    def __init__(self, answers):
+        super().__init__([])
+        self.by_key, self.gates = answers, {}
+
+    async def decide(self, kind, state, ctx, memory):
+        key = state["key"]
+        self.seen.append((ctx, memory))
+        await self.gates.setdefault(key, asyncio.Event()).wait()
+        return dict(self.by_key[key].pop(0))
+
+
+def test_two_concurrent_decks_race_for_the_last_coin():
+    import math
+    for first, second in (("clear:1:85", "drops:1"), ("drops:1", "clear:1:85")):
+        dm = GatedDM({"clear:1:85": [{"intent": "a penny", "rewards": [{"reward": "penny", "count": 1}], "taunt": ""},
+                                     {"intent": "again", "rewards": [], "taunt": ""}],
+                      "drops:1": [{"intent": "a penny", "outcomes": [{"reward": "penny"}, {"reward": "nothing"}],
+                                   "taunt": ""},
+                                  {"intent": "again", "outcomes": [{"reward": "nothing"}], "taunt": ""}]})
+        coord = Coordinator(dm, cruelty=6)
+        _starve_keys(coord)
+        e = coord.memory.economy
+        e.delivered["coins"] = math.floor(e.cap("coins")) - 1       # one coin left on the floor
+        sent = []
+
+        async def send(msg):
+            sent.append(msg)
+
+        def req(rid, key):
+            m = econ_req(rid, key, "room_clear" if key.startswith("clear") else "drops", {"wanted": 2})
+            m["state"]["key"] = key
+            return m
+
+        async def go():
+            await coord.handle(req(1, "clear:1:85"), send)
+            await coord.handle(req(2, "drops:1"), send)
+            await asyncio.sleep(0.02)
+            assert all(c["economy"]["coins"]["remaining"] >= 1 for c, _ in dm.seen), "both were asked with a coin left"
+            for key in (first, second):
+                dm.gates.setdefault(key, asyncio.Event()).set()
+                await asyncio.sleep(0.02)
+            loser = [m for m in sent if m.get("t") == "stale"]
+            assert loser == [{"t": "stale", "session": None, "keys": [second], "why": "trimmed to the budget"}]
+            await coord.handle(req(3, second), send)               # the mod re-asks the loser
+            await asyncio.sleep(0.02)
+
+        asyncio.run(go())
+        res = {m["key"]: m["decision"] for m in sent if m.get("t") == "res" and m["id"] in (1, 2)}
+        coins = [r for r in res["clear:1:85"]["rewards"] if r["reward"] == "penny"] + \
+                [o for o in res["drops:1"]["outcomes"] if o["reward"] == "penny"]
+        assert len(coins) == 1, (first, res)
+        assert f"penny -> nothing (coins over budget: {first} took the last one)" in res[second]["guardrails"]
+        assert e.elsewhere("coins", None) == 1
+        reask_memory = dm.seen[-1][1]
+        assert first in [d["key"] for d in reask_memory["your_open_decks"]], "the re-ask sees the winner's deck"
+
+
+def test_a_kept_deck_is_served_as_what_is_left_of_it():
+    from gate import MockGate
+    dm = ScriptedDM([{"intent": "kills", "outcomes": [{"reward": "key"}, {"reward": "nothing"}, {"reward": "penny"}],
+                      "taunt": ""}])
+    coord = Coordinator(dm, cruelty=6, gate=MockGate())
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle(econ_req(1, "drops:1", "drops", {"wanted": 3}), send)
+        await asyncio.sleep(0.05)
+        await coord.handle({"t": "drawn", "key": "drops:1", "id": 1, "outcome": {"reward": "key", "count": 1}}, send)
+        await coord.handle(econ_req(2, "drops:1", "drops", {"wanted": 3}), send)    # nothing changed: kept
+        await asyncio.sleep(0.05)
+        await coord.handle({"t": "drawn", "key": "drops:1", "id": 2, "outcome": {"reward": "nothing"}}, send)
+
+    asyncio.run(go())
+    kept = [m for m in sent if m.get("t") == "res"][-1]
+    assert len(dm.seen) == 1 and coord.stats["drops"]["reused"] == 1
+    assert [o["reward"] for o in kept["decision"]["outcomes"]] == ["nothing", "penny"], "the drawn key isn't served again"
+    assert kept["drawn_base"] == 1
+    assert coord.stats["drops"]["applied"] == 1, "one answer, however many requests it served"
+    assert coord.memory.issued["drops:1"]["left"] == ["1x penny"]

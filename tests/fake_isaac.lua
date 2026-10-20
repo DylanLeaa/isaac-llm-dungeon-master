@@ -18,9 +18,10 @@ ItemPoolType = enum({ "POOL_TREASURE", "POOL_SHOP", "POOL_BOSS", "POOL_DEVIL", "
   "POOL_CURSE" })
 ItemPoolType.POOL_PLANETARIUM = 26
 ItemPoolType.POOL_ULTRA_SECRET = 24
-GridEntityType = { GRID_ROCK = 2, GRID_ROCKT = 4 }
+GridEntityType = { GRID_ROCK = 2, GRID_ROCKT = 4, GRID_ROCK_ALT = 6, GRID_POOP = 14 }
 EntityType = { ENTITY_PLAYER = 1, ENTITY_FAMILIAR = 3, ENTITY_SLOT = 6, ENTITY_BOMB = 4, ENTITY_PICKUP = 5, ENTITY_GAPER = 10, ENTITY_BOOMFLY = 25,
-  ENTITY_HOST = 27, ENTITY_ATTACKFLY = 18, ENTITY_KNIGHT = 41, ENTITY_DIP = 217 }
+  ENTITY_HOST = 27, ENTITY_ATTACKFLY = 18, ENTITY_KNIGHT = 41, ENTITY_DIP = 217, ENTITY_FIREPLACE = 33, ENTITY_EFFECT = 1000 }
+EffectVariant = { POOF01 = 15 }
 setmetatable(EntityType, { __index = function(_, k) if tostring(k):match("^ENTITY_") then return 900 end end })
 EntityFlag = { FLAG_FREEZE = 1 << 1, FLAG_FRIENDLY = 1 << 29 }
 ActiveSlot = { SLOT_PRIMARY = 0, SLOT_POCKET = 2 }
@@ -43,7 +44,8 @@ LevelCurse = { CURSE_NONE = 0, CURSE_OF_DARKNESS = 1, CURSE_OF_LABYRINTH = 2, CU
 ModCallbacks = { MC_POST_UPDATE = 1, MC_POST_RENDER = 2, MC_INPUT_ACTION = 13, MC_USE_PILL = 10, MC_ENTITY_TAKE_DMG = 11,
   MC_POST_CURSE_EVAL = 12, MC_POST_GAME_STARTED = 15, MC_POST_GAME_END = 16, MC_PRE_GAME_EXIT = 17, MC_POST_NEW_LEVEL = 18,
   MC_POST_NEW_ROOM = 19, MC_GET_CARD = 20, MC_GET_TRINKET = 47, MC_PRE_GET_COLLECTIBLE = 62,
-  MC_GET_PILL_EFFECT = 65, MC_PRE_NPC_UPDATE = 69, MC_PRE_SPAWN_CLEAN_AWARD = 70, MC_POST_PICKUP_INIT = 34, MC_POST_PICKUP_UPDATE = 35, MC_POST_NPC_DEATH = 29 }
+  MC_GET_PILL_EFFECT = 65, MC_PRE_NPC_UPDATE = 69, MC_PRE_SPAWN_CLEAN_AWARD = 70, MC_POST_PICKUP_INIT = 34, MC_POST_PICKUP_UPDATE = 35, MC_POST_NPC_DEATH = 29,
+  MC_PRE_ENTITY_SPAWN = 24, MC_POST_PICKUP_SELECTION = 37, MC_PRE_ROOM_ENTITY_SPAWN = 71, MC_USE_CARD = 5, MC_USE_ITEM = 3 }
 PillColor = enum({ "PILL_NULL", "PILL_BLUE_BLUE", "PILL_WHITE_BLUE", "PILL_ORANGE_ORANGE", "PILL_WHITE_WHITE",
   "PILL_REDDOTS_RED", "PILL_PINK_RED", "PILL_BLUE_CADETBLUE", "PILL_YELLOW_ORANGE", "PILL_ORANGEDOTS_WHITE",
   "PILL_WHITE_AZURE", "PILL_BLACK_YELLOW", "PILL_WHITE_BLACK", "PILL_WHITE_YELLOW", "PILL_GOLD" })
@@ -147,8 +149,11 @@ function player:HasCollectible() return false end
 function player:ToPlayer() return self end
 player.ControllerIndex = 0
 
-local function makeEnemy(hp)
-  local e = { HitPoints = hp, Type = 10, Variant = 0, champion = false, flags = 0, Position = Vector(300, 300) }
+local enemySeed = 5000
+local function makeEnemy(hp, x, y)
+  enemySeed = enemySeed + 1
+  local e = { HitPoints = hp, Type = 10, Variant = 0, champion = false, flags = 0, Position = Vector(x or 300, y or 300),
+              InitSeed = enemySeed, boss = false }
   function e:IsActiveEnemy() return self.HitPoints > 0 end
   function e:IsVulnerableEnemy() return true end
   function e:HasEntityFlags(f) return self.flags & f ~= 0 end
@@ -156,7 +161,7 @@ local function makeEnemy(hp)
   function e:ClearEntityFlags(f) self.flags = self.flags & ~f end
   function e:Exists() return true end
   function e:ToNPC() return self end
-  function e:IsBoss() return false end
+  function e:IsBoss() return self.boss end
   function e:IsChampion() return self.champion end
   function e:MakeChampion() self.champion = true end
   return e
@@ -336,9 +341,54 @@ function W.fire(id, ...)
   return ret
 end
 
+-- The game spawning a pickup on its own, as the phase-0 audit assumes it does: MC_PRE_ENTITY_SPAWN (with
+-- its spawner and seed; a returned table replaces it), then the pickup, its identity roll if it was
+-- spawned blank (GET_CARD / GET_TRINKET / PRE_GET_COLLECTIBLE), then MC_POST_PICKUP_INIT.
+-- Returns the pickup, or nil and the replacement when the spawn was replaced.
+W.cancelled = 0
+function W.spawnPickup(v, s, x, y, spawner)
+  nextSeed = nextSeed + 1
+  local seed = nextSeed
+  local ret = W.fire(ModCallbacks.MC_PRE_ENTITY_SPAWN, EntityType.ENTITY_PICKUP, v, s, Vector(x or 300, y or 300),
+                     Vector(0, 0), spawner, seed)
+  if type(ret) == "table" then
+    if ret[1] ~= EntityType.ENTITY_PICKUP then W.cancelled = W.cancelled + 1; return nil, ret end
+    v, s = ret[2], ret[3]
+  end
+  local p = W.makePickup(EntityType.ENTITY_PICKUP, v, s, x, y)
+  p.InitSeed, p.SpawnerEntity = seed, spawner
+  if v == 0 then                                 -- a random pickup: its variant is chosen as it initialises
+    p.Variant, p.SubType = W.randomPickup or PickupVariant.PICKUP_COIN, 1
+    local sel = W.fire(ModCallbacks.MC_POST_PICKUP_SELECTION, p, p.Variant, p.SubType)
+    if type(sel) == "table" then p.Variant, p.SubType = sel[1], sel[2] end
+    v, s = p.Variant, p.SubType
+  end
+  if s == 0 and v == PickupVariant.PICKUP_TAROTCARD then
+    p.SubType = W.fire(ModCallbacks.MC_GET_CARD, RNG(), 1, true, true, false) or 1
+  elseif s == 0 and v == PickupVariant.PICKUP_TRINKET then
+    p.SubType = W.fire(ModCallbacks.MC_GET_TRINKET, 5, RNG()) or 5
+  elseif s == 0 and v == PickupVariant.PICKUP_COLLECTIBLE then
+    p.SubType = game:GetItemPool():GetCollectible(W.spawnPool or 0, true, seed)
+  end
+  W.fire(ModCallbacks.MC_POST_PICKUP_INIT, p)
+  return p
+end
+
+--- A kill: the enemy's hit points run out and MC_POST_NPC_DEATH fires.
+function W.kill(npc)
+  npc.HitPoints = 0
+  W.fire(ModCallbacks.MC_POST_NPC_DEATH, npc)
+end
+
+W.roomEntities = {}       -- idx -> {{type, variant, subtype, grid}}: what the room's layout spawns as it loads
 function W.enter(idx)
   W.cur = idx
   W.rooms[idx].VisitedCount = W.rooms[idx].VisitedCount + 1
+  if W.rooms[idx].VisitedCount == 1 then
+    for _, e in ipairs(W.roomEntities[idx] or {}) do
+      W.fire(ModCallbacks.MC_PRE_ROOM_ENTITY_SPAWN, e[1], e[2], e[3], e[4], 777)
+    end
+  end
   W.fire(ModCallbacks.MC_POST_NEW_ROOM)
 end
 

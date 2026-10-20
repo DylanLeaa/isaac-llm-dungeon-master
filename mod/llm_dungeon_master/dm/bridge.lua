@@ -8,14 +8,19 @@
 --
 -- Every decision is addressed by a `key` ("clear:3:84"). Requests for the same key
 -- supersede each other: the backend cancels the stale one, and here a result is only
--- replaced by a result for a newer request. That is what lets the scheduler ask early,
+-- replaced by a result for a newer request. That is what lets the decks (decks.lua) ask early,
 -- then re-ask with a fresher snapshot, without ever blocking the game.
+--
+-- A result is a deck: each outcome the game draws from it is reported (`drawn`), so the backend
+-- counts what was actually handed out. The backend can push `stale` for keys whose unused entries
+-- another deck's spending made out of date (the floor's economy); decks.lua re-asks those.
 local json = require("json")
 
 local Bridge = {}
 
 -- Must match PROTO in backend/bridge.py. Bump both when a message changes shape.
-local PROTO = 1
+-- 2: decks (`drawn` per draw, `abandon`, the backend's `stale` push), cards/trinkets/pills/drops kinds.
+local PROTO = 2
 local HELLO_MS = 2000
 local PING_MS = 2000      -- how often a connected bridge checks the backend is still there
 local LINK_TIMEOUT_MS = 6000
@@ -37,6 +42,7 @@ local lastHello = -1e9
 local onSummary        -- optional callback(msg) for the backend's run_summary (after-death stats)
 local onReady          -- optional callback(msg) for the backend's "ready" (the run narrative is in)
 local onEffect         -- optional callback(lines) for every effect sent (the on-screen effect list)
+local onStale          -- optional callback(keys) for the backend's "stale" (decks to rewrite)
 local cruelty          -- nil = backend's --cruelty; set from config / the DM Settings menu
 
 local lineNo = 0       -- numbers our messages in the log
@@ -178,19 +184,27 @@ function Bridge.peek(key) return results[key] end
 --- The backend has answered this key, with a decision or with "none in time".
 function Bridge.settled(key) return results[key] ~= nil or failed[key] == true end
 
---- Remove and return a result, telling the backend it was actually used.
+--- Remove and return a result (what it hands out is reported with Bridge.drawn).
 function Bridge.take(key)
   local r = results[key]
   if r then
     results[key] = nil
     pending[key] = nil
-    send({ t = "applied", key = key })
   end
   return r
 end
 
---- Mark a result as used without removing it (e.g. an item list that is consumed gradually).
-function Bridge.markApplied(key) send({ t = "applied", key = key }) end
+--- One outcome the game drew from the deck answered as request `id` under `key`, and why the game
+--- rolled ("enemy_death", "chest_open"...). The first draw from an answer is what makes it "applied".
+function Bridge.drawn(key, id, outcome, cause)
+  send({ t = "drawn", key = key, id = id, outcome = outcome, cause = cause })
+end
+
+--- The game will never use this key's answer (the player left the room): it promises nothing now.
+function Bridge.abandon(key) send({ t = "abandon", key = key }) end
+
+--- Where the backend's "stale" goes: keys whose unused entries should be rewritten.
+function Bridge.setStaleHandler(fn) onStale = fn end
 
 --- What a used result actually did, as short lines ("+1 bomb dropped"), for the receipt. A result
 --- used gradually reports each use as it happens.
@@ -236,6 +250,10 @@ local function handle(msg)
     if onSummary then onSummary(msg) end
     return
   end
+  if msg.t == "stale" then
+    if msg.session == session and onStale and type(msg.keys) == "table" then onStale(msg.keys) end
+    return
+  end
   if msg.t ~= "res" or msg.session ~= session then return end
   local key, id = msg.key, msg.id
   local p = pending[key]
@@ -246,7 +264,9 @@ local function handle(msg)
   if msg.ok and type(msg.decision) == "table" then
     local cur = results[key]
     if not cur or id >= cur.id then
-      results[key] = { id = id, kind = msg.kind, decision = msg.decision, at = now(), ms = msg.ms }
+      -- base: a reused answer already accounts for this many draws of the key (decks.lua skips the rest)
+      results[key] = { id = id, kind = msg.kind, decision = msg.decision, at = now(), ms = msg.ms,
+                       base = msg.drawn_base }
     end
   elseif not msg.ok and (not p or id >= p.id) then
     failed[key] = true

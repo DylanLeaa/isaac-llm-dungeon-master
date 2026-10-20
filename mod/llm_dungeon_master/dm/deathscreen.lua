@@ -7,7 +7,7 @@
 -- later, the DM's epitaph.
 local Death = {}
 
-local cfg, Bridge, State, Cons, Settings
+local cfg, Bridge, State, Pills, Settings
 
 --- Split text into lines of at most `width` chars, breaking on spaces where possible.
 local function wrap(text, width, out)
@@ -70,7 +70,7 @@ function Death.onGameEnd(gameOver)
   set({ run = runId, outcome = outcome, character = character, sections = { { title = "YOU", rows = rows } },
         dm_pending = Bridge.ready() })
   shown, page, frames = gameOver and cfg.SHOW_DEATH_SCREEN ~= false, 1, 0
-  Bridge.event(outcome, { run = runId, character = character, rows = rows, pills = Cons.lockedList() })
+  Bridge.event(outcome, { run = runId, character = character, rows = rows, pills = Pills.lockedList() })
   Bridge.update()      -- send it now: the game-over screen may not keep pumping the bridge
 end
 
@@ -248,8 +248,8 @@ function Death.render()
   drawColumn(right, sw - EDGE - w, w, RESTART_Y * k)
 end
 
-function Death.init(config, bridge, state, cons, settings)
-  cfg, Bridge, State, Cons, Settings = config, bridge, state, cons, settings
+function Death.init(config, bridge, state, pills, settings)
+  cfg, Bridge, State, Pills, Settings = config, bridge, state, pills, settings
   local saved = Settings.load().last_run
   if type(saved) == "table" and type(saved.sections) == "table" then
     saved.epitaph_pending, saved.dm_pending = nil, nil   -- whatever was on its way is not coming

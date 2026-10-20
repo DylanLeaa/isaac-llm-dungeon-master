@@ -38,7 +38,7 @@ import model_catalog
 import receipt as receipts
 from claude_code import find_claude
 from receipt import Receipt
-from server import Coordinator, Engine, build_dm
+from server import Coordinator, Engine, build_dm, coverage_table
 
 log = logging.getLogger("llmdm")
 
@@ -291,6 +291,8 @@ class RunView(ttk.Frame):
                 self._show_selected()
 
     def _visible(self, seq: int) -> bool:
+        if self.r.full[seq].get("what") == "rolls":           # the roll audit has its own section above
+            return False
         return self.spoilers or self.r.full[seq].get("status") == "applied"
 
     def _insert(self, seq: int) -> None:
@@ -358,12 +360,18 @@ class RunView(ttk.Frame):
         self.cards["fallback"].set(str(t["fallback"]))
         self.cards["problems"].set(f'{t["timeout"]} / {t["error"]}')
 
-        rows, scheme, taunt = epilogue.dm_side(r.applied(), t, [])
+        rows, scheme, taunt = epilogue.dm_side(r.applied(), t, [], drawn=r.drawn or None)
         sections = [("THE DM", rows)]
         if summary:
             sections = [(s["title"], s["rows"]) for s in summary.get("sections", [])]
         on_cards = ("LLM bill", "DM gave up")
         sections = [(name, [row for row in rows if row[0] not in on_cards]) for name, rows in sections]
+        # The game's rolls: which the DM's streams owned, and which went to vanilla (worst first).
+        cov = coverage_table(r.coverage)
+        if cov:
+            ctl, free = sum(c[2] for c in cov), sum(c[3] for c in cov)
+            sections.append(("ROLLS", [["controlled / vanilla", f"{ctl} / {free}"]] +
+                             [[f"{h} {c}", f"{a} / {b}"] for h, c, a, b in cov[:7]]))
         col = 0
         for name, sec_rows in sections:
             ttk.Label(self.tally, text=name, style="Section.TLabel").grid(row=0, column=col, columnspan=2, sticky="w")
@@ -722,6 +730,8 @@ class App:
                 elif event == "effect":
                     if self.current.apply_effect(data["seq"], data["effect"]) and self.run_view.r:
                         self.run_view.updated(int(data["seq"]))
+                elif event == "drawn":
+                    self.current.apply_drawn(data)
         except queue.Empty:
             pass
         if changed:

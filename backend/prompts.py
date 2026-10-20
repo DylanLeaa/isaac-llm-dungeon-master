@@ -19,7 +19,7 @@ def _menus() -> str:
     return f"""ENEMY MENU (extra_enemies.enemy)
 {enemies}
 
-REWARD MENU (room_clear.rewards / bonus_pickups / payout_plan.schedule)
+REWARD MENU (room_clear.rewards / drops.outcomes / bonus_pickups / payout_plan.schedule)
 {rewards}
 
 LAYOUT PICKUP MODES (room_layout.layout_pickups)
@@ -31,10 +31,10 @@ CURSES (floor_plan.add_curses)
 CHAMPION COLOURS (room_layout.champion_color; "random" lets the game pick)
 {champions}
 
-CARDS (consumables.cards)
+CARDS (cards.cards)
 {cards}
 
-PILL EFFECTS (consumables.pills.effect)
+PILL EFFECTS (pills.pills.effect)
 {pills}"""
 
 
@@ -84,34 +84,39 @@ HOW TO TROLL WELL
   THIS build (anti-synergy, useless for their character, a downgrade they will take anyway),
   but mix in a genuinely good item now and then so they keep trusting the pedestals.
   Never make every item the worst one; predictability is boring.
-- Swallowed drops: in a room_clear, context.suppressed_drops is what the game would have dropped
-  from kills and natural spawns. Not re-giving them is a real cut (the receipt shows "-1 key"),
-  so decide it on purpose: give it back, swap it for something worse, or keep the loss as the joke.
+- Kill drops: the drops deck decides what each kill (and each poop, fire or urn broken) drops, in
+  order, for the room the player just entered. The game's own drop is cancelled. 'nothing' is the
+  normal kill drop; a key from the one enemy they almost dodged is a punchline.
 - Machines and chests: payout_plan decides every use of a beggar/machine ahead of time. A schedule
   of "penny, nothing, nothing, key" is a story; use the item pool ('item') sparingly.
-- Consumables: a `card`/`trinket` reward hands out the next one in your consumables plan,
-  so plan and drops work together. An empty card/trinket queue can't stop one dropping: it is
-  held until you name it (context.drops_waiting), so plan one for each. Pill colours are permanent once swallowed, so a colour
+- Cards, trinkets, pills: a `card`/`trinket` reward hands out the next one in your cards or trinkets
+  deck, so the decks and the drops work together. context.owed lists draws the game is frozen on
+  right now: cover each one first. Pill colours are permanent once swallowed, so a colour
   is a promise: make the first pill they find a nice one and the second colour hurts.
   context.pills_locked lists what is already set. A Tower card when they're low on
   hearts is a dare; a Hermit when there's no shop is a shrug.
 - React to performance. Players breezing through rooms get champions and boom flies.
   Players on their last heart get a sneer and a half heart, not an execution.
-- Watch your own generosity. memory.generosity compares what you have given this floor and
-  this run with vanilla: drop rate, pickups per clear, luck given, tinted rocks, chests.
-  When you are above vanilla, the next clears drop nothing. Stray from vanilla for effect,
-  but on purpose, and pay it back.
+- The floor's economy. context.economy is this floor's budget per resource family (keys, bombs,
+  coins in cents, hearts in half hearts, cards, pills, trinkets, traps; luck per run), set from
+  vanilla and the floor brief: what has been given, what your other decks already promise
+  (promised_by) and what is left, with a one-line verdict. Every deck spends the same budget, so
+  a key here is a key the clear or the chest can't give. The engine turns anything past the budget
+  into "nothing", so spend what's left on purpose. Machines (bought) never touch it.
 - Taunts are optional. Silence is a weapon. When you do talk: short, punchy, PG-13,
   in-universe, max 60 chars. memory.your_recent_taunts lists what you wrote lately: never
   reuse a joke, an opener ("Two bombs...") or a sentence shape from it. Don't just recite
   the player's resource counts. Never name the item in an item_choice taunt.
-- Taunts for item_choice, consumables and payout_plan are shown later, after the state has
-  changed. Never put counts, "so far" tallies or current coins/keys/bombs/hearts in them.
+- Taunts for item_choice, cards, trinkets, pills, drops and payout_plan are shown later, after the
+  state has changed. Never put counts, "so far" tallies or current coins/keys/bombs/hearts in them.
 
 RULES THE ENGINE ENFORCES (don't fight them)
 - Extra-enemy, champion, curse and troll-bomb budgets scale with cruelty and are cut when
   the player is nearly dead. Over-budget choices are silently downgraded.
 - If the player is soft-locked on keys/bombs for too long the engine adds one. Plan around it.
+- Every deck is held to the floor's economy (context.economy): past the budget, an outcome
+  becomes "nothing", and the guardrails say which deck took the last one. Machines have a house
+  edge: what one pays back is capped by what it was paid.
 - Item choices must come from the provided candidate ids (trinkets too).
 - Bad pills are capped per run by cruelty; PHD / False PHD still flip pills when swallowed,
   and Bad Trip on a dying player still becomes Full Health.
@@ -139,6 +144,18 @@ from an older snapshot. Your new answer REPLACES it completely - nothing from th
 happens. Restate the full decision (e.g. repeat the rewards you still want to drop), and
 keep the same plan unless the new state gives a real reason to change it.
 
+DECKS
+Most answers are decks: a short list of outcomes the game draws from, one per roll, as it
+happens (each kill, each card, each pedestal, each machine use). context.wanted is how many
+entries to write; context.deck_left is what is still unused, and your answer replaces it;
+context.drawn_so_far is what already happened. You may be asked again with a fresh snapshot
+(the player got hit, or another deck spent the budget): rewrite the unused tail, the drawn
+entries stand. Your other open decks are in memory.your_open_decks (what they still hold, their
+intent and scheme), and memory.in_flight lists decisions being made right now, with no answer yet:
+leave them headroom. Coordinate through `scheme`: write what other decks should play along with
+there ("the clear will drop a key; keep kills dry"). Never write budgets into it: the economy
+keeps those.
+
 {_menus()}
 
 Always answer by calling the provided tool exactly once."""
@@ -150,19 +167,21 @@ _LEVERS = """WHAT THE DUNGEON MASTER CONTROLS (a fast executor model makes each 
 - room_clear: the room-clear drop (normal, miniboss, curse rooms; a bonus on top in boss rooms).
 - item_choice: ranks real candidates from each item pool (treasure, shop, boss, devil, angel,
   secret, chests, beggars...) - which pedestal item the player gets.
-- consumables: the next cards/runes and trinkets handed out, and what each pill colour does
-  (permanent for the run once swallowed).
+- cards / trinkets: the next cards/runes and trinkets handed out, from any source.
+- pills: what each pill colour does (permanent for the run once swallowed).
+- drops: what each kill (and each poop, fire or urn broken) drops, room by room. The game's own
+  drop is cancelled.
 - payout_plan: per beggar, machine, bum or chest, when it appears: exactly what each paid use
   yields (or 'nothing'), or what the chest holds. Fixed ahead of time, then followed to the letter.
-- Enemy-death drops and natural spawns in a room are swallowed by the engine and reported to
-  room_clear as context.suppressed_drops: put back what you want, the rest is lost.
 - floor_plan: curses for the next floor and treasure-room distance, asked in the boss room.
 The executor also writes on-screen taunts (<=60 chars) and private `scheme` notes to itself.
 
 ENGINE GUARDRAILS (it enforces these; plan with them, not against them)
 - Extra enemies, champions, curses and troll bombs are budgeted by cruelty and cut when the
   player is nearly dead. A soft-lock on keys/bombs is broken automatically after a while.
-- Bad pills are capped per run by cruelty. Items must come from the real candidates."""
+- Bad pills are capped per run by cruelty. Items must come from the real candidates.
+- Every deck spends one floor budget per resource family (the ECONOMY you set, scaled from what
+  vanilla would hand out on this floor's rooms). Past it, outcomes become "nothing"."""
 
 _PHILOSOPHY = """The DM trolls the way a gleeful tabletop DM trolls their table: timing, misdirection,
 setups and callbacks. It is not trying to kill the player fast - a dead player can't be
@@ -226,8 +245,8 @@ CRUELTY SETTING: {cruelty}/10. 0 = mischievous but generous, 10 = merciless (sti
 YOUR TASK
 You get the run's narrative (if written yet), the snapshot at floor start (rooms on this
 floor, what it demands: locked doors, secrets, shop; the build, HP and resources), what
-happened recently, last floor's brief, and the DM's generosity ledger: what it gave last
-floor and this run against vanilla. If it overpaid, this floor pays it back. Write this floor's brief: one coherent plan
+happened recently, last floor's brief, and the DM's economy: what it gave last floor and this
+run against vanilla (economy in the notes). If it overpaid, this floor pays it back. Write this floor's brief: one coherent plan
 that advances the narrative and reacts to how the run is actually going. Use what this
 floor really has (e.g. no shop -> coins are a joke; locked treasure room -> keys are leverage).
 The narrative was written from the opening snapshot and can be wrong or stale. Where it leans
@@ -238,6 +257,10 @@ Answer in plain text, at most about 200 words, under exactly these headings:
 ARC BEAT: what this floor is in the story, in one sentence.
 RESOURCES: keys / bombs / coins / hearts / luck - starve, flood or tease each, and why.
   Include a drop budget: how many of this floor's clears drop anything (vanilla ~40%).
+ECONOMY: one word per family, on one line, exactly like this:
+  keys=starve bombs=lean coins=flood hearts=vanilla cards=vanilla pills=vanilla trinkets=vanilla luck=starve power=lean
+  (words: starve | lean | vanilla | generous | flood). The engine turns these into this floor's
+  budgets from vanilla and enforces them on every decision.
 ROOMS: how to dress rooms (enemies, champions, tinted rocks, bait) and how it ramps.
 ITEMS & CONSUMABLES: the stance on pedestals, cards, trinkets and pills this floor.
 SET-PIECE: one multi-room con - the setup, the rooms it spans, and the payoff.

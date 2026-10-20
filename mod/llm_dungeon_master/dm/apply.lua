@@ -8,7 +8,7 @@ local game = Game()
 local Taunt -- set by Apply.init
 local ZERO = Vector(0, 0)
 
--- True while the mod itself is spawning: the drop catcher and payout hooks must leave those alone.
+-- True while the mod itself is spawning: rolls.lua never treats those as the game's spawn rolls.
 Apply.spawning = false
 local function spawn(...)
   Apply.spawning = true
@@ -140,7 +140,7 @@ function Apply.spawnReward(name, pos)
   return true
 end
 
---- Put back a pickup the drop catcher swallowed (or hand out a pool item): exact variant and subtype.
+--- Spawn an exact pickup (a chest's held contents put back, a pool item handed out).
 function Apply.spawnPickup(variant, subtype, pos)
   local at = game:GetRoom():FindFreePickupSpawnPosition(pos, 0, true)
   spawn(EntityType.ENTITY_PICKUP, variant, subtype, at, ZERO, nil)
@@ -159,13 +159,6 @@ local function rewardIndex()
   return byKind
 end
 
-local FAMILY_OF = {}
-for _, n in ipairs({ "penny", "double_penny", "nickel", "dime", "lucky_penny", "sticky_nickel" }) do FAMILY_OF[n] = "coin" end
-for _, n in ipairs({ "bomb", "double_bomb", "golden_bomb" }) do FAMILY_OF[n] = "bomb" end
-for _, n in ipairs({ "key", "double_key", "golden_key", "charged_key" }) do FAMILY_OF[n] = "key" end
-for _, n in ipairs({ "red_heart", "half_heart", "soul_heart", "black_heart", "eternal_heart" }) do FAMILY_OF[n] = "heart" end
-local function family(name) return FAMILY_OF[name] or name end
-
 local VARIANT_LABEL = { PICKUP_HEART = "heart", PICKUP_COIN = "coin", PICKUP_KEY = "key", PICKUP_BOMB = "bomb",
                         PICKUP_TAROTCARD = "card", PICKUP_PILL = "pill", PICKUP_TRINKET = "trinket",
                         PICKUP_LIL_BATTERY = "battery", PICKUP_GRAB_BAG = "grab_bag" }
@@ -178,28 +171,8 @@ function Apply.rewardNameFor(variant, subtype)
   return "pickup"
 end
 
--- What the DM's rewards leave uncovered of the drops the game would have made: a heart of any kind
--- replaces a heart, a coin a coin. {name = n}, a list of lines like "-1 key (...)".
-local function shortfall(suppressed, rewards)
-  local have, names, out = {}, {}, {}
-  for _, r in ipairs(rewards or {}) do
-    local f = family(r.reward)
-    have[f] = (have[f] or 0) + math.max(1, math.min(4, tonumber(r.count) or 1))
-  end
-  for name in pairs(suppressed) do names[#names + 1] = name end
-  table.sort(names)
-  for _, name in ipairs(names) do
-    local f, lost = family(name), suppressed[name]
-    local covered = math.min(lost, have[f] or 0)
-    have[f] = (have[f] or 0) - covered
-    lost = lost - covered
-    if lost > 0 then out[#out + 1] = count("-", lost, name) .. " (would have dropped, not replaced)" end
-  end
-  return out
-end
-
 -- --------------------------------------------------------------- room clear
-function Apply.roomClear(decision, pos, suppressed)
+function Apply.roomClear(decision, pos)
   local effect = {}
   for _, r in ipairs(decision.rewards or {}) do
     local n = 0
@@ -210,7 +183,6 @@ function Apply.roomClear(decision, pos, suppressed)
   end
   Taunt.show(decision.taunt)
   if #effect == 0 then effect[1] = "nothing dropped" end
-  for _, line in ipairs(shortfall(suppressed or {}, decision.rewards)) do effect[#effect + 1] = line end
   return effect
 end
 

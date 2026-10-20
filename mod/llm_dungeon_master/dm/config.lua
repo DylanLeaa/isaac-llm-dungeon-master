@@ -14,12 +14,19 @@ return {
   CONTROL_ROOM_CLEAR  = true,
   CONTROL_ITEMS       = true,
   CONTROL_FLOOR       = true,
-  CONTROL_CONSUMABLES = true,   -- which cards/trinkets drop, what each pill colour does
+  CONTROL_CONSUMABLES = true,   -- which cards/trinkets drop, what each pill colour does (three decks)
   CONTROL_PAYOUTS     = true,   -- what each beggar / machine use and each chest pays out (a fixed schedule)
-  CONTROL_DROPS       = true,   -- enemy-death drops are swallowed and handed to the room-clear decision
-  DROPS_NATURAL       = true,   -- ...and so are other unowned pickups spawned mid-fight (rock loot, etc.)
-  CLEAR_TRAIL_FRAMES  = 6,      -- ...and for this many frames after the clear (the last kill's fallout)
-  LOG_SPAWNS          = true,   -- tell the backend how each pickup spawn was classified (capped per run)
+  CONTROL_DROPS       = true,   -- the drops deck: what each kill drops (the game's own drop is cancelled)
+  DROPS_NATURAL       = true,   -- ...and each poop, fire, urn or skull broken (and tinted rocks with no plan)
+  -- How a cancelled spawn goes: false removes the pickup as it initialises (its card/trinket/item isn't
+  -- drawn meanwhile); true replaces it with a puff of smoke in MC_PRE_ENTITY_SPAWN, so it never exists.
+  -- Which one works for every source is the roll audit's question (see dm/rolls.lua).
+  CANCEL_IN_PRE_SPAWN = false,
+  -- The roll audit: every random roll the game makes is counted by hook, cause and owner (controlled or
+  -- vanilla) and sent every ROLL_REPORT_MS. LOG_SPAWNS adds what each pickup spawn looked like (its
+  -- spawner, seed and cause; capped per run), which is what calibrates the cause tracker.
+  ROLL_REPORT_MS      = 3000,
+  LOG_SPAWNS          = true,
 
   -- Re-roll the floor (console `reseed`) until the treasure room distance matches the
   -- DM's preference. Uses a console command, which disables achievements for the run.
@@ -42,9 +49,14 @@ return {
   MAX_ITEM_SENDS = 3,      -- item_choice requests per pool per floor (re-asked when the player's state changes)
   ITEM_CANDIDATES = 6,
   TRINKET_CANDIDATES = 8,
-  -- consumables requests per floor (floor start + re-asks for new pill colours / empty queues)
-  MAX_CONSUMABLE_SENDS = 4,
-  -- payout_plan requests per machine (first ask + re-asks once its schedule is used up)
+  -- Deck sizes: how many entries a deck is kept stocked with, ahead of the game's draws.
+  CARDS_DEPTH = 2,
+  TRINKETS_DEPTH = 2,
+  DROPS_SPARE = 2,         -- drops entries asked beyond the room's enemies (splitters, poops)
+  -- Requests per floor for each card / trinket / pill deck (restocks, new pill colours, rewrites).
+  MAX_DECK_SENDS = 8,
+  MAX_DROPS_SENDS = 40,    -- drops: one ask per fighting room, plus restocks and rewrites
+  -- payout_plan requests per machine (first ask + re-asks once its schedule runs low)
   MAX_PAYOUT_SENDS = 4,
 
   -- Characters per line in Mod Config Menu > DM Settings > Last run. Lower it if lines get cut off.
