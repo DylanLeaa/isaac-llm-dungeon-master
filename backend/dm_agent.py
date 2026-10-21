@@ -57,9 +57,8 @@ class LLMCallError(RuntimeError):
 class OpenRouterDM:
     """Same Haiku DM, called through OpenRouter's OpenAI-compatible chat endpoint."""
 
-    # Output includes Haiku's reasoning, not just the tool JSON: real calls run ~140-390 tokens,
-    # so leave plenty of headroom. A cut-off answer is a lost decision.
-    def __init__(self, cruelty: int, model: str = OPENROUTER_DEFAULT_MODEL, max_tokens: int = 1024,
+    # Deck answers ran up to ~1900 tokens in a real run: leave headroom. A cut-off answer is a lost decision.
+    def __init__(self, cruelty: int, model: str = OPENROUTER_DEFAULT_MODEL, max_tokens: int = 2048,
                  api_key: str | None = None) -> None:
         import httpx                                    # imported lazily so --mock needs no HTTP client
         self.client = httpx.AsyncClient(timeout=30.0, headers={
@@ -68,6 +67,7 @@ class OpenRouterDM:
         })
         self.model = model
         self.max_tokens = max_tokens
+        self.reasoning: dict = {"enabled": False}       # no thinking tokens: they eat max_tokens and add latency
         self.campaign = ""
         self.set_cruelty(cruelty)
 
@@ -88,9 +88,18 @@ class OpenRouterDM:
             content.append({"type": "text", "text": self.campaign, "cache_control": {"type": "ephemeral"}})
         self.system = {"role": "system", "content": content}
 
+    async def _post(self, body: dict):
+        """POST with thinking off. A model that can't run without it (400 "Reasoning is mandatory")
+        is retried, and from then on called, at low effort."""
+        resp = await self.client.post(OPENROUTER_URL, json={**body, "reasoning": self.reasoning})
+        if resp.status_code == 400 and "reasoning is mandatory" in resp.text.lower() and "effort" not in self.reasoning:
+            self.reasoning = {"effort": "low"}
+            resp = await self.client.post(OPENROUTER_URL, json={**body, "reasoning": self.reasoning})
+        return resp
+
     async def decide(self, kind: str, state: dict, ctx: dict, memory: dict) -> dict[str, Any]:
         tool = TOOLS[kind]
-        resp = await self.client.post(OPENROUTER_URL, json={
+        resp = await self._post({
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": [self.system,
@@ -120,7 +129,7 @@ class OpenRouterDM:
     async def epitaph(self, prompt: str) -> tuple[str, dict]:
         """Free text in the DM's voice (the after-death screen). Same tools and system prompt as a
         decision, with tool_choice none, so the cached persona and campaign still hit."""
-        resp = await self.client.post(OPENROUTER_URL, json={
+        resp = await self._post({
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": [self.system, {"role": "user", "content": prompt}],
