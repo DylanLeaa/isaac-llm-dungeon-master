@@ -143,8 +143,11 @@ Changes apply to the running DM straight away, mid-run included. The window has 
 - **Current run**: the receipt summary (LLM bill, tokens, decisions used / unused / the DM gave up on,
   what the DM did to you, its scheme, last taunt and epitaph), every entry live with its intent and
   effect, the selected entry
-  in full, and the run narrative and floor brief.
-- **History**: every past run's receipt in the same view.
+  in full, the run narrative and floor brief, and the **Deck view**: every deck the DM has written, per
+  floor, in the order the game will draw it (the next payout, kill drop, pedestal, card...), with what has
+  already been drawn and each deck's intent. Rebuilt from the receipt (`backend/deckview.py`).
+- **History**: every past run's receipt in the same view. Its Deck view shows the decks as they stood
+  when the row picked in the receipt was recorded.
 - **Settings**: the key, the Claude Code switch, the models, and the files the backend found. **Models** picks
   three models from OpenRouter's live list, with their prices. **Major** writes the run narrative and floor briefs,
   **Minor** makes every decision (only tool-capable models are listed), and the **re-ask gate** uses one of
