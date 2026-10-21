@@ -199,8 +199,12 @@ prints the run narrative and each floor brief in full. It's fun on a second moni
 $0.05 per run (Opus) and $0.02–0.03 per floor (Sonnet).
 
 **2. Mod**
-- Copy `mod/llm_dungeon_master/` into `…/steamapps/common/The Binding of Isaac Rebirth/mods/`.
-  No launch options: the mod runs in the game's normal sandbox.
+- The app (the exe, or `python backend/app.py`) installs the mod itself: at start it copies its own
+  `mod/llm_dungeon_master/` into `…/steamapps/common/The Binding of Isaac Rebirth/mods/` of every
+  install it finds, and updates it when it differs, so mod and backend always match. It leaves the
+  folder alone when it is a symlink or junction (a link to your checkout) and when a Workshop copy
+  (`mods/llm_dungeon_master_<id>`) is there. The console server doesn't install anything: copy the
+  folder by hand. No launch options: the mod runs in the game's normal sandbox.
 - Start the game with the backend running. Bottom-left shows `DM connected, link …ms  avg …ms p90 …ms`
   (`link` is the round trip of the connection alone; `avg` / `p90` include the LLM).
 
