@@ -1,7 +1,7 @@
 """LLM Dungeon Master as a desktop app: what the exe runs.
 
 The same backend as server.py, with a window instead of a console:
-  Current run   what the DM is doing this run: its bill, its work, every decision, its plans
+  Current run   what the DM is doing this run: its bill, its work, every decision, its plans, its decks
   History       every past run's receipt
   Settings      OpenRouter key or Claude Code and the models, applied to the running DM straight away
   Log           what the console used to show
@@ -33,6 +33,7 @@ from tkinter import messagebox, ttk
 
 import appdata
 import bridge
+import deckview
 import epilogue
 import model_catalog
 import modinstall
@@ -176,7 +177,10 @@ class RunView(ttk.Frame):
     """A run's receipt: summary on top, every entry below, the selected one in full.
 
     With spoiler mode off it shows only what the game used, in the order it used it, and none of
-    the DM's reasoning: no status, reason, intent or result columns, no entry details, no plans.
+    the DM's reasoning: no status, reason, intent or result columns, no entry details, no plans, no decks.
+
+    Its Deck view shows every deck the DM wrote, in draw order (deckview.py): live in Current run, and
+    in History as of the row picked in the receipt.
     """
 
     COLUMNS = (("time", "Generated time", 105), ("applied_time", "Applied time", 95), ("what", "What", 90),
@@ -186,11 +190,14 @@ class RunView(ttk.Frame):
     WIDE = ("intent", "result", "effect")
     SPOILERS = ("status", "reason", "intent", "result")    # hidden with spoiler mode off
 
-    def __init__(self, master, empty: str, spoilers: bool = False) -> None:
+    def __init__(self, master, empty: str, spoilers: bool = False, pin_decks: bool = False) -> None:
         super().__init__(master, padding=(12, 10))
         self.empty = empty
         self.r: Receipt | None = None
         self.spoilers = spoilers
+        self.pin_decks = pin_decks          # the Deck view as of the selected row (History), else live
+        self.decks_shown: tuple | None = None   # what the Deck view was last drawn from
+        self.decks_run: Receipt | None = None   # the run its open / closed decks belong to
 
         head = ttk.Frame(self)
         head.pack(fill="x")
@@ -239,6 +246,9 @@ class RunView(ttk.Frame):
         plan_frame, self.plan_text = text_box(tabs, height=8)
         tabs.add(entry_frame, text="Selected entry")
         tabs.add(plan_frame, text="The DM's plan")
+        self.deck_frame = self._deck_tab(tabs)
+        tabs.add(self.deck_frame, text="Deck view")
+        tabs.bind("<<NotebookTabChanged>>", lambda _e: self._show_decks())
         panes.add(tabs, weight=2)
         self.set_spoilers(spoilers)
 
@@ -274,6 +284,10 @@ class RunView(ttk.Frame):
         for seq in rows:
             self._insert(seq)
         set_text(self.entry_text, "Pick an entry above to see everything behind it." if r else "")
+        self.decks_shown = None
+        if r is not self.decks_run:                          # another run: open and closed start over
+            self.decks_run = r
+            self.deck_toggled.clear()
         self.refresh()
 
     def added(self, seq: int) -> None:
@@ -321,6 +335,8 @@ class RunView(ttk.Frame):
 
     def _show_selected(self) -> None:
         sel = self.tree.selection()
+        if self.pin_decks:
+            self._show_decks()
         if not sel or not self.r:
             return
         entry = self.r.full.get(int(sel[0]))
@@ -332,9 +348,117 @@ class RunView(ttk.Frame):
                 text += f"\n\n----- system prompt {h} -----\n{self.r.prompt_text[h]}"
         set_text(self.entry_text, text)
 
+    # ------------------------------------------------------------ the Deck view
+    def _deck_tab(self, master) -> ttk.Frame:
+        frame = ttk.Frame(master)
+        self.deck_note = ttk.Label(frame, text="", foreground=MUTED, padding=(8, 6, 8, 4))
+        self.deck_note.pack(fill="x")
+        inner = ttk.Frame(frame)
+        inner.pack(fill="both", expand=True)
+        t = self.decks = ttk.Treeview(inner, columns=("state", "detail"), show="tree headings", selectmode="browse")
+        t.heading("#0", text="Deck / what it hands out, in order")
+        t.heading("state", text="State")
+        t.heading("detail", text="Intent / how it was drawn")
+        t.column("#0", width=330, stretch=False)
+        t.column("state", width=170, stretch=False)
+        t.column("detail", width=400, stretch=True)
+        t.tag_configure("floor", foreground="#9fc5ff", font=("Segoe UI Semibold", 10))
+        t.tag_configure("next", foreground=STATUS_TAGS["applied"])
+        for tag in ("drawn", "skipped", "used", "unused", "spent"):
+            t.tag_configure(tag, foreground=MUTED)
+        t.tag_configure("locked", foreground=STATUS_TAGS["written"])
+        t.tag_configure("focus", background="#2f4f6f")
+        bar = ttk.Scrollbar(inner, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=bar.set)
+        t.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        # What the player opened or closed stays so across redraws; the rest opens while it has something left.
+        self.deck_toggled: dict[str, bool] = {}
+        t.bind("<<TreeviewOpen>>", lambda _e: self.deck_toggled.__setitem__(t.focus(), True))
+        t.bind("<<TreeviewClose>>", lambda _e: self.deck_toggled.__setitem__(t.focus(), False))
+        return frame
+
+    def _show_decks(self) -> None:
+        """Redraw the Deck view if it's on screen and what it shows has moved (it's rebuilt from the receipt)."""
+        if not self.spoilers or self.details.select() != str(self.deck_frame):
+            return                        # hidden: drawn when it's shown
+        r = self.r
+        upto = None
+        if self.pin_decks and r:
+            sel = self.tree.selection()
+            upto = int(sel[0]) if sel else None
+        sig = (id(r), upto, r.seq if r else 0, len(r.draws) if r else 0)
+        if sig == self.decks_shown:
+            return
+        self.decks_shown = sig
+        t = self.decks
+        top, picked = t.yview()[0], t.selection()
+        opened = self.deck_toggled.get
+        t.delete(*t.get_children())
+        if r is None:
+            self.deck_note.configure(text="")
+            return
+        floors = deckview.build(r, upto)
+        if not self.pin_decks:
+            note = "Live: what every deck will hand out next, in the order the game draws it. Green is the next draw."
+        elif upto is None:
+            note = "As of the end of the run. Pick a row in the receipt above to see the decks as they stood then."
+        else:
+            e = r.full.get(upto) or {}
+            when = time.strftime("%H:%M:%S", time.localtime(e.get("ts") or 0))
+            note = f'As of #{upto} {e.get("what", "")} {e.get("key") or ""} at {when}, the row picked above.'
+        if not floors:
+            note += "  No decks yet."
+        self.deck_note.configure(text=note)
+
+        focus_key = (r.full.get(upto) or {}).get("key") if upto else None
+        for n, fl in enumerate(floors):
+            fid = f"floor:{fl.number}"
+            open_decks = sum(not d.spent for d in fl.decks)
+            t.insert("", "end", iid=fid, text=f"Floor {fl.number}" + (f": {fl.name}" if fl.name else ""),
+                     values=(f"{open_decks} open of {len(fl.decks)}" if n == 0 else "over", ""),
+                     open=opened(fid, n == 0), tags=("floor",))
+            for d in fl.decks:
+                did = f"deck:{d.key}"
+                about = d.intent + (f'  "{d.taunt}"' if d.taunt else "")
+                tags = ("spent",) if d.spent else ()
+                if d.key == focus_key:
+                    tags += ("focus",)
+                t.insert(fid, "end", iid=did, text=d.title, values=(d.status, about),
+                         open=opened(did, not d.spent), tags=tags)
+                if d.drawn:
+                    hid = f"{did}:drawn"
+                    gave = sum(s.state == "drawn" for s in d.drawn)
+                    t.insert(did, "end", iid=hid, text=f"{gave} drawn so far", values=("", ""),
+                             open=opened(hid, False), tags=("drawn",))
+                    for i, s in enumerate(d.drawn):
+                        t.insert(hid, "end", iid=f"{hid}:{i}", text=s.label, values=self._slot_values(s),
+                                 tags=(s.state,))
+                for i, s in enumerate(d.left):
+                    t.insert(did, "end", iid=f"{did}:{i}", text=s.label, values=self._slot_values(s, i),
+                             tags=(s.state,))
+        t.yview_moveto(top)
+        if picked and t.exists(picked[0]):
+            t.selection_set(picked[0])
+        if focus_key and t.exists(f"deck:{focus_key}"):     # the picked row's own deck, in sight
+            did = f"deck:{focus_key}"
+            t.item(t.parent(did), open=True)
+            t.item(did, open=True)
+            t.see(did)
+
+    @staticmethod
+    def _slot_values(s: deckview.Slot, i: int = 0) -> tuple[str, str]:
+        at = time.strftime("%H:%M:%S", time.localtime(s.ts)) if s.ts else ""
+        state = {"drawn": f"drawn {at}", "skipped": "discarded", "next": "▶ next", "queued": f"then (#{i + 1})",
+                 "waiting": "waiting", "used": f"used {at}", "set": "set, not swallowed yet",
+                 "locked": f"swallowed {at}, locked", "loaded": "every tinted rock pays this",
+                 "unused": "never drawn"}.get(s.state, s.state)
+        return state, s.cause
+
     def refresh(self) -> None:
         """Redo the summary and the plans from the receipt (cheap: a run is a few hundred entries)."""
         r = self.r
+        self._show_decks()
         for w in self.tally.winfo_children():
             w.destroy()
         if r is None or not r.full:
@@ -788,7 +912,8 @@ class App:
         self.history.bind("<<TreeviewSelect>>", lambda _e: self._open_history())
         panes.add(left, weight=1)
 
-        self.history_view = RunView(panes, "Pick a run on the left.", spoilers=bool(self.cfg.get("spoiler_mode")))
+        self.history_view = RunView(panes, "Pick a run on the left.", spoilers=bool(self.cfg.get("spoiler_mode")),
+                                    pin_decks=True)
         panes.add(self.history_view, weight=3)
         # The run view asks for more width than there is: without this the list gets squeezed.
         panes.bind("<Map>", lambda _e: panes.sashpos(0, 400), add="+")
@@ -1197,6 +1322,11 @@ def main() -> None:
         except Exception:                         # noqa: BLE001
             pass
     root = tk.Tk()
+    try:
+        icon = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "icon.ico"
+        root.iconbitmap(default=str(icon))        # default=: every window, pickers included
+    except Exception:                             # noqa: BLE001 - cosmetic
+        pass
     if already_running():
         root.withdraw()
         messagebox.showinfo("LLM Dungeon Master", "The LLM Dungeon Master is already running.")

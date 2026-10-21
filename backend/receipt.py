@@ -56,6 +56,7 @@ class Receipt:
         self.usage = Counter()
         self.prompts: set[str] = set()                        # system prompt hashes already in the file
         self.full: dict[int, dict] = {}                       # seq -> the whole entry (keep_full)
+        self.draws: list[dict] = []                           # every drawn record, in order (keep_full)
         self.prompt_text: dict[str, str] = {}                 # hash -> system prompt (keep_full)
         self.saved_narrative: str | None = None                # the run's latest plans, for a continue
         self.saved_brief: tuple[tuple, str, str] | None = None # (floor signature, floor name, text)
@@ -134,6 +135,8 @@ class Receipt:
         self._tell("drawn", rec)
 
     def _apply_drawn(self, rec: dict) -> None:
+        if self.keep_full and rec.get("key"):
+            self.draws.append(rec)                # the app's Deck view
         if isinstance(rec.get("outcome"), dict):
             self.drawn.append((str(rec.get("kind")), rec["outcome"]))
 
