@@ -35,6 +35,7 @@ import appdata
 import bridge
 import epilogue
 import model_catalog
+import modinstall
 import receipt as receipts
 from claude_code import find_claude
 from receipt import Receipt
@@ -586,6 +587,7 @@ class App:
         self.receipts_dir: Path = args.receipts
         self.isaac_dirs = args.isaac_dir or bridge.isaac_installs()
         self.logs = args.log or bridge.default_logs()
+        self.mod_status = modinstall.install_all(self.isaac_dirs)
         self.current = Receipt(None, keep_full=True)
         self.dirty = False
         self.history_rows: dict[str, Path] = {}
@@ -645,8 +647,15 @@ class App:
             problems.append("Isaac isn't installed in any Steam library found on this PC.")
         if not any(p.exists() for p in self.logs):
             problems.append("The game's log.txt doesn't exist yet: start Isaac once.")
-        if problems:
-            self.problem.configure(text="  ".join(problems))
+        statuses = self.mod_status.values()
+        problems += [f"Couldn't install the mod: {s[len('failed: '):]}" for s in statuses if s.startswith("failed")]
+        if "workshop" in statuses:
+            problems.append("There is a Workshop copy of the mod in Isaac's mods folder, so this app's copy isn't installed.")
+        note = ""
+        if {"installed", "updated"} & set(statuses):
+            note = "Installed this version of the mod in Isaac's mods folder: restart Isaac if it's running."
+        if problems or note:
+            self.problem.configure(text="  ".join(problems) or note, foreground=BAD if problems else GOOD)
             self.problem.pack(fill="x")
 
     def _set_status(self, colour: str, text: str) -> None:
@@ -928,6 +937,7 @@ class App:
         files.pack(fill="x")
         log_file = next((p for p in self.logs if p.exists()), self.logs[0] if self.logs else None)
         rows = [("Game", self.isaac_dirs[0] if self.isaac_dirs else None),
+                ("Mod", self.isaac_dirs[0] / "mods" / modinstall.MOD_DIR if self.isaac_dirs else None),
                 ("Game's log.txt", log_file),
                 ("Receipts", self.receipts_dir),
                 ("Settings", appdata.config_path()),
