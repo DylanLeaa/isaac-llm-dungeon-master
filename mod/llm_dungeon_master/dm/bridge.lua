@@ -174,6 +174,11 @@ function Bridge.holdPending(on)
   holding = on and true or false
 end
 
+--- A key the game is frozen on (Loading.hold) never expires: its answer may come late, and a re-ask
+--- would restart the call that is about to land. The hold has its own timeout.
+local keepPending = function() return false end
+function Bridge.keepPending(fn) keepPending = fn end
+
 function Bridge.event(name, data)
   if Bridge.ready() then send({ t = "event", name = name, data = data or {} }) end
 end
@@ -318,7 +323,7 @@ function Bridge.update()
   -- Forget requests the backend never answered (it gives up after its own deadline).
   if holding then return end
   for k, p in pairs(pending) do
-    if t - p.sentAt > 15000 then pending[k] = nil end
+    if t - p.sentAt > 15000 and not keepPending(k) then pending[k] = nil end
   end
 end
 

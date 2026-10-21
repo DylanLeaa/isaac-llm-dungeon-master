@@ -32,6 +32,13 @@
 --     suppresses those draws while a chest or beggar of that pool is paying out.
 --   * room-entity IDs for rocks, tinted rocks and layout pickups in MC_PRE_ROOM_ENTITY_SPAWN: only
 --     observed (counted) so far; layouts still change the room after it loads.
+-- What the first real run (2026-10-20, 4 floors) showed:
+--   * kill drops carry SpawnerEntity (the enemy); a boss's heart drop carries the boss; chest contents
+--     and breakable loot have none (causes.lua's "what just happened nearby" fallback found them).
+--   * every spawn had a seed.
+--   * a layout pickup fires MC_PRE_ROOM_ENTITY_SPAWN and then MC_PRE_ENTITY_SPAWN on the same frame, with
+--     no spawner and the same variant: matched here and counted once, as room_entity.
+--   * a boss room's pedestal spawns as clean_award, variant 100: its item is the get_collectible roll.
 local Rolls = {}
 
 local game = Game()
@@ -44,6 +51,8 @@ local nexts = {}          -- one-shot claims on the next pickup of a variant thi
 local tally = {}          -- "hook|cause|owner" -> rolls since the last report
 local samples = {}        -- LOG_SPAWNS: what recent spawns looked like
 local sampled = 0
+local gridSeen = {}       -- room-entity grid types already sampled (one sample each: they're all alike)
+local roomEnts = {}       -- pickups the room's layout file is placing: {variant, frame}, until they spawn
 local lastReport = -1e9
 local SAMPLE_CAP = 300    -- per run
 local POOF = 15           -- EffectVariant.POOF01
@@ -56,6 +65,7 @@ end
 
 function Rolls.reset()
   pending, nexts, tally, samples, sampled, Rolls.current = {}, {}, {}, {}, 0, nil
+  gridSeen, roomEnts = {}, {}
 end
 
 -- ----------------------------------------------------------------- owners
@@ -109,6 +119,17 @@ local function preSpawn(etype, variant, subtype, pos, _vel, spawner, seed)
     Rolls.current = { seed = seed, frame = f, mod = true, variant = variant }
     return nil
   end
+  -- A pickup the room's layout file placed (MC_PRE_ROOM_ENTITY_SPAWN just counted it): not a roll of its
+  -- own. The layout owns it, and what a random one resolves to (MC_POST_PICKUP_SELECTION).
+  if not spawner then
+    for i, r in ipairs(roomEnts) do
+      if f - r.frame <= 1 and (r.variant == variant or r.variant == 0 or variant == 0) then
+        table.remove(roomEnts, i)
+        Rolls.current = { seed = seed, frame = f, variant = variant, owner = r.owner, cause = "room_entity" }
+        return nil
+      end
+    end
+  end
   local info = { variant = variant, subtype = subtype, pos = pos, spawner = spawner, seed = seed, frame = f }
   info.cause, info.source = Causes.of(info)
   local owner, verdict
@@ -116,7 +137,9 @@ local function preSpawn(etype, variant, subtype, pos, _vel, spawner, seed)
     verdict = c.fn(info)
     if verdict then owner = c.name; break end
   end
-  Rolls.count("spawn", info.cause, owner)
+  -- A pedestal no stream claimed (a boss's, a room's): where it stands isn't random, and its item is the
+  -- MC_PRE_GET_COLLECTIBLE roll, counted there.
+  if owner or variant ~= PickupVariant.PICKUP_COLLECTIBLE then Rolls.count("spawn", info.cause, owner) end
   sample({ hook = "spawn", variant = variant, subtype = subtype, cause = info.cause, owner = owner or "uncontrolled",
            spawner = entName(spawner), seed = seed ~= nil and seed ~= 0, frame = f })
   local rec = { seed = seed, frame = f, variant = variant, cancel = verdict == "cancel", owner = owner, cause = info.cause }
@@ -203,9 +226,14 @@ function Rolls.register(mod, safe)
   end)
   add(MC.MC_PRE_ROOM_ENTITY_SPAWN, "room_entity_spawn", function(_, etype, variant, subtype, grid, seed)
     if etype == EntityType.ENTITY_PICKUP then
-      Rolls.count("room_entity", Causes.variantName(variant), cfg.CONTROL_ROOM_LAYOUT and "layout" or nil)
-      sample({ hook = "room_entity", type = etype, variant = variant, subtype = subtype, grid = grid })
-    elseif etype and etype >= 1000 then
+      local owner = cfg.CONTROL_ROOM_LAYOUT and "layout" or nil
+      Rolls.count("room_entity", Causes.variantName(variant), owner)
+      local f = game:GetFrameCount()
+      for i = #roomEnts, 1, -1 do if f - roomEnts[i].frame > 1 then table.remove(roomEnts, i) end end
+      roomEnts[#roomEnts + 1] = { variant = variant, frame = f, owner = owner }
+      sample({ hook = "room_entity", type = etype, variant = variant, subtype = subtype, grid = grid, frame = f })
+    elseif etype and etype >= 1000 and not gridSeen[etype] then
+      gridSeen[etype] = true
       sample({ hook = "room_entity", type = etype, variant = variant, subtype = subtype, grid = grid })
     end
     return nil

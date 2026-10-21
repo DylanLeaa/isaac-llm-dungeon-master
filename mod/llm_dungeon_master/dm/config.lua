@@ -53,6 +53,8 @@ return {
   CARDS_DEPTH = 2,
   TRINKETS_DEPTH = 2,
   DROPS_SPARE = 2,         -- drops entries asked beyond the room's enemies (splitters, poops)
+  DROPS_RESERVE = 3,       -- drops entries kept between fights: the next room's first kills draw from
+                           -- them while its own ask is on the way (0 = none)
   -- Requests per floor for each card / trinket / pill deck (restocks, new pill colours, rewrites).
   MAX_DECK_SENDS = 8,
   MAX_DROPS_SENDS = 40,    -- drops: one ask per fighting room, plus restocks and rewrites

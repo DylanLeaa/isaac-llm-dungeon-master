@@ -3,9 +3,13 @@
 --
 -- The roll is the kill (MC_POST_NPC_DEATH) or the break (causes.lua): each one draws the deck's next
 -- entry, pays it where it happened, and the game's own drop from it is cancelled in MC_PRE_ENTITY_SPAWN.
--- The deck is asked on entering a room with enemies, sized to them (+ DROPS_SPARE), and its unused tail
--- is rewritten when the player's state moves or another deck spends the budget. A kill with the deck
--- empty keeps the game's own drop, and the roll audit reports it uncontrolled. Bosses keep theirs.
+-- The deck is asked on entering a room with more enemies than it holds, sized to them (+ DROPS_SPARE),
+-- and between fights it is topped up to DROPS_RESERVE, so a room's first kills have entries while its own
+-- ask is on the way. Its unused tail is rewritten when the player's state moves or another deck spends the
+-- budget. A kill with the deck empty never falls back to the game's own drop: its drop is cancelled, the
+-- game freezes (decks.lua's IOU) until the answer lands, and the entry is paid then. Only if that freeze
+-- times out is the game's drop put back. A broken poop or urn with the deck empty waits for the game's
+-- own loot to appear: most drop nothing, so only one that drops something is held. Bosses keep theirs.
 local Drops = {}
 
 local game = Game()
@@ -43,15 +47,33 @@ local function breakablesHere()
 end
 
 -- A kill or break the deck takes: draws its entry (once), to pay on the next update.
-local function take(rec, cause)
-  if rec.drawn then return rec.entry ~= nil end
-  rec.drawn = true
-  if not (on() and (cause ~= "breakable" or cfg.DROPS_NATURAL)) then return false end
+local function take(rec, cause, spawned)
+  if rec.drawn then return rec.entry ~= nil or rec.owed == true end
+  if not (on() and (cause ~= "breakable" or cfg.DROPS_NATURAL)) then rec.drawn = true; return false end
   local e = Decks.draw("drops", floorNo(), { cause = cause })
-  if not e then return false end                  -- empty: the game's own drop stands
-  rec.entry, rec.owner, rec.cancelled, rec.cause = e, "drops", {}, cause
-  toPay[#toPay + 1] = rec
-  return true
+  if e then
+    rec.drawn = true
+    rec.entry, rec.owner, rec.cancelled, rec.cause = e, "drops", {}, cause
+    toPay[#toPay + 1] = rec
+    return true
+  end
+  -- Empty. A kill, or a break whose loot has appeared, is owed: the game's drop is cancelled and the game
+  -- freezes until the deck answers. A break with no loot yet isn't a roll (retried when loot appears).
+  if cause == "enemy_death" or spawned then
+    rec.drawn = true
+    rec.owner, rec.cancelled, rec.cause, rec.owed = "drops", {}, cause, true
+    local owedOk = Decks.owe("drops", floorNo(), { cause = cause }, function(entry, gaveUp)
+      if entry then
+        rec.entry = entry
+        toPay[#toPay + 1] = rec
+      elseif gaveUp then
+        for _, name in ipairs(rec.cancelled) do Apply.spawnReward(name, rec.pos) end   -- the game's own, after all
+      end
+    end)
+    if not owedOk then rec.owner, rec.owed = nil, nil; return false end   -- no backend to wait for
+    return true
+  end
+  return false
 end
 
 local function qualifies(npc)
@@ -78,13 +100,17 @@ function Drops.init(deps)
                breakables = breakablesHere() }
     end,
     wanted = function()
-      return math.max(1, math.min(8, (aliveEnemies()) + math.min(3, breakablesHere()) + cfg.DROPS_SPARE))
+      local n = (aliveEnemies()) + math.min(3, breakablesHere()) + cfg.DROPS_SPARE
+      return math.max(1, math.min(8, math.max(n, cfg.DROPS_RESERVE or 0)))
     end,
     wants = function()
-      local room = D.Sched.room()
-      if not room or room.wasClear then return {} end
+      if not on() or not D.Sched.room() then return {} end
       local n = aliveEnemies()
-      if n == 0 then return {} end
+      if n == 0 then
+        -- Between fights: enough for the next room's first kills.
+        if (cfg.DROPS_RESERVE or 0) <= 0 then return {} end
+        return { { arg = floorNo(), n = cfg.DROPS_RESERVE, reason = "between fights: stock for the next room" } }
+      end
       return { { arg = floorNo(), n = math.min(n, 8), reason = "restock: more kills than entries left" } }
     end,
     refresh = { max = 1, minMs = cfg.REFRESH_MIN_MS },
@@ -124,7 +150,11 @@ function Drops.init(deps)
       return nil
     end
     if info.variant == PickupVariant.PICKUP_COLLECTIBLE then return nil end   -- an enemy's item (Krampus): never
-    if not src.drawn and info.cause == "enemy_death" then take(src, "enemy_death") end   -- spawned before its death callback
+    if info.cause == "enemy_death" then
+      if not src.drawn then take(src, "enemy_death") end   -- spawned before its death callback
+    elseif not src.owner and not src.entry then
+      take(src, "breakable", true)                         -- loot from a break whose draw found the deck empty
+    end
     if src.owner ~= "drops" then return nil end
     src.cancelled[#src.cancelled + 1] = Apply.rewardNameFor(info.variant, info.subtype)
     return "cancel"
@@ -173,8 +203,10 @@ end
 
 function Drops.onNewRoom(room)
   paidHere, toPay = {}, {}
-  -- Asked on the way in, sized to this room's fight: the answer replaces the unused tail.
-  if on() and not room.wasClear and (aliveEnemies()) > 0 then
+  -- Asked on the way in, sized to this room's fight, unless the deck already holds enough for it (the
+  -- reserve, or what a cleared room left): the answer replaces the unused tail.
+  local n = (aliveEnemies())
+  if on() and not room.wasClear and n > 0 and Decks.left("drops", floorNo()) < n then
     Decks.request("drops", floorNo(), "player entered the room")
   end
 end
