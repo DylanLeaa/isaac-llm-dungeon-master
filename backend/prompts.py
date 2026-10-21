@@ -86,7 +86,9 @@ HOW TO TROLL WELL
   Never make every item the worst one; predictability is boring.
 - Kill drops: the drops deck decides what each kill (and each poop, fire or urn broken) drops, in
   order, for the room the player just entered. The game's own drop is cancelled. 'nothing' is the
-  normal kill drop; a key from the one enemy they almost dodged is a punchline.
+  normal kill drop; a key from the one enemy they almost dodged is a punchline. Asked "between
+  fights", it is a short reserve for the first kills of the next room (enemies not known yet): the
+  room's own ask rewrites whatever of it is left.
 - Machines and chests: payout_plan decides every use of a beggar/machine ahead of time. A schedule
   of "penny, nothing, nothing, key" is a story; use the item pool ('item') sparingly.
 - Cards, trinkets, pills: a `card`/`trinket` reward hands out the next one in your cards or trinkets

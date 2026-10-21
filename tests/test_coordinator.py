@@ -785,7 +785,7 @@ def test_a_kept_deck_is_served_as_what_is_left_of_it():
         await coord.handle(econ_req(1, "drops:1", "drops", {"wanted": 3}), send)
         await asyncio.sleep(0.05)
         await coord.handle({"t": "drawn", "key": "drops:1", "id": 1, "outcome": {"reward": "key", "count": 1}}, send)
-        await coord.handle(econ_req(2, "drops:1", "drops", {"wanted": 3}), send)    # nothing changed: kept
+        await coord.handle(econ_req(2, "drops:1", "drops", {"wanted": 2}), send)    # nothing changed: kept
         await asyncio.sleep(0.05)
         await coord.handle({"t": "drawn", "key": "drops:1", "id": 2, "outcome": {"reward": "nothing"}}, send)
 
@@ -796,3 +796,30 @@ def test_a_kept_deck_is_served_as_what_is_left_of_it():
     assert kept["drawn_base"] == 1
     assert coord.stats["drops"]["applied"] == 1, "one answer, however many requests it served"
     assert coord.memory.issued["drops:1"]["left"] == ["1x penny"]
+
+
+def test_a_kept_deck_too_short_for_the_ask_is_re_asked():
+    # Regression (first real run): the gate kept a drops deck the game had drawn dry, and every kill in the
+    # next room was left to vanilla. A deck whose unused tail is shorter than the ask is always re-asked.
+    from gate import MockGate
+    dm = ScriptedDM([{"intent": "kills", "outcomes": [{"reward": "key"}, {"reward": "nothing"}], "taunt": ""},
+                     {"intent": "more", "outcomes": [{"reward": "penny"}] * 4, "taunt": ""}])
+    coord = Coordinator(dm, cruelty=6, gate=MockGate())
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle(econ_req(1, "drops:1", "drops", {"wanted": 2}), send)
+        await asyncio.sleep(0.05)
+        for r in ("key", "nothing"):
+            await coord.handle({"t": "drawn", "key": "drops:1", "id": 1, "outcome": {"reward": r, "count": 1}}, send)
+        await coord.handle(econ_req(2, "drops:1", "drops", {"wanted": 2}), send)    # same state, deck spent
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    last = [m for m in sent if m.get("t") == "res"][-1]
+    assert len(dm.seen) == 2 and coord.stats["drops"]["reused"] == 0
+    assert [o["reward"] for o in last["decision"]["outcomes"]] == ["penny", "penny"], last
+    assert "drawn_base" not in last

@@ -338,13 +338,21 @@ def run(tmp, game):
     REWARD_VARIANT = {"penny": PV.PICKUP_COIN, "half_heart": PV.PICKUP_HEART, "key": PV.PICKUP_KEY,
                       "bomb": PV.PICKUP_BOMB}
     wait(lambda: Decks.left("cards", 1) > 0, 6, "the cards deck restocked")
-    foes = [W.makeEnemy(10, 200, 200), W.makeEnemy(10, 420, 220), W.makeEnemy(10, 260, 340)]
+    # Between fights the deck is topped up to a reserve: the next room's first kills have entries while
+    # its own ask is on the way. A room the reserve covers isn't asked again on the way in.
+    wait(lambda: Decks.left("drops", 1) >= 3 and not Bridge.isPending("drops:1"), 6, "the drops reserve")
+    foes = [W.makeEnemy(10, 200, 200), W.makeEnemy(10, 420, 220), W.makeEnemy(10, 260, 340),
+            W.makeEnemy(10, 500, 340), W.makeEnemy(10, 520, 360)]
     W.enemies = lua.table_from(foes)
+    while Decks.left("drops", 1) > 0:              # spend the reserve: this room has more foes than it holds
+        Decks.draw("drops", 1, lua.table())
     asks0 = len(reqs("drops:1"))
-    W.enter(85)                                    # back in room 85: its drops are asked on the way in
+    W.enter(85)                                    # back in room 85: asked on the way in
     wait(lambda: len(reqs("drops:1")) > asks0 and not Bridge.isPending("drops:1"), 6, "the drops deck for this room")
     req = reqs("drops:1")[-1]
-    assert req["ctx"]["wanted"] == 3 + 2 and req["ctx"]["enemies_left"] == 3, req["ctx"]
+    assert req["ctx"]["wanted"] == 5 + 2 and req["ctx"]["enemies_left"] == 5, req["ctx"]
+    foes = foes[:3]
+    W.enemies = lua.table_from(foes)               # the last two wander off: three kills below
     deck = [dict(o) for o in deck_of("drops:1")["outcomes"]]
     assert Decks.left("drops", 1) == len(deck) >= 3, deck
     d0, n0 = len(drawn("drops:1")), len(W.spawned)
@@ -385,6 +393,23 @@ def run(tmp, game):
     paid_names = [e["reward"] for e in deck[:3] if e["reward"] != "nothing"]
     assert list(reqs("clear:1:85")[-1]["ctx"].get("kills_dropped") or []) == paid_names
     print("15b. kills drew the drops deck, the game's drops were cancelled:", kills)
+
+    # --- an empty drops deck never leaves a kill to the game: its drop is cancelled, the game freezes, and the
+    # entry is paid when the answer lands ---
+    while Decks.left("drops", 1) > 0:
+        Decks.draw("drops", 1, lua.table())
+    foe = W.makeEnemy(10, 300, 300)
+    W.enemies = lua.table_from([foe])
+    d1, n1 = len(drawn("drops:1")), len(W.spawned)
+    W.kill(foe)
+    vheart = W.spawnPickup(PV.PICKUP_HEART, g.HeartSubType.HEART_FULL, 300, 300, foe)
+    assert vheart.removed, "the game's own drop is cancelled even with the deck empty"
+    tick(3)
+    assert Hold.holding("drops:1"), "the game freezes for the drops deck"
+    wait(lambda: not Hold.holding("drops:1"), 8, "the drops answer for the empty-deck kill")
+    tick(3)
+    assert len(drawn("drops:1")) == d1 + 1, "the kill drew from the new answer"
+    print("15b1. empty deck: the kill's drop was cancelled, the game froze until the DM answered")
 
     # --- a tinted rock holds what the room's layout planned, not the game's loot ---
     Rocks = modules["dm.streams.rocks"]
@@ -509,7 +534,7 @@ def run(tmp, game):
     assert not loose, loose
     assert tally.get(("room_entity", "coin", "layout"), 0) == 1, "a room's own pickups are counted as it loads"
     assert not [k for k in tally if k[0] == "pickup_selection"], "a cancelled spawn's selection is no roll"
-    assert tally.get(("npc_death", "-", "drops"), 0) == 3 and tally.get(("spawn", "enemy_death", "drops"), 0) == 3, tally
+    assert tally.get(("npc_death", "-", "drops"), 0) == 4 and tally.get(("spawn", "enemy_death", "drops"), 0) == 4, tally
     assert any(m.get("t") == "event" and m.get("name") == "rolls" and m["data"].get("samples") for m in sent(game)), \
         "LOG_SPAWNS samples go with the counts"
     print("15f. roll audit:", {f"{h}/{c}": n for (h, c, o), n in tally.items() if o != "uncontrolled"})

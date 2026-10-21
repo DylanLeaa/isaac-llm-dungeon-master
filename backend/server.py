@@ -31,7 +31,7 @@ from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_C
                          CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeDM, ClaudeCodePlanner)
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
-from memory import RunMemory, kind_of
+from memory import DECK_FIELD, RunMemory, kind_of
 from planners import (FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, NARRATIVE_WAIT_S, Campaign, MockPlanner, OpenRouterPlanner,
                       floor_signature, parse_economy)
 from receipt import Receipt
@@ -58,6 +58,19 @@ def _priority(kind: str, ctx: dict) -> int:
     if kind == "item_choice" and ctx.get("reason") != "floor start":
         return NEXT_DOOR
     return BACKGROUND
+
+
+def _deck_short(kind: str, prev: dict, ctx: dict) -> bool:
+    """A deck whose unused tail is shorter than the game asked for: the gate can't keep it (the game would
+    be handed an empty deck back, and every roll after it left to vanilla)."""
+    field = DECK_FIELD.get(kind)
+    if not field:
+        return False
+    try:
+        wanted = max(1, int(ctx.get("wanted") or 1))
+    except (TypeError, ValueError):
+        wanted = 1
+    return len(prev.get(field) or []) < wanted
 
 
 class PrioritySemaphore:
@@ -478,7 +491,8 @@ class Coordinator:
         call = None
         campaign = ""
         try:
-            if prev and await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
+            if prev and not _deck_short(kind, prev, asked_ctx) \
+                    and await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
                 # The same deck answers this request too: what is left of it, and how many draws that
                 # already accounts for (the mod skips only draws made since).
                 self.memory.reissue(key, rid)
