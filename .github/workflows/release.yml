@@ -25,7 +25,7 @@ jobs:
       - name: Run tests
         shell: pwsh
         run: |
-          python -m pip install -r backend/requirements.txt pytest
+          python -m pip install -r backend/requirements.txt pytest lupa
           python -m pytest tests --ignore=tests/live_smoke.py --ignore=tests/probe_models.py -q
 
       - name: Build exe
