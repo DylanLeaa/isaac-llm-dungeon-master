@@ -15,9 +15,18 @@ GOOGLE_DEFAULT_MODEL = "gemini-2.5-flash"
 
 # id -> (USD per million tokens: in, out, cached in): Google's list prices for paid use, for the models we know.
 # A model missing here still works: its price shows as "-" and receipts count it as free.
+# Standard tier, text input, prompts <= 200k (the DM's prompts are ~15k), as listed on 2026-10-22. Scheduled
+# increases: gemini-4-argon doubles on 2026-12-01 (4.00 / 20.00 / 0.20), gemini-3.8-flash and 3.6-flash on
+# 2027-01-01 (1.50 / 7.50 / 0.15).
 PRICES: dict[str, tuple[float, float, float | None]] = {
+    "gemini-4-argon": (2.00, 10.00, 0.10),
+    "gemini-3.8-flash": (0.75, 3.75, 0.075),
+    "gemini-3.6-flash": (0.75, 3.75, 0.075),
+    "gemini-3.1-pro-preview": (2.00, 12.00, 0.20),
     "gemini-3-pro-preview": (2.00, 12.00, 0.20),
     "gemini-3-flash-preview": (0.50, 3.00, 0.05),
+    "gemini-3.5-flash-lite": (0.30, 2.50, 0.03),
+    "gemini-3.1-flash-lite": (0.25, 1.50, 0.025),
     "gemini-2.5-pro": (1.25, 10.00, 0.125),
     "gemini-2.5-flash": (0.30, 2.50, 0.03),
     "gemini-2.5-flash-lite": (0.10, 0.40, 0.01),

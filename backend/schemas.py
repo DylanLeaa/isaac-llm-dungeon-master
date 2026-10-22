@@ -267,6 +267,31 @@ def _int(v: Any, default: int) -> int:
         return default
 
 
+def kill_drop_cap(state: dict, cruelty: int) -> int:
+    """How many kills and breaks may drop something this floor. Rare in vanilla: scaled from the clear
+    rate and cruelty."""
+    return round(normal_rooms(state) * VANILLA_PICKUPS_PER_CLEAR * max(0.5, 1.5 - 0.08 * cruelty))
+
+
+def kill_drops_left(state: dict, cruelty: int, counters: dict) -> int:
+    return max(0, kill_drop_cap(state, cruelty) - int(counters.get("drops_floor", 0)))
+
+
+def traps_per_floor(cruelty: int) -> int:
+    """Troll bombs (and other traps) a floor may hold: none below cruelty 4."""
+    return 0 if cruelty < 4 else 1 + cruelty // 4
+
+
+def extra_enemies_per_room(cruelty: int) -> int:
+    return round(cruelty / 3.3)                         # 0..3
+
+
+def max_curses(cruelty: int, mercy: bool = False) -> int:
+    """How many curses a floor plan may add."""
+    n = 2 if cruelty >= 7 else (1 if cruelty >= 3 else 0)
+    return min(n, 1) if mercy else n
+
+
 def _wanted(ctx: dict, default: int, cap: int) -> int:
     """How many entries a deck answer may hold: context.wanted, within the schema's maximum."""
     return max(1, min(cap, _int(ctx.get("wanted"), default)))
@@ -280,7 +305,7 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
     budget = budget or Budget(None, None)
     mercy = mercy_active(state)
     floor_trolls = int(counters.get("troll_bombs_floor", 0))
-    troll_budget = 0 if (mercy or cruelty < 4) else max(0, 1 + cruelty // 4 - floor_trolls)
+    troll_budget = 0 if mercy else max(0, traps_per_floor(cruelty) - floor_trolls)
     out: dict[str, Any] = {
         "intent": _clean_text(raw.get("intent"), 120),
         "taunt": _clean_text(raw.get("taunt"), 70),
@@ -304,7 +329,7 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         if color in CHAMPION_COLORS:
             out["champion_enum"] = CHAMPION_COLORS[color][0]
 
-        budget_n = round(cruelty / 3.3)                     # 0..3 extra enemies
+        budget_n = extra_enemies_per_room(cruelty)
         if mercy:
             budget_n = min(budget_n, 1)
         if ctx.get("first_room_of_floor"):
@@ -405,9 +430,7 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
 
     elif kind == "drops":
         wanted = _wanted(ctx, 8, 8)
-        # Kill drops are rare in vanilla: a floor-wide count, scaled from the clear rate and cruelty.
-        floor_cap = round(normal_rooms(state) * VANILLA_PICKUPS_PER_CLEAR * max(0.5, 1.5 - 0.08 * cruelty))
-        left = max(0, floor_cap - int(counters.get("drops_floor", 0)))
+        left = kill_drops_left(state, cruelty, counters)
         outcomes = []
         for r in (raw.get("outcomes") or [])[:wanted]:
             name = r.get("reward") if isinstance(r, dict) else None
@@ -456,14 +479,17 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         out["order"] = order
 
     elif kind == "floor_plan":
-        max_curses = 2 if cruelty >= 7 else (1 if cruelty >= 3 else 0)
-        if mercy:
-            max_curses = min(max_curses, 1)
+        allowed = max_curses(cruelty, mercy)
         add = []
         for c in raw.get("add_curses") or []:
-            if c in CURSES and c not in add and len(add) < max_curses:
-                if mercy and c == "unknown":
-                    continue                                    # don't hide HP from a dying player
+            if c not in CURSES or c in add:
+                continue
+            if mercy and c == "unknown":
+                notes.append("unknown -> none (mercy)")         # don't hide HP from a dying player
+            elif len(add) >= allowed:
+                notes.append(f"{c} -> none (no curses below cruelty 3)" if allowed == 0
+                             else f"{c} -> none (at most {allowed} curse{'s' if allowed > 1 else ''} at this cruelty)")
+            else:
                 add.append(c)
         out["add_curses"] = add
         out["strip_vanilla_curses"] = bool(raw.get("strip_vanilla_curses"))

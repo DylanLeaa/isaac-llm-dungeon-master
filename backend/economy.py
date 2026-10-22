@@ -194,6 +194,8 @@ class Economy:
         rows = [(row.get(family, 0), k) for k, row in self.committed.items() if k != key and row.get(family, 0) > 0]
         if rows:
             return f"{max(rows)[1]} took the last one"
+        if family == "traps" and self.target(family) <= 0:
+            return "none below cruelty 4"
         return "already given this " + ("run" if family in RUN_TRIMMED else "floor")
 
     # ------------------------------------------------------------ decks
