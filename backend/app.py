@@ -154,7 +154,7 @@ class CellTip:
 
     def _move(self, e) -> None:
         row, col = self.tree.identify_row(e.y), self.tree.identify_column(e.x)
-        cell = (row, col) if row and col and self.tree.identify_region(e.x, e.y) == "cell" else None
+        cell = (row, col) if row and col and self.tree.identify_region(e.x, e.y) in ("cell", "tree") else None
         if cell == self.cell:
             return
         self._cancel()
@@ -167,10 +167,17 @@ class CellTip:
         row, col = cell
         try:
             index = int(col.lstrip("#")) - 1
-            shown = self.tree["displaycolumns"]
-            key = self.tree["columns"][index] if shown in ("#all", ("#all",)) else shown[index]
-            text = str(self.tree.set(row, key))
-            width = self.tree.column(key, "width")
+            if index < 0:                                     # the tree column: indented by depth
+                key, text = "#0", str(self.tree.item(row, "text"))
+                depth, parent = 1, self.tree.parent(row)
+                while parent:
+                    depth, parent = depth + 1, self.tree.parent(parent)
+                indent = 20 * depth
+            else:
+                shown = self.tree["displaycolumns"]
+                key = self.tree["columns"][index] if shown in ("#all", ("#all",)) else shown[index]
+                text, indent = str(self.tree.set(row, key)), 0
+            width = self.tree.column(key, "width") - indent
         except (tk.TclError, ValueError, IndexError):
             return
         font = tkfont.nametofont("TkDefaultFont")
@@ -421,6 +428,7 @@ class RunView(ttk.Frame):
         t.column("#0", width=330, stretch=False)
         t.column("state", width=170, stretch=False)
         t.column("detail", width=400, stretch=True)
+        CellTip(t)
         t.tag_configure("floor", foreground="#9fc5ff", font=("Segoe UI Semibold", 10))
         t.tag_configure("next", foreground=STATUS_TAGS["applied"])
         for tag in ("drawn", "skipped", "used", "unused", "spent"):
