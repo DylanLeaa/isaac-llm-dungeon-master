@@ -3,7 +3,7 @@
 The same backend as server.py, with a window instead of a console:
   Current run   what the DM is doing this run: its bill, its work, every decision, its plans, its decks
   History       every past run's receipt
-  Settings      OpenRouter key or Claude Code and the models, applied to the running DM straight away
+  Settings      OpenRouter / Google AI Studio key or Claude Code, and the models, applied to the running DM straight away
   Log           what the console used to show
 
 Settings live in %APPDATA%/LLM Dungeon Master/config.json, the backend's log next to them.
@@ -50,6 +50,7 @@ DEFAULT_CRUELTY = 6           # until the game's DM Settings menu says otherwise
 GAME_TIMEOUT_S = 15.0
 LOG_LINES = 3000
 KEYS_URL = "https://openrouter.ai/keys"
+from google_ai import KEYS_URL as GOOGLE_KEYS_URL
 # Text colours, set on the widget: a colour in a derived ttk style doesn't always survive the theme.
 BAD, GOOD, MUTED, LINK = "#ff8a7a", "#7fd18b", "#9a9a9a", "#7fb8ff"
 
@@ -560,16 +561,18 @@ class ModelPicker(tk.Toplevel):
     """Every model a role can use: filter, sort by any column (intelligence first), pick one.
     Claude Code's models, when it's on, are pinned to the top whatever the sort."""
 
-    COLUMNS = (("name", "Model", 270), ("id", "ID", 250), ("intelligence", "Intelligence", 95),
+    COLUMNS = (("whitelisted", "Whitelisted", 85), ("name", "Model", 300), ("intelligence", "Intelligence", 95),
                ("prompt", "Input $/M", 85), ("completion", "Output $/M", 90), ("cache_read", "Cached $/M", 90),
-               ("context", "Context", 75), ("reasoning", "Reasoning", 80))
-    NUMERIC = ("intelligence", "prompt", "completion", "cache_read", "context")
+               ("turn_cost", "Turn cost", 85), ("latency", "Latency", 70))
+    NUMERIC = ("intelligence", "prompt", "completion", "cache_read", "turn_cost", "latency")
+    PROBED = ("whitelisted", "turn_cost", "latency")   # the DM whitelist's columns: the minor role only
 
     def __init__(self, master, role: str, pinned: list, rows: list, current: str, on_pick) -> None:
         super().__init__(master)
         self.pinned, self.rows, self.current, self.on_pick = pinned, rows, current, on_pick
         self.by_value = {m.value: m for m in pinned + rows}
         scored = any(m.intelligence is not None for m in rows)
+        probed = any(m.whitelisted is not None for m in rows)
         self.sort_key, self.desc = ("intelligence", True) if scored else ("created", True)
         self.title(PICKER_TITLES[role])
         self.transient(master)
@@ -589,15 +592,20 @@ class ModelPicker(tk.Toplevel):
         search = ttk.Entry(bar, textvariable=self.query, width=32)
         search.pack(side="left", padx=(6, 14))
         self.query.trace_add("write", lambda *_: self._fill())
-        self.author = tk.StringVar(value="All providers")
-        box = ttk.Combobox(bar, textvariable=self.author, state="readonly", width=22,
-                           values=["All providers", *sorted({m.author for m in pinned + rows})])
+        self.provider = tk.StringVar(value="All providers")
+        names = model_catalog.PROVIDERS
+        box = ttk.Combobox(bar, textvariable=self.provider, state="readonly", width=22,
+                           values=["All providers", *(names[b] for b in names if any(m.backend == b for m in pinned + rows))])
         box.pack(side="left")
         box.bind("<<ComboboxSelected>>", lambda _e: self._fill())
         self.scored = tk.BooleanVar(value=False)
         if scored:
             ttk.Checkbutton(bar, text="Only models with an intelligence score", variable=self.scored,
-                            command=self._fill).pack(side="left", padx=14)
+                            command=self._fill).pack(side="left", padx=(14, 0))
+        self.whitelisted = tk.BooleanVar(value=probed)
+        if probed:
+            ttk.Checkbutton(bar, text="Whitelist Only", variable=self.whitelisted,
+                            command=self._fill).pack(side="left", padx=(14, 0))
         self.count = ttk.Label(bar, text="", foreground=MUTED)
         self.count.pack(side="right")
 
@@ -606,11 +614,12 @@ class ModelPicker(tk.Toplevel):
         self.tree = ttk.Treeview(table, columns=[c[0] for c in self.COLUMNS], show="headings", selectmode="browse")
         for key, label, width in self.COLUMNS:
             self.tree.heading(key, text=label, command=lambda k=key: self._sort(k))
-            self.tree.column(key, width=width, stretch=key in ("name", "id"),
-                             anchor="e" if key in self.NUMERIC else "w")
+            self.tree.column(key, width=width, stretch=key == "name",
+                             anchor="e" if key in self.NUMERIC else "center" if key == "whitelisted" else "w")
+        hidden = () if probed else self.PROBED
         if not scored:                            # the gate's decisions models: no score, priced on input only
-            self.tree.configure(displaycolumns=[c[0] for c in self.COLUMNS
-                                                if c[0] not in ("intelligence", "completion", "reasoning")])
+            hidden += ("intelligence", "completion")
+        self.tree.configure(displaycolumns=[c[0] for c in self.COLUMNS if c[0] not in hidden])
         self.tree.tag_configure("pinned", foreground=PINNED)
         self.tree.tag_configure("current", foreground=GOOD)
         bar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
@@ -647,19 +656,21 @@ class ModelPicker(tk.Toplevel):
             self.tree.see(self.current)
 
     def _sort(self, key: str) -> None:
-        """Click a heading to sort by it, again to reverse. Scores and context high first, the rest low first."""
+        """Click a heading to sort by it, again to reverse. Scores and whitelisted first, the rest low first."""
         if key == self.sort_key:
             self.desc = not self.desc
         else:
-            self.sort_key, self.desc = key, key in ("intelligence", "context")
+            self.sort_key, self.desc = key, key in ("intelligence", "whitelisted")
         self._fill()
 
     def _fill(self) -> None:
         q = self.query.get()
-        author = "" if self.author.get() == "All providers" else self.author.get()
-        pinned = model_catalog.filter_rows(self.pinned, q, author, self.scored.get())
-        rows = model_catalog.sort_rows(model_catalog.filter_rows(self.rows, q, author, self.scored.get()),
-                                       self.sort_key, self.desc)
+        backend = next((b for b, name in model_catalog.PROVIDERS.items() if name == self.provider.get()), "")
+        pinned = model_catalog.filter_rows(self.pinned, q, scored_only=self.scored.get(),
+                                           whitelist_only=self.whitelisted.get(), backend=backend)
+        rows = model_catalog.filter_rows(self.rows, q, scored_only=self.scored.get(),
+                                         whitelist_only=self.whitelisted.get(), backend=backend)
+        rows = model_catalog.sort_rows(rows, self.sort_key, self.desc)
         selected = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
         for m in pinned + rows:
@@ -679,14 +690,10 @@ class ModelPicker(tk.Toplevel):
             prices = ("your plan",) * 3
         else:
             prices = (price(m.prompt), price(m.completion), price(m.cache_read))
-        if not m.context:
-            context = "-"
-        elif m.context >= 1_000_000:
-            context = f"{m.context / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
-        else:
-            context = f"{m.context // 1000}K"
+        listed = "-" if m.whitelisted is None else "✓" if m.whitelisted else "✗"
         score = "-" if m.intelligence is None else f"{m.intelligence:g}"
-        return (m.name, m.id, score, *prices, context, m.reasoning or "-")
+        latency = "-" if m.latency is None else f"{m.latency:.1f}s"
+        return (listed, m.name, score, *prices, model_catalog.turn_price(m.turn_cost), latency)
 
     def _show_selected(self) -> None:
         sel = self.tree.selection()
@@ -721,6 +728,7 @@ class App:
         self.catalog_error: str | None = None
         self.fetching = False
         self.model_picks = {role: self.cfg.get(f"{role}_model", "") for role in model_catalog.ROLES}
+        self.google_key_var = tk.StringVar(value=self.cfg.get("google_api_key", ""))
 
         root.title("LLM Dungeon Master")
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -793,7 +801,8 @@ class App:
             return build_dm("mock", "", cruelty=DEFAULT_CRUELTY)
         dm_backend, dm_model = model_catalog.resolve(cfg, "minor")
         planner_backend, planner_model = model_catalog.resolve(cfg, "major")
-        return build_dm(dm_backend, appdata.api_key(cfg), cruelty=DEFAULT_CRUELTY, model=dm_model,
+        return build_dm(dm_backend, appdata.api_key(cfg), google_key=appdata.google_key(cfg),
+                        cruelty=DEFAULT_CRUELTY, model=dm_model,
                         planner_backend=planner_backend, narrative_model=planner_model, floor_model=planner_model,
                         gate_model=model_catalog.resolve(cfg, "gate")[1])
 
@@ -817,7 +826,7 @@ class App:
     def _tick(self) -> None:
         dm = self.dm
         if dm is None:
-            self._set_status("#ffb86b", "The DM isn't set up: add an OpenRouter key or turn on Claude Code in Settings")
+            self._set_status("#ffb86b", "The DM isn't set up: add an OpenRouter or Google AI Studio key, or turn on Claude Code, in Settings")
             self.dm_label.configure(text="")
         elif not dm.alive():
             self._set_status("#ff6b5b", f"The DM stopped: {dm.error or 'unknown error'}")
@@ -1000,9 +1009,25 @@ class App:
         link = ttk.Label(box, text=f"Get a key at {KEYS_URL}", style="Link.TLabel", foreground=LINK, cursor="hand2")
         link.grid(row=1, column=1, sticky="w", padx=8, pady=(6, 0))
         link.bind("<Button-1>", lambda _e: webbrowser.open(KEYS_URL))
-        env = " (OPENROUTER_API_KEY is set in your environment: it's used while this is blank)" \
-            if os.environ.get("OPENROUTER_API_KEY") else ""
-        ttk.Label(box, text="Pays for the models below, a few cents a run with the defaults." + env,
+        ttk.Label(box, text="Pays for the models below, a few cents a run with the defaults.",
+                  foreground=MUTED).grid(row=2, column=1, sticky="w", padx=8, pady=(2, 0))
+        box.columnconfigure(1, weight=1)
+
+        box = ttk.LabelFrame(tab, text=" Google AI Studio ", padding=(14, 10))
+        box.pack(fill="x", pady=(14, 0))
+        ttk.Label(box, text="API key").grid(row=0, column=0, sticky="w")
+        self.google_key_entry = ttk.Entry(box, textvariable=self.google_key_var, show="\u2022", width=70)
+        self.google_key_entry.grid(row=0, column=1, sticky="we", padx=8)
+        self.show_google_key = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="Show", variable=self.show_google_key,
+                        command=lambda: self.google_key_entry.configure(
+                            show="" if self.show_google_key.get() else "\u2022")).grid(row=0, column=2)
+        link = ttk.Label(box, text=f"Get a key at {GOOGLE_KEYS_URL}", style="Link.TLabel", foreground=LINK,
+                         cursor="hand2")
+        link.grid(row=1, column=1, sticky="w", padx=8, pady=(6, 0))
+        link.bind("<Button-1>", lambda _e: webbrowser.open(GOOGLE_KEYS_URL))
+        ttk.Label(box, text="Runs the Gemini models in the pickers below on your own key, billed by Google. "
+                            "The list of models comes from Google, so it needs the key.",
                   foreground=MUTED).grid(row=2, column=1, sticky="w", padx=8, pady=(2, 0))
         box.columnconfigure(1, weight=1)
 
@@ -1097,6 +1122,8 @@ class App:
                 text += "  - your Claude Code pick comes back when Claude Code is on"
             line.configure(text=text)
         n = len(self.catalog["text"]) + len(self.catalog["decisions"])
+        g = len(self.catalog["google"])
+        google_error = (self.catalog_raw or {}).get("google_error")
         when = time.strftime("%d %b %H:%M", time.localtime(self.catalog_raw["fetched"])) \
             if self.catalog_raw and self.catalog_raw.get("fetched") else None
         if self.fetching:
@@ -1106,7 +1133,12 @@ class App:
             text += f": showing the one from {when}." if when else "."
             colour = BAD
         else:
-            text, colour = (f"{n} models from OpenRouter, fetched {when}." if when else "No model list yet."), MUTED
+            text, colour = (f"{n} models from OpenRouter" + (f", {g} from Google AI Studio" if g else "")
+                            + f", fetched {when}." if when else "No model list yet."), MUTED
+            if google_error:
+                text, colour = f"{text}  Google AI Studio's list failed ({google_error}).", BAD
+            elif not g and not self.google_key_var.get().strip():
+                text += "  Add a Google AI Studio key to list Gemini models."
         self.models_status.configure(text=text, foreground=colour)
         self.models_refresh.configure(state="disabled" if self.fetching else "normal")
 
@@ -1121,10 +1153,11 @@ class App:
             return
         self.fetching, self.catalog_error = True, None
         result: queue.Queue = queue.Queue()
+        key = self.google_key_var.get().strip()
 
         def work() -> None:
             try:
-                result.put((model_catalog.fetch(), None))
+                result.put((model_catalog.fetch(google_key=key), None))
             except Exception as e:                # noqa: BLE001 - shown in Settings, the cached list stays
                 result.put((None, f"{type(e).__name__}: {e}"))
 
@@ -1167,7 +1200,8 @@ class App:
         self.cfg["spoiler_mode"] = on
 
     def save_settings(self) -> None:
-        cfg = {"openrouter_api_key": self.key_var.get().strip(), "use_claude_code": self.cc_var.get(),
+        cfg = {"openrouter_api_key": self.key_var.get().strip(),
+               "google_api_key": self.google_key_var.get().strip(), "use_claude_code": self.cc_var.get(),
                "spoiler_mode": self.spoiler_var.get(),
                **{f"{role}_model": pick for role, pick in self.model_picks.items()}}
         try:
@@ -1180,7 +1214,10 @@ class App:
         except OSError as e:
             self.settings_msg.configure(text=f"Couldn't save the settings: {e}", foreground=BAD)
             return
+        key_changed = cfg["google_api_key"] != self.cfg.get("google_api_key", "")
         self.cfg = cfg
+        if key_changed:
+            self.refresh_models()                 # Google's model list needs the key
         if self.dm and self.dm.alive():
             self.dm.apply(engine)
         else:

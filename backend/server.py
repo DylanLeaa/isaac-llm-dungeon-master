@@ -29,6 +29,7 @@ import bridge
 import epilogue
 from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_CODE_LATE_GRACE_S,
                          CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeDM, ClaudeCodePlanner)
+from google_ai import GOOGLE_DEFAULT_MODEL
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
 from memory import DECK_FIELD, RunMemory, kind_of
@@ -702,21 +703,24 @@ class Engine:
 def build_dm(backend: str, api_key: str, *, cruelty: int, model: str | None = None,
              narrative_model: str | None = None, floor_model: str | None = None, planner_backend: str | None = None,
              gate_model: str = GATE_DEFAULT_MODEL, gate_threshold: float = GATE_THRESHOLD, no_gate: bool = False,
-             no_planners: bool = False, claude_bin: str | None = None,
+             no_planners: bool = False, claude_bin: str | None = None, google_key: str = "",
              mock_latency: tuple[float, float] = (0.25, 1.2)) -> Engine:
-    """The DM, planners and gate for a backend: "openrouter", "claude-code" or "mock". The planners can run
+    """The DM, planners and gate for a backend: "openrouter", "google", "claude-code" or "mock". The planners can run
     on another backend than the DM (planner_backend, default the DM's).
     ValueError, with a message for the player, when it can't be set up."""
     if backend == "mock":
         return Engine(MockDM(cruelty, latency=mock_latency), None if no_planners else MockPlanner(),
                       None if no_gate else MockGate(), label="MOCK (offline)")
     planner_backend = planner_backend or backend
-    if not api_key and "openrouter" in (backend, None if no_planners else planner_backend):
-        raise ValueError("No OpenRouter API key: add one, or use Claude Code instead.")
+    used = (backend, None if no_planners else planner_backend)
+    if not api_key and "openrouter" in used:
+        raise ValueError("No OpenRouter API key: add one, or use Claude Code or Google AI Studio instead.")
+    if not google_key and "google" in used:
+        raise ValueError("No Google AI Studio API key: add one in Settings.")
     try:
-        dm, model = _make_dm(backend, model, cruelty, api_key, claude_bin)
+        dm, model = _make_dm(backend, model, cruelty, api_key, claude_bin, google_key)
         planner = None if no_planners else _make_planner(planner_backend, narrative_model, floor_model, api_key,
-                                                         claude_bin)
+                                                         claude_bin, google_key)
     except SystemExit as e:                       # find_claude's message, for the CLI
         raise ValueError(str(e)) from None
     # The gate isn't a Claude model: it stays on OpenRouter, when there's a key for it.
@@ -724,22 +728,29 @@ def build_dm(backend: str, api_key: str, *, cruelty: int, model: str | None = No
     if backend == "claude-code":
         return Engine(dm, planner, gate, CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_LATE_GRACE_S,
                       f"{model} via Claude Code ({dm.runner.bin})")
-    return Engine(dm, planner, gate, label=f"{model} via OpenRouter")
+    return Engine(dm, planner, gate, label=f"{model} via {'Google AI Studio' if backend == 'google' else 'OpenRouter'}")
 
 
-def _make_dm(backend: str, model: str | None, cruelty: int, api_key: str, claude_bin: str | None):
+def _make_dm(backend: str, model: str | None, cruelty: int, api_key: str, claude_bin: str | None,
+             google_key: str = ""):
     if backend == "claude-code":
         model = model or CLAUDE_CODE_DM_MODEL
         return ClaudeCodeDM(cruelty, model=model, claude_bin=claude_bin), model
+    if backend == "google":
+        model = model or GOOGLE_DEFAULT_MODEL
+        return OpenRouterDM(cruelty, model=model, api_key=google_key, google=True), model
     model = model or OPENROUTER_DEFAULT_MODEL
     return OpenRouterDM(cruelty, model=model, api_key=api_key), model
 
 
 def _make_planner(backend: str, narrative_model: str | None, floor_model: str | None, api_key: str,
-                  claude_bin: str | None):
+                  claude_bin: str | None, google_key: str = ""):
     if backend == "claude-code":
         return ClaudeCodePlanner(narrative_model or CLAUDE_CODE_PLANNER_MODEL,
                                  floor_model or CLAUDE_CODE_PLANNER_MODEL, claude_bin=claude_bin)
+    if backend == "google":
+        return OpenRouterPlanner(narrative_model or GOOGLE_DEFAULT_MODEL, floor_model or GOOGLE_DEFAULT_MODEL,
+                                 api_key=google_key, google=True)
     return OpenRouterPlanner(narrative_model or NARRATIVE_DEFAULT_MODEL, floor_model or FLOOR_DEFAULT_MODEL,
                              api_key=api_key)
 
@@ -750,7 +761,7 @@ def main() -> None:
                     help="the game's install folder, if it isn't found in your Steam libraries (repeatable)")
     ap.add_argument("--log", type=Path, action="append",
                     help="the game's log.txt, if it isn't in Documents/My Games/Binding of Isaac ... (repeatable)")
-    ap.add_argument("--backend", choices=["openrouter", "claude-code"],
+    ap.add_argument("--backend", choices=["openrouter", "google", "claude-code"],
                     default=os.environ.get("LLMDM_BACKEND", "openrouter"),
                     help="where the Claude calls go: OpenRouter, or your local Claude Code in headless mode")
     ap.add_argument("--claude-bin", default=None,
@@ -783,7 +794,7 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         engine = build_dm("mock" if args.mock else args.backend, os.environ.get("OPENROUTER_API_KEY", ""),
-                          cruelty=args.cruelty, model=args.model, narrative_model=args.narrative_model,
+                          google_key=os.environ.get("GOOGLE_API_KEY", ""), cruelty=args.cruelty, model=args.model, narrative_model=args.narrative_model,
                           floor_model=args.floor_model, gate_model=args.gate_model,
                           gate_threshold=args.gate_threshold, no_gate=args.no_gate, no_planners=args.no_planners,
                           claude_bin=args.claude_bin, mock_latency=tuple(args.mock_latency))

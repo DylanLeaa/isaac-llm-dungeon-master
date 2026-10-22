@@ -20,6 +20,8 @@ def build_user_message(kind: str, state: dict, ctx: dict, memory: dict) -> str:
     }, separators=(",", ":"))
 
 
+from google_ai import GOOGLE_URL, tidy, strip_cache_control
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_DEFAULT_MODEL = "anthropic/claude-haiku-5.5"      # OpenRouter slugs use dots
 
@@ -29,6 +31,18 @@ OPENROUTER_DEFAULT_MODEL = "anthropic/claude-haiku-5.5"      # OpenRouter slugs 
 _OPENAI_TOOLS = [{"type": "function", "function": {
     "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
     for t in TOOLS.values()]
+
+
+def api_headers(api_key: str | None, google: bool = False) -> dict:
+    if google:
+        return {"Authorization": f"Bearer {api_key}"}
+    return {"Authorization": f"Bearer {api_key or os.environ['OPENROUTER_API_KEY']}", "X-Title": "LLM Dungeon Master"}
+
+
+def completion_json(resp, model: str, google: bool = False) -> dict:
+    """The response body; Google's gets its cost worked out from the price list."""
+    data = resp.json()
+    return tidy(data, model) if google and isinstance(data, dict) else data
 
 
 def _usage(data: dict) -> dict:
@@ -59,13 +73,12 @@ class OpenRouterDM:
 
     # Deck answers ran up to ~1900 tokens in a real run: leave headroom. A cut-off answer is a lost decision.
     def __init__(self, cruelty: int, model: str = OPENROUTER_DEFAULT_MODEL, max_tokens: int = 2048,
-                 api_key: str | None = None) -> None:
+                 api_key: str | None = None, google: bool = False) -> None:
         import httpx                                    # imported lazily so --mock needs no HTTP client
-        self.client = httpx.AsyncClient(timeout=30.0, headers={
-            "Authorization": f"Bearer {api_key or os.environ['OPENROUTER_API_KEY']}",
-            "X-Title": "LLM Dungeon Master",
-        })
+        self.google = google                            # Google AI Studio's endpoint instead of OpenRouter's
+        self.client = httpx.AsyncClient(timeout=30.0, headers=api_headers(api_key, google))
         self.model = model
+        self.effort: str | None = "none"               # Google's thinking switch: raised if the model insists, dropped if it has none
         self.max_tokens = max_tokens
         self.reasoning: dict = {"enabled": False}       # no thinking tokens: they eat max_tokens and add latency
         self.campaign = ""
@@ -91,11 +104,24 @@ class OpenRouterDM:
     async def _post(self, body: dict):
         """POST with thinking off. A model that can't run without it (400 "Reasoning is mandatory")
         is retried, and from then on called, at low effort."""
+        if self.google:
+            body = {**{k: v for k, v in body.items() if k != "usage"}, "messages": strip_cache_control(body["messages"])}
+            resp = await self._post_google(body)
+            if resp.status_code == 400 and self.effort == "none":    # e.g. Gemini Pro can't run without thinking
+                self.effort = "low"
+                resp = await self._post_google(body)
+            if resp.status_code == 400 and "thinking level is not supported" in resp.text.lower() and self.effort:
+                self.effort = None                                   # e.g. Gemma: no thinking setting at all
+                resp = await self._post_google(body)
+            return resp
         resp = await self.client.post(OPENROUTER_URL, json={**body, "reasoning": self.reasoning})
         if resp.status_code == 400 and "reasoning is mandatory" in resp.text.lower() and "effort" not in self.reasoning:
             self.reasoning = {"effort": "low"}
             resp = await self.client.post(OPENROUTER_URL, json={**body, "reasoning": self.reasoning})
         return resp
+
+    async def _post_google(self, body: dict):
+        return await self.client.post(GOOGLE_URL, json={**body, **({"reasoning_effort": self.effort} if self.effort else {})})
 
     async def decide(self, kind: str, state: dict, ctx: dict, memory: dict) -> dict[str, Any]:
         tool = TOOLS[kind]
@@ -109,10 +135,10 @@ class OpenRouterDM:
             "usage": {"include": True},                 # token + cost accounting in the response
         })
         resp.raise_for_status()
-        data = resp.json()
+        data = completion_json(resp, self.model, self.google)
         record = call_record(self.model, [b["text"] for b in self.system["content"]], data)
         if "error" in data:
-            raise LLMCallError(f"openrouter: {data['error']}", record)
+            raise LLMCallError(f"{'google' if self.google else 'openrouter'}: {data['error']}", record)
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
             raise LLMCallError(f"hit max_tokens={self.max_tokens} before finishing the tool call", record)
@@ -138,10 +164,10 @@ class OpenRouterDM:
             "usage": {"include": True},
         })
         resp.raise_for_status()
-        data = resp.json()
+        data = completion_json(resp, self.model, self.google)
         record = call_record(self.model, [b["text"] for b in self.system["content"]], data)
         if "error" in data:
-            raise LLMCallError(f"openrouter: {data['error']}", record)
+            raise LLMCallError(f"{'google' if self.google else 'openrouter'}: {data['error']}", record)
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
             raise LLMCallError(f"hit max_tokens={self.max_tokens} before finishing the epitaph", record)
