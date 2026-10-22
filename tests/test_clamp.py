@@ -56,7 +56,8 @@ def test_item_order_subset_and_complete():
 
 def test_floor_plan_curse_limits():
     raw = {"add_curses": ["darkness", "labyrinth", "unknown", "blind"], "treasure_distance": "moon", "taunt": ""}
-    assert clamp("floor_plan", raw, st(), {}, cruelty=2, counters={})["add_curses"] == []
+    low = clamp("floor_plan", raw, st(), {}, cruelty=2, counters={})
+    assert low["add_curses"] == [] and "darkness -> none (no curses below cruelty 3)" in low["guardrails"]
     assert clamp("floor_plan", raw, st(), {}, cruelty=5, counters={})["add_curses"] == ["darkness"]
     out = clamp("floor_plan", raw, st(), {}, cruelty=9, counters={})
     assert out["add_curses"] == ["darkness", "unknown"] and out["treasure_distance"] == "any"
@@ -121,6 +122,18 @@ def test_drops_keep_one_entry_per_kill_and_their_budgets():
     spent = clamp("drops", {"outcomes": [{"reward": "penny"}] * 3, "taunt": ""}, st(), {"wanted": 3},
                   cruelty=6, counters={"drops_floor": 3})
     assert [o["reward"] for o in spent["outcomes"]] == ["penny", "nothing", "nothing"]
+
+
+def test_a_trap_below_cruelty_4_says_why():
+    from economy import Economy
+
+    econ = Economy()
+    econ.cruelty = 1
+    econ.observe({"level": {"stage": 1, "stage_type": 0, "room_types": {"default": 5}}})
+    out = clamp("drops", {"outcomes": [{"reward": "sticky_nickel"}], "taunt": ""}, st(), {"wanted": 1},
+                cruelty=1, counters={}, budget=econ.budget("drops:1", "drops", {}))
+    assert out["outcomes"] == [{"reward": "nothing", "count": 1}]
+    assert out["guardrails"] == ["sticky_nickel -> nothing (traps over budget: none below cruelty 4)"]
 
 
 def test_budget_trims_gifts_past_the_floor_economy():

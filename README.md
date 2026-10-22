@@ -124,7 +124,9 @@ so the lead time adapts to your connection.
 Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the referee:
 
 - `--cruelty 0..10` scales extra-enemy budget (0–3/room), champion chance cap, curse count (0–2)
-  and troll-bomb budget per floor. Max one live troll bomb per room. With
+  and troll-bomb budget per floor (none below cruelty 4; no curses below 3). Max one live troll bomb
+  per room. The planners' prompts list these limits for the current cruelty, and a floor plan is told
+  `allowed_curses`; a curse cut by them is noted in the guardrails. With
   Mod Config Menu (Pure) installed,
   **DM Settings → Cruelty** changes it in-game (even mid-run), overrides `--cruelty` and is saved.
 - **Mercy**: at ≤1 heart, no troll bombs, ≤1 extra enemy, no Curse of the Unknown, and a half
@@ -133,7 +135,8 @@ Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the
 - Item and trinket picks must come from the real candidates; unknown enemies/rewards/cards are dropped.
 - **The economy**: every deck spends the floor's budget per resource family (see above); past it, an
   outcome becomes "nothing". Kill drops also have a per-floor count (from vanilla's clear rate and
-  cruelty). Machines keep a house edge: over its uses one pays back at most `1 - 0.05 × cruelty` of
+  cruelty), shown to the DM as `ctx.economy.kill_drops`; once it is spent, a drops deck is written as
+  all "nothing" by the backend, with no model call (`local` in the summary and the receipt). Machines keep a house edge: over its uses one pays back at most `1 - 0.05 × cruelty` of
   what it was paid (at shop prices), plus one small win, and at most one item.
 - **Pills**: a colour's effect is locked the first time it's swallowed (saved with the run, so
   continues keep it). Bad pills are capped per run (40% of colours at cruelty 0, all at 10);
@@ -206,7 +209,8 @@ call does, and lets a call run up to 20 s past its deadline and still deliver: t
 answer and uses it if it still needs one. Use `--claude-bin` if `claude` isn't on PATH.
 `python tests/live_smoke.py --backend claude-code` checks it.
 The console (or the app's Log tab) logs every decision with its latency, intent and taunt, and
-prints the run narrative and each floor brief in full. It's fun on a second monitor. The planners add roughly
+prints the run narrative and each floor brief in full. Its summary table counts one run (it restarts
+when a new run says hello), and a death or victory cancels the decisions still being made. It's fun on a second monitor. The planners add roughly
 $0.05 per run (Opus) and $0.02–0.03 per floor (Sonnet).
 
 **2. Mod**

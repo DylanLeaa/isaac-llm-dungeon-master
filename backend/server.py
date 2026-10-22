@@ -37,7 +37,7 @@ from memory import DECK_FIELD, RunMemory, kind_of
 from planners import (FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, NARRATIVE_WAIT_S, Campaign, MockPlanner, OpenRouterPlanner,
                       floor_signature, parse_economy)
 from receipt import Receipt
-from schemas import KINDS, clamp
+from schemas import KINDS, clamp, kill_drop_cap, kill_drops_left, max_curses, mercy_active
 
 log = logging.getLogger("llmdm")
 Send = Callable[[dict], Awaitable[None]]
@@ -73,6 +73,16 @@ def _deck_short(kind: str, prev: dict, ctx: dict) -> bool:
     except (TypeError, ValueError):
         wanted = 1
     return len(prev.get(field) or []) < wanted
+
+
+def _spent_drops(ctx: dict) -> dict:
+    """A drops deck once the floor's kill drops are spent: nothing for every kill the game asked for."""
+    try:
+        wanted = max(1, int(ctx.get("wanted") or 1))
+    except (TypeError, ValueError):
+        wanted = 1
+    return {"intent": "This floor's kill drops are spent.", "taunt": "",
+            "outcomes": [{"reward": "nothing", "count": 1} for _ in range(wanted)]}
 
 
 class PrioritySemaphore:
@@ -170,8 +180,8 @@ class Coordinator:
         """Log how many answers were requested, paid for, and actually used, per kind."""
         if not self.stats:
             return
-        cols = ("req", "ok", "late", "applied", "replaced", "reused", "superseded", "timeout", "error", "cooldown",
-                "fallback")
+        cols = ("req", "ok", "local", "late", "applied", "replaced", "reused", "superseded", "timeout", "error",
+                "cooldown", "fallback")
         log.info("summary %-11s %s", "kind", " ".join(f"{c:>10}" for c in cols))
         for kind in sorted(k for k in self.stats if k != "gate"):
             log.info("        %-11s %s", kind, " ".join(f"{self.stats[kind][c]:>10}" for c in cols))
@@ -225,6 +235,8 @@ class Coordinator:
                 for _rid, task in list(self.inflight.values()):
                     task.cancel()                 # asked in the old run: don't spend DM slots on it
                 self.inflight.clear()
+                self.stats.clear()                # the summary above was the last run's; this one starts at zero
+                self.usage.clear()                # (cleared in place: the campaign counts into the same objects)
                 self.receipt.start_run(msg.get("run"), fresh=bool(msg.get("new_run")))
                 if not msg.get("new_run"):        # a continue: its plans are in its receipt, don't rewrite them
                     self.campaign.restore(*self.receipt.saved_plans())
@@ -272,6 +284,9 @@ class Coordinator:
             self._rolls(msg.get("data") or {})
         elif t == "event" and msg.get("name") in ("death", "victory"):
             self.memory.on_game_event(str(msg.get("name")), msg.get("data") or {})
+            for _rid, task in list(self.inflight.values()):
+                task.cancel()                     # the run is over: nothing still being decided can be used
+            self.inflight.clear()
             await self._run_over(str(msg["name"]), msg.get("data") or {}, send)
         elif t == "event":
             self.memory.on_game_event(str(msg.get("name")), msg.get("data") or {})
@@ -484,6 +499,13 @@ class Coordinator:
         if prev:                                  # a re-ask replaces this answer; show it so the model restates it
             ctx = {**ctx, "your_previous_answer": _compact(prev)}
         ctx = {**ctx, "economy": self.memory.economy.view(key)}
+        kills_left = None
+        if kind == "drops":                       # the cap clamp() holds kill drops to, so intents don't promise past it
+            kills_left = kill_drops_left(state, self.cruelty, self.memory.counters)
+            ctx["economy"]["kill_drops"] = {"cap": kill_drop_cap(state, self.cruelty), "left": kills_left}
+            ctx["economy"]["verdict"] += f"; kill drops: {kills_left} left this floor"
+        elif kind == "floor_plan":
+            ctx["allowed_curses"] = max_curses(self.cruelty, mercy_active(state))
         deadline = max(MIN_DEADLINE_S, min(MAX_DEADLINE_S, float(msg.get("deadline_ms", 4000)) / 1000))
         digest = self.memory.digest(exclude=key, in_flight=self._in_flight(key))
         # What the receipt keeps of the request: the user message is exactly these, as JSON.
@@ -496,31 +518,38 @@ class Coordinator:
         call = None
         campaign = ""
         try:
-            if prev and not _deck_short(kind, prev, asked_ctx) \
-                    and await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
-                # The same deck answers this request too: what is left of it, and how many draws that
-                # already accounts for (the mod skips only draws made since).
-                self.memory.reissue(key, rid)
-                seq = self.receipt_seq.get(key, self.used_seq.get(key))
-                if seq is not None:
-                    self.answer_seq[(key, rid)] = seq
-                await send({**base, "ok": True, "ms": _ms(t0), "decision": prev,
-                            "drawn_base": self.memory.drawn_total.get(key, 0)})
-                return
-            # Rate-limited: hold the request until the model's cooldown is over, then make the call. A cooldown
-            # longer than the deadline is answered "cooldown" at the deadline instead: answered at once, the game
-            # would re-ask on the next frame and give up after HOLD_RETRIES. Like the slot queue, not the DM's time.
-            wait = self._cooldown_left()
-            if wait:
-                if wait >= deadline:
-                    await asyncio.sleep(deadline)
-                    raise CoolingDown(self._cooldown_left())
-                log.info("%-11s %-14s rate-limited: holding %.1fs for the cooldown", kind, key, wait)
-                await asyncio.sleep(wait)
-            # the deadline counts from here: queueing for a slot isn't the DM's time
-            async with self.sem.slot(_priority(kind, ctx)):
-                campaign = getattr(self.dm, "campaign", "")   # what this answer is written against
-                raw, late = await self._decide(kind, key, state, ctx, digest, deadline, t0)
+            if kills_left == 0:
+                # This floor's kill drops are spent: every entry would be clamped to nothing anyway, so the
+                # deck is written here and the DM isn't paid for it.
+                raw, late = _spent_drops(ctx), False
+                campaign = getattr(self.dm, "campaign", "")
+            else:
+                if prev and not _deck_short(kind, prev, asked_ctx) \
+                        and await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
+                    # The same deck answers this request too: what is left of it, and how many draws that
+                    # already accounts for (the mod skips only draws made since).
+                    self.memory.reissue(key, rid)
+                    seq = self.receipt_seq.get(key, self.used_seq.get(key))
+                    if seq is not None:
+                        self.answer_seq[(key, rid)] = seq
+                    await send({**base, "ok": True, "ms": _ms(t0), "decision": prev,
+                                "drawn_base": self.memory.drawn_total.get(key, 0)})
+                    return
+                # Rate-limited: hold the request until the model's cooldown is over, then make the call. A
+                # cooldown longer than the deadline is answered "cooldown" at the deadline instead: answered at
+                # once, the game would re-ask on the next frame and give up after HOLD_RETRIES. Like the slot
+                # queue, not the DM's time.
+                wait = self._cooldown_left()
+                if wait:
+                    if wait >= deadline:
+                        await asyncio.sleep(deadline)
+                        raise CoolingDown(self._cooldown_left())
+                    log.info("%-11s %-14s rate-limited: holding %.1fs for the cooldown", kind, key, wait)
+                    await asyncio.sleep(wait)
+                # the deadline counts from here: queueing for a slot isn't the DM's time
+                async with self.sem.slot(_priority(kind, ctx)):
+                    campaign = getattr(self.dm, "campaign", "")   # what this answer is written against
+                    raw, late = await self._decide(kind, key, state, ctx, digest, deadline, t0)
             usage = raw.pop("_usage", None)
             call = raw.pop("_call", None)
             # Trimmed against the economy as it is now, and committed in the same step below: no other
@@ -552,7 +581,10 @@ class Coordinator:
             await send({**base, "ok": False, "reason": type(e).__name__})
             return
         ms = _ms(t0)
+        local = kills_left == 0
         self.stats[kind]["ok"] += 1
+        if local:
+            self.stats[kind]["local"] += 1
         if late:
             self.stats[kind]["late"] += 1
         old_seq = self.receipt_seq.get(key)
@@ -560,14 +592,16 @@ class Coordinator:
             self.stats[kind]["replaced"] += 1    # paid for an answer the game never used
             self.receipt.update(old_seq, "replaced")
         self.receipt_seq[key] = self.answer_seq[(key, rid)] = self._record(
-            kind, "ok", ms=ms, llm=call, raw=raw, decision=decision, **({"late": True} if late else {}), **rec)
+            kind, "ok", ms=ms, llm=call, raw=raw, decision=decision, **({"late": True} if late else {}),
+            **({"local": "kill drops spent"} if local else {}), **rec)
         self.last_req[key] = {"state": state, "ctx": asked_ctx, "events": digest["recent_events"],
                               "campaign": campaign}
         tok = ""
         if usage:
             self.usage.update({**usage, "calls": 1})
             tok = f'  [{usage["in"]}/{usage["cached"]}c/{usage["out"]} tok]'
-        log.info("%-11s %-14s %5dms%s%s  %s%s", kind, key, ms, " LATE" if late else "", tok, decision.get("intent", ""),
+        log.info("%-11s %-14s %5dms%s%s  %s%s", kind, key, ms, " LATE" if late else (" LOCAL" if local else ""), tok,
+                 decision.get("intent", ""),
                  f'  "{decision["taunt"]}"' if decision.get("taunt") else "")
         if sum(c["ok"] for c in self.stats.values()) % 25 == 0:
             self.summary()

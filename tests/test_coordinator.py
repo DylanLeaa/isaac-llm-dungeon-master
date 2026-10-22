@@ -823,3 +823,91 @@ def test_a_kept_deck_too_short_for_the_ask_is_re_asked():
     assert len(dm.seen) == 2 and coord.stats["drops"]["reused"] == 0
     assert [o["reward"] for o in last["decision"]["outcomes"]] == ["penny", "penny"], last
     assert "drawn_base" not in last
+
+
+def test_drops_are_written_without_the_dm_once_the_floor_kill_drops_are_spent(tmp_path):
+    # 10 normal rooms x 0.5 x (1.5 - 0.48) = 5 kill drops this floor, all given: every entry would be clamped
+    # to nothing, so no call is made.
+    from receipt import Receipt
+    dm = ScriptedDM([])                          # any call would fail: nothing scripted
+    coord = Coordinator(dm, cruelty=6, receipt=Receipt(tmp_path))
+    coord.receipt.start_run("R", fresh=True)
+    coord.memory.counters["drops_floor"] = 5
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle(econ_req(1, "drops:1", "drops", {"wanted": 3}), send)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    res = [m for m in sent if m.get("t") == "res"][-1]
+    assert res["ok"] and [o["reward"] for o in res["decision"]["outcomes"]] == ["nothing"] * 3
+    assert dm.seen == [] and coord.stats["drops"]["local"] == 1 and coord.usage["calls"] == 0
+    assert coord.receipt.usage["calls"] == 0, "not on the LLM bill"
+
+
+def test_drops_ctx_shows_the_kill_drops_left_and_floor_plan_the_curses_allowed():
+    dm = ScriptedDM([{"intent": "kills", "outcomes": [{"reward": "nothing"}], "taunt": ""},
+                     {"intent": "dark", "add_curses": ["darkness"], "treasure_distance": "far", "taunt": ""}])
+    coord = Coordinator(dm, cruelty=1)
+    coord.memory.counters["drops_floor"] = 2
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle(econ_req(1, "drops:1", "drops", {"wanted": 1}), send)
+        await asyncio.sleep(0.05)
+        await coord.handle(econ_req(2, "curses:1", "floor_plan"), send)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    # 10 rooms x 0.5 x 1.42 = 7 at cruelty 1, 2 given
+    econ = dm.seen[0][0]["economy"]
+    assert econ["kill_drops"] == {"cap": 7, "left": 5} and "kill drops: 5 left this floor" in econ["verdict"]
+    assert dm.seen[1][0]["allowed_curses"] == 0
+    plan = [m for m in sent if m.get("t") == "res"][-1]["decision"]
+    assert plan["add_curses"] == [] and "darkness -> none (no curses below cruelty 3)" in plan["guardrails"]
+
+
+def test_the_run_ending_cancels_decisions_still_being_made(tmp_path):
+    from receipt import Receipt
+
+    class SlowDM(ScriptedDM):
+        async def decide(self, kind, state, ctx, memory):
+            await asyncio.sleep(5)
+            return await super().decide(kind, state, ctx, memory)
+
+    dm = SlowDM([{"intent": "late", "rewards": [], "taunt": ""}])
+    coord = Coordinator(dm, cruelty=6, receipt=Receipt(tmp_path), epitaph=False)
+    coord.receipt.start_run("R", fresh=True)
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def go():
+        await coord.handle(econ_req(1, "clear:1:56", "room_clear"), send)
+        await asyncio.sleep(0.05)
+        await coord.handle({"t": "event", "name": "death", "data": {}}, send)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    assert not coord.inflight and not [m for m in sent if m.get("t") == "res"]
+    assert "superseded" in coord.receipt.status.values() and "ok" not in coord.receipt.status.values()
+
+
+def test_the_summary_counts_one_run():
+    dm = ScriptedDM([{"intent": "kills", "outcomes": [{"reward": "nothing"}], "taunt": ""}])
+    coord = Coordinator(dm, cruelty=6)
+    _run_coord(coord, [{"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True},
+                       econ_req(1, "drops:1", "drops", {"wanted": 1})])
+    assert coord.stats["drops"]["ok"] == 1 and coord.usage["calls"] == 1
+    _run_coord(coord, [{"t": "hello", "proto": PROTO, "session": "S", "run": "R1"}])   # a reconnect: same run
+    assert coord.stats["drops"]["ok"] == 1
+    _run_coord(coord, [{"t": "hello", "proto": PROTO, "session": "S", "run": "R2", "new_run": True}])
+    assert not coord.stats["drops"] and not coord.usage

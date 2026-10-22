@@ -1,6 +1,8 @@
 """System prompt for the trolling Dungeon Master."""
-from catalog import CARDS, CHAMPION_COLORS, CURSES, ENEMIES, LAYOUT_PICKUP_MODES, PILLS, REWARDS
+from catalog import (CARDS, CHAMPION_COLORS, CURSES, ENEMIES, LAYOUT_PICKUP_MODES, PILLS, REWARDS,
+                     VANILLA_PICKUPS_PER_CLEAR)
 from isaac_knowledge import ISAAC_KNOWLEDGE
+from schemas import extra_enemies_per_room, max_curses, traps_per_floor
 
 
 def _bullets(d: dict, fmt) -> str:
@@ -185,6 +187,22 @@ ENGINE GUARDRAILS (it enforces these; plan with them, not against them)
 - Every deck spends one floor budget per resource family (the ECONOMY you set, scaled from what
   vanilla would hand out on this floor's rooms). Past it, outcomes become "nothing"."""
 
+def _limits(cruelty: int) -> str:
+    """What this cruelty lets the DM do, so a plan isn't built on a trick the engine will cut."""
+    traps, curses, extras = traps_per_floor(cruelty), max_curses(cruelty), extra_enemies_per_room(cruelty)
+    kills = VANILLA_PICKUPS_PER_CLEAR * max(0.5, 1.5 - 0.08 * cruelty)
+    return f"""AT THIS CRUELTY (hard limits: the engine cuts anything past them)
+- Traps (troll bombs, sticky nickels, mimic and spiked chests): {f"at most {traps} per floor" if traps
+  else "none at all (they need cruelty 4+)"}.
+- Curses the DM adds: {f"at most {curses} per floor" if curses else "none (they need cruelty 3+)"}.
+- Extra enemies: {f"at most {extras} per room" if extras else "none"}.{"" if cruelty >= 3 else '''
+- Tinted rocks can't be hidden or left empty (both need cruelty 3+).'''}
+- Kill drops (kills and breakables together): {kills:.2f} x the floor's normal rooms, for the
+  whole floor. After that every kill drops nothing.
+- The DM decides what drops and what is offered, never prices or what the player already holds.
+  A gag that needs an exact coin, key or bomb count won't land."""
+
+
 _PHILOSOPHY = """The DM trolls the way a gleeful tabletop DM trolls their table: timing, misdirection,
 setups and callbacks. It is not trying to kill the player fast - a dead player can't be
 trolled. It wants them alive, close to the edge, and suspicious of every pedestal."""
@@ -200,6 +218,8 @@ pills are all decided by the DM. You write, once, the narrative this whole run f
 CRUELTY SETTING: {cruelty}/10. 0 = mischievous but generous, 10 = merciless (still fair).
 
 {_LEVERS}
+
+{_limits(cruelty)}
 
 {_ECONOMY}
 
@@ -237,6 +257,8 @@ fast executor follows for every decision on this floor.
 CRUELTY SETTING: {cruelty}/10. 0 = mischievous but generous, 10 = merciless (still fair).
 
 {_LEVERS}
+
+{_limits(cruelty)}
 
 {_ECONOMY}
 
