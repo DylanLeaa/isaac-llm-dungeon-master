@@ -380,3 +380,12 @@ A new decision kind also needs a tool schema + clamp branch (`schemas.py`, with 
 if it hands out resources), a mock answer (`dm_agent.py`) and its line in `prompts.py`. Good next ones,
 from the roll audit: shop stock, dropped pill colours, layout pickups at `MC_PRE_ROOM_ENTITY_SPAWN`,
 devil vs angel room (`Level:InitializeDevilAngelRoom`).
+
+## Disclaimer and license
+
+This is an unofficial fan mod. It is not affiliated with, endorsed by or sponsored by Edmund McMillen,
+Nicalis or Valhalla Games Studios. *The Binding of Isaac* and *The Binding of Isaac: Repentance* belong to
+their respective owners. The mod ships no game assets and requires a legitimate copy of the game.
+It is not affiliated with Anthropic either; it just calls the Claude API with your own key.
+
+Released under the [MIT License](LICENSE).
