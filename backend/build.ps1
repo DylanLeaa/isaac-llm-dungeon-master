@@ -3,7 +3,7 @@
 $ErrorActionPreference = "Stop"
 Push-Location $PSScriptRoot
 try {
-    python -m pip install --quiet -r requirements.txt pyinstaller
+    python -m pip install --quiet -r requirements.txt -r requirements-build.txt
     if (-not $?) { throw "pip install failed" }
     # --windowed: no console. --collect-data sv_ttk: the dark theme's Tcl files.
     # --add-data: the mod, which the app installs into the game (modinstall.py),
