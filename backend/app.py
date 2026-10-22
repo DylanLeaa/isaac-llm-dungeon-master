@@ -184,8 +184,8 @@ class RunView(ttk.Frame):
     in History as of the row picked in the receipt.
     """
 
-    COLUMNS = (("time", "Generated time", 105), ("applied_time", "Applied time", 95), ("what", "What", 90),
-               ("key", "Key", 105), ("status", "Status", 75), ("reason", "Asked because", 150),
+    COLUMNS = (("time", "Generated", 105), ("applied_time", "Applied", 95), ("what", "What", 90),
+               ("key", "Key", 105), ("status", "Status", 75), ("reason", "Why", 150),
                ("intent", "Intent", 230), ("result", "Result", 220), ("effect", "Effect", 240),
                ("ms", "ms", 55), ("cost", "Cost", 65))
     WIDE = ("intent", "result", "effect")
@@ -210,8 +210,8 @@ class RunView(ttk.Frame):
         cards = ttk.Frame(self)
         cards.pack(fill="x")
         self.cards = {k: Card(cards, c) for k, c in (
-            ("bill", "LLM bill"), ("tokens", "tokens in/cached/out"), ("applied", "decisions used"),
-            ("replaced", "paid for, not used"), ("fallback", "DM gave up"), ("problems", "timeouts / errors"))}
+            ("bill", "cost"), ("tokens", "tokens in/cached/out"), ("applied", "decisions used"),
+            ("replaced", "decisions made"), ("fallback", "DM gave up"), ("problems", "timeouts / errors"))}
         self.card_cols = 0
         cards.bind("<Configure>", lambda e: self._lay_cards(cards, 6 if e.width >= 860 else 3))
         self._lay_cards(cards, 6)
@@ -475,14 +475,12 @@ class RunView(ttk.Frame):
         summary = r.run_summary()
         title = (summary or {}).get("title") or epilogue.run_title(narrative)
         self.title.configure(text=f'"{title}"' if title else f"Run {r.run_id or '?'}")
-        bits = [f"seed {r.run_id}" if r.run_id else None,
-                (r.source or r.path).name if (r.source or r.path) else "receipt not saved"]
-        self.subtitle.configure(text="  |  ".join(b for b in bits if b))
+        self.subtitle.configure(text=str(r.run_id) if r.run_id else "")
         self.cards["bill"].set(f'${t["cost"]:.4f}')
         self.cards["tokens"].set(f'{_k(t["in"])} / {_k(t["cached"])} / {_k(t["out"])}')
         self.cards["applied"].set(str(t["applied"]))
-        self.cards["bill"].caption.configure(text=f'LLM bill, {t["calls"]} calls')
-        self.cards["replaced"].set(str(t["replaced"] + t["superseded"]))
+        self.cards["bill"].caption.configure(text=f'cost, {t["calls"]} calls')
+        self.cards["replaced"].set(str(t["applied"] + t["replaced"] + t["superseded"]))
         self.cards["fallback"].set(str(t["fallback"]))
         self.cards["problems"].set(f'{t["timeout"]} / {t["error"]}')
 
@@ -510,7 +508,7 @@ class RunView(ttk.Frame):
         words = []
         if summary:
             who = summary.get("character") or "The player"
-            words.append(f'{who}: {"died" if summary.get("outcome") == "death" else "won"}.')
+            words.append(f'{who} {"died" if summary.get("outcome") == "death" else "won"}.')
             if summary.get("epitaph"):
                 words.append(f'Epitaph: "{summary["epitaph"]}"')
             scheme, taunt = summary.get("scheme") or scheme, summary.get("taunt") or taunt
@@ -543,16 +541,14 @@ def _k(n: int) -> str:
 
 
 # ====================================================================== the model picker
-ROLE_NAMES = {"major": "Major", "minor": "Minor", "gate": "Re-ask gate"}
-PICKER_TITLES = {"major": "Major model: the run narrative and floor briefs",
-                 "minor": "Minor model: every decision the DM makes",
-                 "gate": "Re-ask gate model"}
+ROLE_NAMES = {"major": "Narrative", "minor": "DM", "gate": "Re-ask gate"}
+PICKER_TITLES = {"major": "Narrative model selector",
+                 "minor": "DM model selector",
+                 "gate": "Re-ask gate model selector"}
 PICKER_HINTS = {
     "major": "Called once per run and once per floor: it can afford to be slow and clever.",
-    "minor": "Only models that can be made to call a tool. Every decision is needed within seconds: models that "
-             "always reason are slower, and can run out of room (1024 tokens) before they answer.",
-    "gate": "OpenRouter's typed-decisions models: one yes/no answer, as a probability. They have no intelligence "
-            "score, so they're listed newest first.",
+    "minor": "Called often, needs to be quick.",
+    "gate": "Called to check if the DM should be asked again.",
 }
 PINNED = "#d6a8ff"
 
@@ -600,7 +596,7 @@ class ModelPicker(tk.Toplevel):
         box.bind("<<ComboboxSelected>>", lambda _e: self._fill())
         self.scored = tk.BooleanVar(value=False)
         if scored:
-            ttk.Checkbutton(bar, text="Only models with an intelligence score", variable=self.scored,
+            ttk.Checkbutton(bar, text="Only with intelligence score", variable=self.scored,
                             command=self._fill).pack(side="left", padx=(14, 0))
         self.whitelisted = tk.BooleanVar(value=probed)
         if probed:
@@ -699,7 +695,7 @@ class ModelPicker(tk.Toplevel):
         sel = self.tree.selection()
         m = self.by_value.get(sel[0]) if sel else None
         text = m.description if m else ""
-        self.about.configure(text=text[:600] + ("..." if len(text) > 600 else ""))
+        self.about.configure(text=text[:1800] + ("..." if len(text) > 1800 else ""))
 
     def _use(self) -> None:
         sel = self.tree.selection()
@@ -738,7 +734,7 @@ class App:
         self._header()
         self.tabs = ttk.Notebook(root)
         self.tabs.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        self.run_view = RunView(self.tabs, "No run yet. Start a run in Isaac with the mod enabled.",
+        self.run_view = RunView(self.tabs, "No run detected.",
                                 spoilers=bool(self.cfg.get("spoiler_mode")))
         self.tabs.add(self.run_view, text="  Current run  ")
         self._history_tab()
@@ -826,7 +822,7 @@ class App:
     def _tick(self) -> None:
         dm = self.dm
         if dm is None:
-            self._set_status("#ffb86b", "The DM isn't set up: add an OpenRouter or Google AI Studio key, or turn on Claude Code, in Settings")
+            self._set_status("#ffb86b", "The DM isn't set up: go to Settings")
             self.dm_label.configure(text="")
         elif not dm.alive():
             self._set_status("#ff6b5b", f"The DM stopped: {dm.error or 'unknown error'}")
@@ -837,7 +833,7 @@ class App:
             run = self.current.run_id
             self._set_status("#4cc96b", "Game connected" + (f"  |  run {run}" if run else ""))
         else:
-            self._set_status("#8a8a8a", "Waiting for the game: start Isaac with the mod enabled")
+            self._set_status("#8a8a8a", "Waiting for Isaac")
             if self.current.full or self.current.run_id:    # no game, no current run
                 self.current = Receipt(None, keep_full=True)
                 self.run_view.show(None)
@@ -921,7 +917,7 @@ class App:
         self.history.bind("<<TreeviewSelect>>", lambda _e: self._open_history())
         panes.add(left, weight=1)
 
-        self.history_view = RunView(panes, "Pick a run on the left.", spoilers=bool(self.cfg.get("spoiler_mode")),
+        self.history_view = RunView(panes, "Select a run.", spoilers=bool(self.cfg.get("spoiler_mode")),
                                     pin_decks=True)
         panes.add(self.history_view, weight=3)
         # The run view asks for more width than there is: without this the list gets squeezed.
@@ -992,12 +988,30 @@ class App:
         outer.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", wheel))
         outer.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
 
-        ttk.Label(tab, text="Who plays the Dungeon Master", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(tab, text="Changes apply to the running DM straight away: a run in progress carries on.",
-                  foreground=MUTED).pack(anchor="w", pady=(0, 14))
+        ttk.Label(tab, text="AI Settings", style="Header.TLabel").pack(anchor="w", pady=(0, 8))
 
-        box = ttk.LabelFrame(tab, text=" OpenRouter ", padding=(14, 10))
+        box = ttk.LabelFrame(tab, text=" Models ", padding=(14, 10))
         box.pack(fill="x")
+        ttk.Label(box, text="Set the models the DM will use. Narrative plans the story, DM implements it. "
+                            "A re-ask gate saves DM calls where possible.",
+                  foreground=MUTED, justify="left").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        self.model_lines: dict[str, ttk.Label] = {}
+        for i, role in enumerate(model_catalog.ROLES, start=1):
+            ttk.Label(box, text=ROLE_NAMES[role]).grid(row=i, column=0, sticky="w", pady=2)
+            self.model_lines[role] = ttk.Label(box, text="")
+            self.model_lines[role].grid(row=i, column=1, sticky="w", padx=12)
+            ttk.Button(box, text="Change...", command=lambda r=role: self.pick_model(r)).grid(row=i, column=2, pady=2)
+            ttk.Button(box, text="Default", command=lambda r=role: self._set_pick(r, "")).grid(
+                row=i, column=3, padx=(6, 0), pady=2)
+        box.columnconfigure(1, weight=1)
+        status = ttk.Frame(box)
+        status.grid(row=len(model_catalog.ROLES) + 1, column=0, columnspan=4, sticky="we", pady=(6, 0))
+        self.models_status = ttk.Label(status, text="", foreground=MUTED)
+        self.models_status.pack(side="left")
+        self.models_refresh = ttk.Button(status, text="Refresh list", command=self.refresh_models)
+        self.models_refresh.pack(side="left", padx=10)
+        box = ttk.LabelFrame(tab, text=" OpenRouter ", padding=(14, 10))
+        box.pack(fill="x", pady=(14, 0))
         ttk.Label(box, text="API key").grid(row=0, column=0, sticky="w")
         self.key_var = tk.StringVar(value=self.cfg.get("openrouter_api_key", ""))
         self.key_entry = ttk.Entry(box, textvariable=self.key_var, show="\u2022", width=70)
@@ -1034,37 +1048,13 @@ class App:
         box = ttk.LabelFrame(tab, text=" Claude Code ", padding=(14, 10))
         box.pack(fill="x", pady=(14, 0))
         self.cc_var = tk.BooleanVar(value=bool(self.cfg.get("use_claude_code")))
-        ttk.Checkbutton(box, text="Use Claude Code instead of OpenRouter", variable=self.cc_var,
+        ttk.Checkbutton(box, text="Enable Claude Code", variable=self.cc_var,
                         style="Switch.TCheckbutton", command=self._claude_status).pack(anchor="w")
-        ttk.Label(box, text="Adds Claude Code's models to the top of the Major and Minor pickers below (the "
-                            "default for both while it's on). They run through your own\nsigned-in Claude Code "
-                            "(claude -p), billed to your Claude plan, and are slower than OpenRouter. With both on "
-                            "Claude Code, the OpenRouter key\nis optional: if set, it only runs the re-ask gate.",
+        ttk.Label(box, text="Enables routing through your own signed-in Claude Code, billed to your Claude plan.",
                   foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
         self.cc_status = ttk.Label(box, text="")
         self.cc_status.pack(anchor="w", pady=(6, 0))
 
-        box = ttk.LabelFrame(tab, text=" Models ", padding=(14, 10))
-        box.pack(fill="x", pady=(14, 0))
-        ttk.Label(box, text="Major writes the run narrative and every floor brief: it can be slow and clever. Minor "
-                            "makes every decision in the game, within seconds,\nso it has to be fast. The re-ask gate "
-                            "skips asking the DM again when the answer wouldn't change.",
-                  foreground=MUTED, justify="left").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
-        self.model_lines: dict[str, ttk.Label] = {}
-        for i, role in enumerate(model_catalog.ROLES, start=1):
-            ttk.Label(box, text=ROLE_NAMES[role]).grid(row=i, column=0, sticky="w", pady=2)
-            self.model_lines[role] = ttk.Label(box, text="")
-            self.model_lines[role].grid(row=i, column=1, sticky="w", padx=12)
-            ttk.Button(box, text="Change...", command=lambda r=role: self.pick_model(r)).grid(row=i, column=2, pady=2)
-            ttk.Button(box, text="Default", command=lambda r=role: self._set_pick(r, "")).grid(
-                row=i, column=3, padx=(6, 0), pady=2)
-        box.columnconfigure(1, weight=1)
-        status = ttk.Frame(box)
-        status.grid(row=len(model_catalog.ROLES) + 1, column=0, columnspan=4, sticky="we", pady=(6, 0))
-        self.models_status = ttk.Label(status, text="", foreground=MUTED)
-        self.models_status.pack(side="left")
-        self.models_refresh = ttk.Button(status, text="Refresh list", command=self.refresh_models)
-        self.models_refresh.pack(side="left", padx=10)
         self._claude_status()
 
         row = ttk.Frame(tab)
@@ -1073,7 +1063,7 @@ class App:
         self.settings_msg = ttk.Label(row, text="", wraplength=800)
         self.settings_msg.pack(side="left", padx=12)
 
-        box = ttk.LabelFrame(tab, text=" Display ", padding=(14, 10))
+        box = ttk.LabelFrame(tab, text=" Display Settings ", padding=(14, 10))
         box.pack(fill="x", pady=(20, 0))
         self.spoiler_var = tk.BooleanVar(value=bool(self.cfg.get("spoiler_mode")))
         ttk.Checkbutton(box, text="Spoiler mode", variable=self.spoiler_var, style="Switch.TCheckbutton",
@@ -1082,7 +1072,7 @@ class App:
                             "Off: they show only what the game has used, as it's used. Applies straight away.",
                   foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
 
-        ttk.Label(tab, text="Files", style="Header.TLabel").pack(anchor="w", pady=(26, 6))
+        ttk.Label(tab, text="File Settings", style="Header.TLabel").pack(anchor="w", pady=(26, 6))
         files = ttk.Frame(tab)
         files.pack(fill="x")
         log_file = next((p for p in self.logs if p.exists()), self.logs[0] if self.logs else None)
@@ -1133,7 +1123,7 @@ class App:
             text += f": showing the one from {when}." if when else "."
             colour = BAD
         else:
-            text, colour = (f"{n} models from OpenRouter" + (f", {g} from Google AI Studio" if g else "")
+            text, colour = (f"{n} models found" + (f", {g} from Google AI Studio" if g else "")
                             + f", fetched {when}." if when else "No model list yet."), MUTED
             if google_error:
                 text, colour = f"{text}  Google AI Studio's list failed ({google_error}).", BAD
