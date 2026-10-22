@@ -11,11 +11,14 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from collections import Counter
 from typing import Callable
 
-from dm_agent import OPENROUTER_URL, LLMCallError, call_record
+from dm_agent import OPENROUTER_URL, LLMCallError, api_headers, call_record, completion_json
+from google_ai import GOOGLE_URL
+from http_retry import error_fields, error_line, post_retrying, raise_for_status
 from prompts import floor_prompt, narrative_prompt
 from receipt import plan_excerpt
 
@@ -26,6 +29,8 @@ FLOOR_DEFAULT_MODEL = "anthropic/claude-sonnet-5.5"
 
 NARRATIVE_WAIT_S = 25.0     # a floor brief waits this long for the run narrative, then goes without
 BRIEF_WAIT_S = 45.0         # a decision (or the loading screen) waits this long for its floor's brief
+PLANNER_RETRIES = 2         # a plan nobody re-asks for: a 5xx is sent again twice, after 1-2s then 2-4s
+PLANNER_429_WAIT_S = 20.0   # and a rate limit asking for no more than this is waited out
 
 
 def _compact_json(obj) -> str:
@@ -49,6 +54,24 @@ def loadout(state: dict) -> str:
             f"active item: {p.get('active_item') or 'none'}; pocket active: {p.get('pocket_active') or 'none'}; "
             f"trinkets: {p.get('trinkets') or 'none'}; pocket: {p.get('pocket') or 'none'}; "
             f"items: {', '.join(items) or 'none'}{progress}")
+
+
+ECONOMY_RE = re.compile(r"^\s*ECONOMY\s*:(.*?)(?=^\s*[A-Z][A-Z &]+:|\Z)", re.M | re.S)
+FAMILY_RE = re.compile(r"\b(keys?|bombs?|coins?|hearts?|cards?|pills?|trinkets?|luck|power)\s*[=:-]\s*"
+                       r"(starve|lean|vanilla|generous|flood)\b", re.I)
+
+
+def parse_economy(brief: str | None) -> dict[str, str]:
+    """The brief's ECONOMY block as {family: starve | lean | vanilla | generous | flood}. Families it leaves
+    out (or a brief without the block) stay vanilla."""
+    m = ECONOMY_RE.search(brief or "")
+    if not m:
+        return {}
+    out = {}
+    for fam, word in FAMILY_RE.findall(m.group(1)):
+        fam = fam.lower()
+        out[fam if fam in ("luck", "power") or fam.endswith("s") else fam + "s"] = word.lower()
+    return out
 
 
 def floor_signature(state: dict) -> tuple | None:
@@ -75,29 +98,26 @@ class OpenRouterPlanner:
 
     # Thinking can't be turned off on these models and counts toward max_tokens: leave room.
     def __init__(self, narrative_model: str = NARRATIVE_DEFAULT_MODEL, floor_model: str = FLOOR_DEFAULT_MODEL,
-                 max_tokens: int = 6000, api_key: str | None = None) -> None:
+                 max_tokens: int = 6000, api_key: str | None = None, google: bool = False) -> None:
         import httpx
-        self.client = httpx.AsyncClient(timeout=120.0, headers={
-            "Authorization": f"Bearer {api_key or os.environ['OPENROUTER_API_KEY']}",
-            "X-Title": "LLM Dungeon Master",
-        })
+        self.google = google
+        self.client = httpx.AsyncClient(timeout=120.0, headers=api_headers(api_key, google))
         self.narrative_model = narrative_model
         self.floor_model = floor_model
         self.max_tokens = max_tokens
 
     async def _complete(self, model: str, system: str, user: str) -> tuple[str, dict]:
         """The plan text, and usage with the receipt's call record under "_call"."""
-        resp = await self.client.post(OPENROUTER_URL, json={
-            "model": model,
-            "max_tokens": self.max_tokens,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "usage": {"include": True},
-        })
-        resp.raise_for_status()
-        data = resp.json()
+        body = {"model": model, "max_tokens": self.max_tokens,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        resp = await post_retrying(lambda: self.client.post(
+            GOOGLE_URL if self.google else OPENROUTER_URL, json=body if self.google else {**body, "usage": {"include": True}}),
+            what=model, retries=PLANNER_RETRIES, base=2.0, wait_429_up_to=PLANNER_429_WAIT_S)
+        raise_for_status(resp)
+        data = completion_json(resp, model, self.google)
         record = {**call_record(model, [system], data), "user": user}
         if "error" in data:
-            raise LLMCallError(f"openrouter: {data['error']}", record)
+            raise LLMCallError(f"{'google' if self.google else 'openrouter'}: {data['error']}", record)
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
             raise LLMCallError(f"hit max_tokens={self.max_tokens} before finishing the plan", record)
@@ -139,7 +159,9 @@ class MockPlanner:
     async def floor_brief(self, state, narrative, digest, prev_brief, cruelty) -> tuple[str, dict]:
         await asyncio.sleep(self.rng.uniform(*self.latency))
         name = (state.get("level") or {}).get("name", "this floor")
-        return (f"ARC BEAT: {name} lulls them.\nRESOURCES: starve keys\nROOMS: light\n"
+        return (f"ARC BEAT: {name} lulls them.\nRESOURCES: starve keys\n"
+                "ECONOMY: keys=starve bombs=vanilla coins=generous hearts=lean cards=vanilla pills=vanilla "
+                "trinkets=vanilla luck=lean power=vanilla\nROOMS: light\n"
                 "ITEMS & CONSUMABLES: one good item\nSET-PIECE: key drought, then key by a troll bomb\n"
                 "VOICE: smug"), {"_call": {"model": "mock"}}
 
@@ -148,9 +170,11 @@ class Campaign:
     """Starts the planners at the right moments and pushes their text to the DM."""
 
     def __init__(self, planner, push: Callable[[str], None], stats: dict[str, Counter], usage: Counter,
-                 record: Callable[..., None] = lambda what, status, **fields: None) -> None:
+                 record: Callable[..., None] = lambda what, status, **fields: None,
+                 on_brief: Callable[[tuple, str], None] = lambda sig, text: None) -> None:
         self.planner, self.push, self.stats, self.usage = planner, push, stats, usage
         self.record = record                          # receipt.add-like: (what, status, **fields)
+        self.on_brief = on_brief                      # (floor signature, brief text): the economy's targets
         self.run_token = 0
         self.tasks: set[asyncio.Task] = set()
         self._clear()
@@ -184,6 +208,7 @@ class Campaign:
             sig, self.floor_name, self.brief = brief
             self.floor_sig = tuple(sig)
             self.stats["floor_brief"]["reused"] += 1
+            self.on_brief(self.floor_sig, self.brief)
         if narrative or brief:
             log.info("continued run: reusing its %s", " and ".join(
                 what for what, have in (("narrative", narrative), (f"brief for {self.floor_name}", brief)) if have))
@@ -260,8 +285,7 @@ class Campaign:
 
     def _failed(self, kind: str, e: Exception, t0: float, **fields) -> None:
         self.stats[kind]["error"] += 1
-        self.record(kind, "error", ms=_ms(t0), error=f"{type(e).__name__}: {e}",
-                    llm=getattr(e, "call", None), **fields)
+        self.record(kind, "error", ms=_ms(t0), **error_fields(e), llm=getattr(e, "call", None), **fields)
 
     async def _write_narrative(self, state: dict, cruelty: int, token: int) -> None:
         self.stats["narrative"]["req"] += 1
@@ -272,7 +296,7 @@ class Campaign:
             raise
         except Exception as e:                        # noqa: BLE001 - a planner must never break the DM
             self._failed("narrative", e, t0)
-            log.warning("narrative   failed (%s: %s) -> the DM runs without one", type(e).__name__, e)
+            log.warning("narrative   failed (%s: %s) -> the DM runs without one", type(e).__name__, error_line(e))
             return
         if token != self.run_token:
             return
@@ -302,7 +326,7 @@ class Campaign:
             raise
         except Exception as e:                        # noqa: BLE001
             self._failed("floor_brief", e, t0, key=floor)
-            log.warning("floor_brief failed (%s: %s) -> the DM improvises this floor", type(e).__name__, e)
+            log.warning("floor_brief failed (%s: %s) -> the DM improvises this floor", type(e).__name__, error_line(e))
             return
         if token != self.run_token:
             return                                    # the run moved on meanwhile
@@ -315,6 +339,7 @@ class Campaign:
                     floor=list(sig), floor_name=self.floor_name)   # what a continue restores it by
         self._account("floor_brief", usage)
         self.brief = text
+        self.on_brief(sig, text)
         log.info("floor_brief %s [%s]\n%s", self.floor_name, self.planner.floor_model, _indent(text))
         self._push()
 

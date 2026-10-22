@@ -6,7 +6,11 @@ Stored per run as JSON lines in receipts/<started>_run-<seed>.jsonl:
   {"type": "update", "ref": n, "status": ...}        what later happened to it (applied / replaced)
   {"type": "effect", "ref": n, "effect": [...]}      what it actually did in the game, as the mod saw it
                                                      ("+1 bomb dropped"); a decision used gradually
-                                                     (item rankings, consumables) adds one per use
+                                                     (a deck: rankings, cards, drops) adds one per use
+  {"type": "drawn", "ref": n, "key": k, "outcome": ...}   one outcome the game drew from a deck, as data
+                                                     (what the after-death tallies count)
+Entries with what "rolls" carry the mod's roll audit: per hook, cause and owner, how many of the
+game's rolls a stream controlled and how many none did.
 A continued run picks up its latest file again. The app shows it (Current run and History).
 """
 from __future__ import annotations
@@ -47,9 +51,12 @@ class Receipt:
         self.status: dict[int, str] = {}                      # every entry's current status
         self.decisions: dict[int, tuple[str, dict]] = {}      # seq -> (kind, clamped decision)
         self.effects: dict[int, list[str]] = {}               # seq -> what it did in the game
+        self.drawn: list[tuple[str, dict]] = []               # (kind, outcome) of every draw, in order
+        self.coverage = Counter()                             # (hook, cause, owner) -> rolls (the mod's audit)
         self.usage = Counter()
         self.prompts: set[str] = set()                        # system prompt hashes already in the file
         self.full: dict[int, dict] = {}                       # seq -> the whole entry (keep_full)
+        self.draws: list[dict] = []                           # every drawn record, in order (keep_full)
         self.prompt_text: dict[str, str] = {}                 # hash -> system prompt (keep_full)
         self.saved_narrative: str | None = None                # the run's latest plans, for a continue
         self.saved_brief: tuple[tuple, str, str] | None = None # (floor signature, floor name, text)
@@ -91,6 +98,8 @@ class Receipt:
                 self._apply_update(rec.get("ref"), rec.get("status"), rec.get("ts"))
             elif rec.get("type") == "effect":
                 self._apply_effect(rec.get("ref"), rec.get("effect"))
+            elif rec.get("type") == "drawn":
+                self._apply_drawn(rec)
         if self.seq and self.source is None:
             log.info("receipt: resumed %s (%d entries)", path.name, self.seq)
 
@@ -116,6 +125,24 @@ class Receipt:
         self._apply_update(seq, status, ts)
         self._tell("update", {"seq": seq, "status": status, "ts": ts})
         return True
+
+    def add_drawn(self, seq: int | None, key: str, kind: str, outcome: Any, cause: Any = None) -> None:
+        """One outcome the game drew from deck `key` (answer `seq`, if known): what the tallies count."""
+        rec = {"type": "drawn", "ref": seq, "key": key, "kind": kind, "outcome": outcome,
+               **({"cause": cause} if cause else {}), "ts": round(time.time(), 3)}
+        self._write(rec)
+        self._apply_drawn(rec)
+        self._tell("drawn", rec)
+
+    def _apply_drawn(self, rec: dict) -> None:
+        if self.keep_full and rec.get("key"):
+            self.draws.append(rec)                # the app's Deck view
+        if isinstance(rec.get("outcome"), dict):
+            self.drawn.append((str(rec.get("kind")), rec["outcome"]))
+
+    def apply_drawn(self, rec: dict) -> None:
+        """A draw recorded elsewhere (the running DM's receipt)."""
+        self._apply_drawn(rec)
 
     def add_effect(self, seq: int | None, lines: Any) -> bool:
         """What entry `seq` actually did in the game (added to what it did before). False if not recorded."""
@@ -168,6 +195,10 @@ class Receipt:
             self.decisions[seq] = (entry["what"], entry["decision"])
         if entry["status"] == "written" and isinstance(entry.get("text"), str):
             self._keep_plan(entry)
+        if entry["what"] == "rolls" and isinstance(entry.get("rolls"), list):
+            for row in entry["rolls"]:
+                if isinstance(row, list) and len(row) == 4:
+                    self.coverage[tuple(map(str, row[:3]))] += int(row[3] or 0)
         llm = entry.get("llm")
         if llm:
             self.usage["calls"] += 1
@@ -351,13 +382,17 @@ def summarize(kind: str, d: dict, ctx: dict) -> str:
         curses = ",".join(d.get("add_curses", [])) or "none"
         out = f'curses {curses}; treasure {d.get("treasure_distance", "any")}'
         return out + ("; strip vanilla curses" if d.get("strip_vanilla_curses") else "")
-    if kind == "consumables":
-        parts = ["cards " + (",".join(c["key"] for c in d.get("cards", [])) or "-")]
-        if d.get("trinkets"):
-            parts.append(f'{len(d["trinkets"])} trinket(s)')
-        if d.get("pills"):
-            parts.append("pills " + ",".join(f'{p["color"]}={p["effect"]}' for p in d["pills"]))
-        return "; ".join(parts)
+    if kind == "cards":
+        return "cards " + (",".join(c["key"] for c in d.get("cards", [])) or "-")
+    if kind == "trinkets":
+        names = {int(c["id"]): c.get("name", str(c["id"])) for c in ctx.get("trinket_candidates", []) if "id" in c}
+        return "trinkets " + (",".join(str(names.get(i, i)) for i in d.get("trinkets", [])) or "-")
+    if kind == "pills":
+        return "pills " + (",".join(f'{p["color"]}={p["effect"]}' for p in d.get("pills", [])) or "-")
+    if kind == "drops":
+        outs = d.get("outcomes", [])
+        given = [f'{r["count"]}x {r["reward"]}' for r in outs if r.get("reward") != "nothing"]
+        return f"{len(outs)} kills: " + (", ".join(given) or "nothing")
     return ""
 
 

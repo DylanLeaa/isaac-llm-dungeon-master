@@ -11,6 +11,7 @@ import json
 import logging
 from typing import Any
 
+from http_retry import raise_for_status
 from isaac_knowledge import GATE_KNOWLEDGE
 
 
@@ -101,7 +102,7 @@ class OpenRouterGate:
                             "earlier_answer": previous, "changes_since": changes}, separators=(",", ":"))
         resp = await self.client.post(GATE_URL, json={
             "model": self.model, "state": state, "questions": {"needs_new_answer": GATE_QUESTION}})
-        resp.raise_for_status()
+        raise_for_status(resp)
         data = resp.json()
         p = float(data["answers"]["needs_new_answer"]["noul"])
         u = data.get("usage") or {}

@@ -20,6 +20,11 @@ def build_user_message(kind: str, state: dict, ctx: dict, memory: dict) -> str:
     }, separators=(",", ":"))
 
 
+from google_ai import GOOGLE_URL, tidy, strip_cache_control
+from http_retry import Cooldown, post_retrying, raise_for_status
+
+DM_RETRIES = 1                  # a 5xx is sent again once: a decision has seconds, not minutes
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_DEFAULT_MODEL = "anthropic/claude-haiku-5.5"      # OpenRouter slugs use dots
 
@@ -29,6 +34,18 @@ OPENROUTER_DEFAULT_MODEL = "anthropic/claude-haiku-5.5"      # OpenRouter slugs 
 _OPENAI_TOOLS = [{"type": "function", "function": {
     "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
     for t in TOOLS.values()]
+
+
+def api_headers(api_key: str | None, google: bool = False) -> dict:
+    if google:
+        return {"Authorization": f"Bearer {api_key}"}
+    return {"Authorization": f"Bearer {api_key or os.environ['OPENROUTER_API_KEY']}", "X-Title": "LLM Dungeon Master"}
+
+
+def completion_json(resp, model: str, google: bool = False) -> dict:
+    """The response body; Google's gets its cost worked out from the price list."""
+    data = resp.json()
+    return tidy(data, model) if google and isinstance(data, dict) else data
 
 
 def _usage(data: dict) -> dict:
@@ -57,17 +74,17 @@ class LLMCallError(RuntimeError):
 class OpenRouterDM:
     """Same Haiku DM, called through OpenRouter's OpenAI-compatible chat endpoint."""
 
-    # Output includes Haiku's reasoning, not just the tool JSON: real calls run ~140-390 tokens,
-    # so leave plenty of headroom. A cut-off answer is a lost decision.
-    def __init__(self, cruelty: int, model: str = OPENROUTER_DEFAULT_MODEL, max_tokens: int = 1024,
-                 api_key: str | None = None) -> None:
+    # Deck answers ran up to ~1900 tokens in a real run: leave headroom. A cut-off answer is a lost decision.
+    def __init__(self, cruelty: int, model: str = OPENROUTER_DEFAULT_MODEL, max_tokens: int = 2048,
+                 api_key: str | None = None, google: bool = False) -> None:
         import httpx                                    # imported lazily so --mock needs no HTTP client
-        self.client = httpx.AsyncClient(timeout=30.0, headers={
-            "Authorization": f"Bearer {api_key or os.environ['OPENROUTER_API_KEY']}",
-            "X-Title": "LLM Dungeon Master",
-        })
+        self.google = google                            # Google AI Studio's endpoint instead of OpenRouter's
+        self.client = httpx.AsyncClient(timeout=30.0, headers=api_headers(api_key, google))
         self.model = model
+        self.effort: str | None = "none"               # Google's thinking switch: raised if the model insists, dropped if it has none
         self.max_tokens = max_tokens
+        self.reasoning: dict = {"enabled": False}       # no thinking tokens: they eat max_tokens and add latency
+        self.cooldown = Cooldown(model)                 # this model's rate-limit window (429s)
         self.campaign = ""
         self.set_cruelty(cruelty)
 
@@ -88,9 +105,47 @@ class OpenRouterDM:
             content.append({"type": "text", "text": self.campaign, "cache_control": {"type": "ephemeral"}})
         self.system = {"role": "system", "content": content}
 
+    async def _post(self, body: dict):
+        """POST with thinking off. A model that can't run without it (400 "Reasoning is mandatory")
+        is retried, and from then on called, at low effort. A 5xx is sent again after a short backoff;
+        a 429 starts this model's cooldown, and nothing is sent until it is over (CoolingDown)."""
+        self.cooldown.check()
+        resp = await self._post_once(body)
+        if resp.status_code == 429:
+            self.cooldown.hit(resp)
+        elif resp.status_code < 400:
+            self.cooldown.ok()
+        return resp
+
+    async def _post_once(self, body: dict):
+        if self.google:
+            body = {**{k: v for k, v in body.items() if k != "usage"}, "messages": strip_cache_control(body["messages"])}
+            resp = await self._post_google(body)
+            if resp.status_code == 400 and self.effort == "none":    # e.g. Gemini Pro can't run without thinking
+                self.effort = "low"
+                resp = await self._post_google(body)
+            if resp.status_code == 400 and "thinking level is not supported" in resp.text.lower() and self.effort:
+                self.effort = None                                   # e.g. Gemma: no thinking setting at all
+                resp = await self._post_google(body)
+            return resp
+        resp = await self._post_openrouter(body)
+        if resp.status_code == 400 and "reasoning is mandatory" in resp.text.lower() and "effort" not in self.reasoning:
+            self.reasoning = {"effort": "low"}
+            resp = await self._post_openrouter(body)
+        return resp
+
+    async def _post_google(self, body: dict):
+        return await post_retrying(lambda: self.client.post(
+            GOOGLE_URL, json={**body, **({"reasoning_effort": self.effort} if self.effort else {})}),
+            what=self.model, retries=DM_RETRIES, base=0.5)
+
+    async def _post_openrouter(self, body: dict):
+        return await post_retrying(lambda: self.client.post(OPENROUTER_URL, json={**body, "reasoning": self.reasoning}),
+                                   what=self.model, retries=DM_RETRIES, base=0.5)
+
     async def decide(self, kind: str, state: dict, ctx: dict, memory: dict) -> dict[str, Any]:
         tool = TOOLS[kind]
-        resp = await self.client.post(OPENROUTER_URL, json={
+        resp = await self._post({
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": [self.system,
@@ -99,11 +154,11 @@ class OpenRouterDM:
             "tool_choice": {"type": "function", "function": {"name": tool["name"]}},
             "usage": {"include": True},                 # token + cost accounting in the response
         })
-        resp.raise_for_status()
-        data = resp.json()
+        raise_for_status(resp)
+        data = completion_json(resp, self.model, self.google)
         record = call_record(self.model, [b["text"] for b in self.system["content"]], data)
         if "error" in data:
-            raise LLMCallError(f"openrouter: {data['error']}", record)
+            raise LLMCallError(f"{'google' if self.google else 'openrouter'}: {data['error']}", record)
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
             raise LLMCallError(f"hit max_tokens={self.max_tokens} before finishing the tool call", record)
@@ -120,7 +175,7 @@ class OpenRouterDM:
     async def epitaph(self, prompt: str) -> tuple[str, dict]:
         """Free text in the DM's voice (the after-death screen). Same tools and system prompt as a
         decision, with tool_choice none, so the cached persona and campaign still hit."""
-        resp = await self.client.post(OPENROUTER_URL, json={
+        resp = await self._post({
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": [self.system, {"role": "user", "content": prompt}],
@@ -128,11 +183,11 @@ class OpenRouterDM:
             "tool_choice": "none",
             "usage": {"include": True},
         })
-        resp.raise_for_status()
-        data = resp.json()
+        raise_for_status(resp)
+        data = completion_json(resp, self.model, self.google)
         record = call_record(self.model, [b["text"] for b in self.system["content"]], data)
         if "error" in data:
-            raise LLMCallError(f"openrouter: {data['error']}", record)
+            raise LLMCallError(f"{'google' if self.google else 'openrouter'}: {data['error']}", record)
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
             raise LLMCallError(f"hit max_tokens={self.max_tokens} before finishing the epitaph", record)
@@ -187,9 +242,10 @@ class MockDM:
                     "taunt": r.choice(["", "A penny for your thoughts.", "Earned it. Barely."])}
         if kind == "payout_plan":
             chest = ctx.get("source_class") == "chest"
+            inside = ["item", "half_heart"] if ctx.get("has_item_pool") else ["half_heart", "bomb"]
             return {"intent": "mock: a machine with moods",
                     "schedule": [{"reward": n, "count": 1} for n in
-                                 (["half_heart", "bomb"] if chest else ["key", "nothing", "penny"])],
+                                 (inside if chest else ["key", "nothing", "penny"])],
                     "taunt": "", "scheme": "mock scheme"}
         if kind == "item_choice":
             cands = sorted(ctx.get("candidates", []), key=lambda c: c.get("quality", 2))
@@ -199,11 +255,20 @@ class MockDM:
             return {"intent": "mock: dim the lights", "add_curses": ["darkness"],
                     "strip_vanilla_curses": False, "treasure_distance": r.choice(TREASURE_DISTANCE),
                     "taunt": "Watch your step."}
-        if kind == "consumables":
+        if kind == "cards":
             return {"intent": "mock: tower first, then whatever",
                     "cards": ["tower", "rune_hagalaz", *r.sample(list(CARDS), 2)],
-                    "trinkets": [c["id"] for c in ctx.get("trinket_candidates", [])][:2],
-                    "pills": [{"color": c["color"], "effect": r.choice(list(PILLS))}
-                              for c in ctx.get("pill_colors_to_assign", [])],
                     "taunt": "Pick a card. Any card."}
+        if kind == "trinkets":
+            return {"intent": "mock: the first candidates", "taunt": "Shiny.",
+                    "trinkets": [c["id"] for c in ctx.get("trinket_candidates", [])][:max(2, len(ctx.get("owed") or []))]}
+        if kind == "pills":
+            return {"intent": "mock: whatever", "taunt": "Swallow it.",
+                    "pills": [{"color": c["color"], "effect": r.choice(list(PILLS))}
+                              for c in ctx.get("pill_colors_to_assign", [])]}
+        if kind == "drops":
+            n = max(1, int(ctx.get("wanted") or 3))
+            outcomes = [{"reward": "nothing"} for _ in range(n)]
+            outcomes[min(1, n - 1)] = {"reward": r.choice(["penny", "half_heart", "key", "bomb"]), "count": 1}
+            return {"intent": "mock: one kill pays", "outcomes": outcomes, "taunt": ""}
         raise ValueError(kind)

@@ -6,25 +6,35 @@ Three roles, each with its own pick:
   gate    the re-ask gate (OpenRouter's typed-decisions models)
 
 A pick is stored in config.json as an OpenRouter id ("anthropic/claude-haiku-5.5"), as "claude-code:<model>"
-for Claude Code, or blank for the default. With Claude Code switched on, its models are pinned on top of the
+for Claude Code, as "google:<model>" for Google AI Studio (its Gemini models, below, run on the player's own key),
+or blank for the default. With Claude Code switched on, its models are pinned on top of the
 major and minor lists. The catalogue is cached next to the settings, so the pickers work offline.
+
+The minor list also carries model_whitelist.json (written by tests/probe_models.py): which models passed as the DM,
+what a turn cost and how long it took.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 import appdata
 from claude_code import CLAUDE_CODE_DM_MODEL, CLAUDE_CODE_PLANNER_MODEL
 from dm_agent import OPENROUTER_DEFAULT_MODEL
+from google_ai import GOOGLE_DEFAULT_MODEL, fetch_models as fetch_google, price_of
 from gate import GATE_DEFAULT_MODEL
 from planners import FLOOR_DEFAULT_MODEL
 
 MODELS_URL = "https://openrouter.ai/api/v1/models"
 CLAUDE_CODE = "claude-code:"                      # prefix of a Claude Code pick
+GOOGLE = "google:"                                # prefix of a Google AI Studio pick
+# What the picker's provider filter offers, by ModelInfo.backend.
+PROVIDERS = {"openrouter": "OpenRouter", "claude-code": "Claude Code", "google": "Google AI Studio"}
 ROLES = ("major", "minor", "gate")
 _FAMILIES = ("haiku", "sonnet", "opus", "fable")  # one Claude Code row each: the newest
 
@@ -44,19 +54,29 @@ class ModelInfo:
     tools: bool                   # forced tool calls work (the DM needs them)
     reasoning: str                # "always", "optional" or ""
     description: str = ""
-    backend: str = "openrouter"   # or "claude-code"
+    backend: str = "openrouter"   # or "claude-code" or "google"
+    whitelisted: bool | None = None   # passed the DM probe; None where the whitelist doesn't apply
+    turn_cost: float | None = None    # USD per DM decision, as probed
+    latency: float | None = None      # median seconds per DM decision, as probed
 
 
 # ------------------------------------------------------------------ fetching and the cache
-def fetch(timeout: float = 15.0) -> dict:
-    """The live catalogue: text models, and the decisions models the gate can use. No key needed."""
+def fetch(timeout: float = 15.0, google_key: str = "") -> dict:
+    """The live catalogue: OpenRouter's text models (no key needed) and the decisions models the gate can use, and,
+    with a Google key, Google's own list ("google"; if it fails, "google_error" says why and OpenRouter's still loads)."""
     import httpx
     with httpx.Client(timeout=timeout, headers={"X-Title": "LLM Dungeon Master"}) as client:
         text = client.get(MODELS_URL)
         text.raise_for_status()
         decisions = client.get(MODELS_URL, params={"output_modalities": "decisions"})
         decisions.raise_for_status()
-    return {"fetched": time.time(), "text": text.json()["data"], "decisions": decisions.json()["data"]}
+    raw = {"fetched": time.time(), "text": text.json()["data"], "decisions": decisions.json()["data"]}
+    if google_key:
+        try:
+            raw["google"] = fetch_google(google_key, timeout)
+        except Exception as e:                    # noqa: BLE001 - shown in Settings
+            raw["google_error"] = f"{type(e).__name__}: {e}"
+    return raw
 
 
 def cache_path():
@@ -77,6 +97,34 @@ def save_cache(raw: dict) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(raw), encoding="utf-8")
     os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------ the DM whitelist
+def whitelist_path() -> Path:
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "model_whitelist.json"
+
+
+def load_whitelist() -> dict:
+    """{model id: probe result as the DM}. Empty if the file is missing or broken."""
+    try:
+        raw = json.loads(whitelist_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    models = raw.get("models") if isinstance(raw, dict) else None
+    return {k: v["dm"] for k, v in (models or {}).items() if isinstance(v, dict) and isinstance(v.get("dm"), dict)}
+
+
+def with_whitelist(rows: list[ModelInfo], whitelist: dict) -> list[ModelInfo]:
+    """Copies of the rows with the probe's verdict: whitelisted only if it came back "ok". Turn cost is the
+    probe's spend over its calls, kept only for models that finished (a failed call is billed but not counted)."""
+    out = []
+    for m in rows:
+        dm = whitelist.get(m.id if m.backend == "openrouter" else m.value) or {}     # no data: not whitelisted
+        done = dm.get("status") in ("ok", "slow") and dm.get("calls")
+        out.append(replace(m, whitelisted=dm.get("status") == "ok",
+                           turn_cost=dm.get("cost", 0) / dm["calls"] if done else None,
+                           latency=dm.get("median_s") if done else None))
+    return out
 
 
 # ------------------------------------------------------------------ parsing
@@ -104,13 +152,25 @@ def _info(m: dict) -> ModelInfo:
         description=(m.get("description") or "").strip())
 
 
+def _google_info(m: dict) -> ModelInfo:
+    mid = m["name"].removeprefix("models/")
+    price = price_of(mid)
+    return ModelInfo(value=GOOGLE + mid, id=mid, name="Google: " + (m.get("displayName") or mid), author="google",
+                     intelligence=None, prompt=price[0] if price else None, completion=price[1] if price else None,
+                     cache_read=price[2] if price else None, context=int(m.get("inputTokenLimit") or 0), created=0,
+                     tools=True, reasoning="optional" if m.get("thinking") else "",
+                     description=(m.get("description") or "").strip(), backend="google")
+
+
 def parse(raw: dict | None) -> dict[str, list[ModelInfo]]:
-    """{"text": [...], "decisions": [...]}. Batch variants are dropped: they don't answer straight away."""
-    out: dict[str, list[ModelInfo]] = {"text": [], "decisions": []}
-    for kind in out:
+    """{"text": [...], "decisions": [...], "google": [...]}. Batch variants are dropped: they don't answer straight away."""
+    out: dict[str, list[ModelInfo]] = {"text": [], "decisions": [], "google": []}
+    for kind in ("text", "decisions"):
         for m in (raw or {}).get(kind) or []:
             if isinstance(m, dict) and m.get("id") and not m["id"].endswith(":batch"):
                 out[kind].append(_info(m))
+    out["google"] = [_google_info(m) for m in (raw or {}).get("google") or []
+                     if isinstance(m, dict) and str(m.get("name", "")).startswith("models/")]
     return out
 
 
@@ -142,24 +202,33 @@ def claude_code_rows(text: list[ModelInfo]) -> list[ModelInfo]:
     return sort_rows([_claude_code_row(to_claude_code_id(m.id), m) for m in newest.values()])
 
 
-def candidates(catalog: dict[str, list[ModelInfo]], role: str, claude_code_on: bool) -> tuple[list, list]:
-    """(pinned, rows) for one role's picker. Pinned are the Claude Code rows, shown on top."""
+def candidates(catalog: dict[str, list[ModelInfo]], role: str, claude_code_on: bool,
+               whitelist: dict | None = None) -> tuple[list, list]:
+    """(pinned, rows) for one role's picker. Pinned are the Claude Code rows, shown on top. The minor role's rows
+    carry the DM whitelist (loaded from model_whitelist.json unless given)."""
     if role == "gate":
         return [], list(catalog["decisions"])
-    rows = [m for m in catalog["text"] if m.tools] if role == "minor" else list(catalog["text"])
-    return (claude_code_rows(catalog["text"]) if claude_code_on else []), rows
+    wl = load_whitelist() if whitelist is None else whitelist
+    rows = [m for m in catalog["text"] + catalog.get("google", []) if role != "minor" or m.tools]
+    pinned = claude_code_rows(catalog["text"]) if claude_code_on else []
+    return with_whitelist(pinned, wl), with_whitelist(rows, wl)
 
 
 # ------------------------------------------------------------------ filtering and sorting
-def filter_rows(rows: list[ModelInfo], query: str = "", author: str = "", scored_only: bool = False) -> list:
+def filter_rows(rows: list[ModelInfo], query: str = "", author: str = "", scored_only: bool = False,
+                whitelist_only: bool = False, backend: str = "") -> list:
+
     q = query.strip().lower()
     return [m for m in rows
             if (not q or q in m.name.lower() or q in m.id.lower())
             and (not author or m.author == author)
-            and (not scored_only or m.intelligence is not None)]
+            and (not backend or m.backend == backend)
+            and (not scored_only or m.intelligence is not None)
+            and (not whitelist_only or m.whitelisted)]
 
 
-SORT_KEYS = ("intelligence", "name", "id", "prompt", "completion", "cache_read", "context", "reasoning", "created")
+SORT_KEYS = ("intelligence", "name", "id", "prompt", "completion", "cache_read", "context", "reasoning", "created",
+             "whitelisted", "turn_cost", "latency")
 
 
 def sort_rows(rows: list[ModelInfo], key: str = "intelligence", desc: bool = True) -> list[ModelInfo]:
@@ -187,7 +256,8 @@ def default_value(role: str, claude_code_on: bool) -> str:
 def effective_value(pick: str, role: str, claude_code_on: bool) -> str:
     """The pick, or the default when blank. A Claude Code pick only counts while Claude Code is on."""
     pick = (pick or "").strip()
-    if not pick or (pick.startswith(CLAUDE_CODE) and (not claude_code_on or role == "gate")):
+    if not pick or (pick.startswith(CLAUDE_CODE) and (not claude_code_on or role == "gate")) \
+            or (pick.startswith(GOOGLE) and role == "gate"):
         return default_value(role, claude_code_on)
     return pick
 
@@ -197,6 +267,8 @@ def resolve(cfg: dict, role: str) -> tuple[str, str]:
     value = effective_value(cfg.get(f"{role}_model", ""), role, bool(cfg.get("use_claude_code")))
     if value.startswith(CLAUDE_CODE):
         return "claude-code", value[len(CLAUDE_CODE):]
+    if value.startswith(GOOGLE):
+        return "google", value[len(GOOGLE):]
     return "openrouter", value
 
 
@@ -208,10 +280,19 @@ def price(v: float | None) -> str:
     return f"${v:.2f}" if v >= 0.1 else f"${v:.3f}"
 
 
+def turn_price(v: float | None) -> str:
+    """A fraction of a cent: $0.00050."""
+    if v is None:
+        return "-"
+    return "free" if v == 0 else f"${v:.5f}"
+
+
 def find(catalog: dict[str, list[ModelInfo]], value: str) -> ModelInfo | None:
     if value.startswith(CLAUDE_CODE):
         model = value[len(CLAUDE_CODE):]
         return next((m for m in claude_code_rows(catalog["text"]) if m.id == model), None) or _claude_code_row(model)
+    if value.startswith(GOOGLE):
+        return next((m for m in catalog.get("google", []) if m.id == value[len(GOOGLE):]), None)
     return next((m for kind in ("text", "decisions") for m in catalog[kind] if m.id == value), None)
 
 
@@ -225,6 +306,9 @@ def describe(catalog: dict[str, list[ModelInfo]], value: str) -> str:
         bits.append(f"intelligence {m.intelligence:g}")
     if m.backend == "claude-code":
         bits.append("billed to your Claude plan")
+    elif m.backend == "google":
+        bits.append("your Google AI Studio key" + (f", {price(m.prompt)} in / {price(m.completion)} out per M tokens"
+                                                    if m.prompt is not None else ""))
     elif m.completion:
         bits.append(f"{price(m.prompt)} in / {price(m.completion)} out per M tokens")
     else:

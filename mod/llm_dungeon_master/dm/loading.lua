@@ -352,6 +352,7 @@ end
 
 function Loading.init(config, bridge, state, taunt, sched)
   cfg, Bridge, State, Taunt, Sched = config, bridge, state, taunt, sched
+  if Bridge.keepPending then Bridge.keepPending(Loading.holding) end
 end
 
 return Loading

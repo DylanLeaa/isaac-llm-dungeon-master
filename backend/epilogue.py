@@ -61,17 +61,41 @@ def _net(gained: int, lost: int) -> str:
     return f"+{gained} -{lost}" if lost else str(gained)
 
 
+def _drawn_rewards(outcome: Any) -> list[dict]:
+    """A drawn outcome's rewards as [{reward, count}] (a clear's whole list, or one kill / machine use)."""
+    if not isinstance(outcome, dict):
+        return []
+    rows = [r for r in outcome.get("rewards") or [] if isinstance(r, dict)]
+    rows += [{"reward": r, "count": 1} for r in outcome.get("rewards") or [] if isinstance(r, str)]
+    if isinstance(outcome.get("reward"), str):
+        rows.append({"reward": outcome["reward"], "count": outcome.get("count") or 1})
+    return rows
+
+
+# Kinds whose pickups count from what was drawn, when the receipt has draws (PROTO 2): a deck may be
+# only partly used, and draws carry what mercy changed at the last moment.
+DRAWN_KINDS = ("room_clear", "drops", "payout_plan", "rock")
+
+
 def dm_side(applied: list[tuple[str, dict]], totals: dict, pills: Any,
-            effects: Any = None) -> tuple[list[list[str]], str | None, str | None]:
+            effects: Any = None, drawn: list[tuple[str, dict]] | None = None) -> tuple[list[list[str]], str | None, str | None]:
     """Rows for the DM's column, plus its latest scheme and taunt among the decisions the game used.
-    Pickups it gave count from its decisions; pickups it took away from what the game saw it do."""
+    Pickups it gave count from what the game drew from its decks (or, for a receipt without draws, from
+    its decisions); pickups it took away from what the game saw it do."""
     c, curses, scheme, taunt = Counter(), [], None, None
     lost = losses(effects)
+    for kind, outcome in drawn or []:
+        if kind in DRAWN_KINDS:
+            rewards = _drawn_rewards(outcome)
+            c.update(summarize_categories(rewards))
+            c["troll"] += sum(int(r.get("count") or 1) for r in rewards if r.get("reward") == "troll_bomb")
     for kind, d in applied:
         if kind == "room_layout":
             c["rooms"] += 1
             c["enemies"] += sum(int(e.get("count", 0)) for e in d.get("extra_enemies", []))
             c["troll"] += int(d.get("layout_pickups") == "troll_bombs") + d.get("bonus_pickups", []).count("troll_bomb")
+        elif drawn and kind in DRAWN_KINDS:
+            pass
         elif kind == "room_clear":
             rewards = d.get("rewards", [])
             c.update(summarize_categories(rewards))
@@ -100,7 +124,8 @@ def dm_side(applied: list[tuple[str, dict]], totals: dict, pills: Any,
 
 def build(outcome: str, game: dict, receipt, run_id: Any, narrative: str | None) -> dict:
     """The whole screen, as sent to the game (without the epitaph, which comes later)."""
-    rows, scheme, taunt = dm_side(receipt.applied(), receipt.totals(), game.get("pills"), receipt.effect_lines())
+    rows, scheme, taunt = dm_side(receipt.applied(), receipt.totals(), game.get("pills"), receipt.effect_lines(),
+                                  receipt.drawn or None)
     return {
         "run": game.get("run", run_id),
         "outcome": outcome,
