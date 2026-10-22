@@ -12,7 +12,7 @@ from pathlib import Path
 
 APP_NAME = "LLM Dungeon Master"
 # The model picks: blank = the default for the backend (model_catalog.resolve).
-DEFAULTS = {"openrouter_api_key": "", "use_claude_code": False, "spoiler_mode": False,
+DEFAULTS = {"openrouter_api_key": "", "google_api_key": "", "use_claude_code": False, "spoiler_mode": False,
             "major_model": "", "minor_model": "", "gate_model": ""}
 
 
@@ -52,5 +52,10 @@ def save_config(cfg: dict) -> None:
 
 
 def api_key(cfg: dict) -> str:
-    """The key from Settings, else the OPENROUTER_API_KEY environment variable."""
-    return (cfg.get("openrouter_api_key") or "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
+    """The OpenRouter key from Settings: nowhere else."""
+    return (cfg.get("openrouter_api_key") or "").strip()
+
+
+def google_key(cfg: dict) -> str:
+    """The Google AI Studio key from Settings: nowhere else."""
+    return (cfg.get("google_api_key") or "").strip()

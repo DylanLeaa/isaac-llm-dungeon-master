@@ -16,7 +16,8 @@ import time
 from collections import Counter
 from typing import Callable
 
-from dm_agent import OPENROUTER_URL, LLMCallError, call_record
+from dm_agent import OPENROUTER_URL, LLMCallError, api_headers, call_record, completion_json
+from google_ai import GOOGLE_URL
 from prompts import floor_prompt, narrative_prompt
 from receipt import plan_excerpt
 
@@ -94,29 +95,25 @@ class OpenRouterPlanner:
 
     # Thinking can't be turned off on these models and counts toward max_tokens: leave room.
     def __init__(self, narrative_model: str = NARRATIVE_DEFAULT_MODEL, floor_model: str = FLOOR_DEFAULT_MODEL,
-                 max_tokens: int = 6000, api_key: str | None = None) -> None:
+                 max_tokens: int = 6000, api_key: str | None = None, google: bool = False) -> None:
         import httpx
-        self.client = httpx.AsyncClient(timeout=120.0, headers={
-            "Authorization": f"Bearer {api_key or os.environ['OPENROUTER_API_KEY']}",
-            "X-Title": "LLM Dungeon Master",
-        })
+        self.google = google
+        self.client = httpx.AsyncClient(timeout=120.0, headers=api_headers(api_key, google))
         self.narrative_model = narrative_model
         self.floor_model = floor_model
         self.max_tokens = max_tokens
 
     async def _complete(self, model: str, system: str, user: str) -> tuple[str, dict]:
         """The plan text, and usage with the receipt's call record under "_call"."""
-        resp = await self.client.post(OPENROUTER_URL, json={
-            "model": model,
-            "max_tokens": self.max_tokens,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "usage": {"include": True},
-        })
+        body = {"model": model, "max_tokens": self.max_tokens,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        resp = await self.client.post(GOOGLE_URL if self.google else OPENROUTER_URL,
+                                      json=body if self.google else {**body, "usage": {"include": True}})
         resp.raise_for_status()
-        data = resp.json()
+        data = completion_json(resp, model, self.google)
         record = {**call_record(model, [system], data), "user": user}
         if "error" in data:
-            raise LLMCallError(f"openrouter: {data['error']}", record)
+            raise LLMCallError(f"{'google' if self.google else 'openrouter'}: {data['error']}", record)
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
             raise LLMCallError(f"hit max_tokens={self.max_tokens} before finishing the plan", record)
