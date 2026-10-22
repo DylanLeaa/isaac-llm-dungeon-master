@@ -69,6 +69,20 @@ def _usage(data: dict) -> dict:
             "cost": float(data.get("total_cost_usd") or 0.0)}     # list price; a subscription doesn't bill it
 
 
+def _soften(node: Any) -> Any:
+    """Copy of a schema with maxLength turned into a hint in the description. The CLI rejects an answer that
+    breaks the schema and re-asks, a whole extra turn (~17.5K tokens) for a note 8 chars too long, and
+    schemas.clamp() trims text anyway."""
+    if isinstance(node, list):
+        return [_soften(n) for n in node]
+    if not isinstance(node, dict):
+        return node
+    out = {k: _soften(v) for k, v in node.items() if k != "maxLength"}
+    if "maxLength" in node:
+        out["description"] = f"{node.get('description', '')} (Keep under {node['maxLength']} characters.)".strip()
+    return out
+
+
 class ClaudeCodeRunner:
     """Runs one headless Claude Code completion per call."""
 
@@ -106,7 +120,10 @@ class ClaudeCodeRunner:
             raise LLMCallError(f"claude exited {proc.returncode} without JSON: {tail}", record) from e
         record.update({"id": data.get("session_id"), "finish": data.get("stop_reason"),
                        "response": data.get("structured_output", data.get("result")),
-                       "usage": _usage(data), "error": data.get("result") if data.get("is_error") else None})
+                       "usage": _usage(data), "error": data.get("result") if data.get("is_error") else None,
+                       # >1 turn means the schema answer was rejected and retried (~17.5K tokens each).
+                       "num_turns": data.get("num_turns"),
+                       "validation_error": data.get("errors") or data.get("permission_denials") or None})
         if data.get("is_error") or data.get("subtype") != "success":
             raise LLMCallError(f"claude-code {data.get('subtype')}: {data.get('result')}", record)
         if schema is not None:
@@ -147,7 +164,7 @@ class ClaudeCodeDM:
         # The tool's description travels with the question, since --json-schema only carries the shape.
         user = (f"Answer as the `{tool['name']}` decision: {tool['description']}\n\n"
                 + build_user_message(kind, state, ctx, memory))
-        args, record = await self.runner.complete(self.model, self.system, user, tool["input_schema"])
+        args, record = await self.runner.complete(self.model, self.system, user, _soften(tool["input_schema"]))
         return {**args, "_usage": record["usage"], "_call": record}
 
     async def epitaph(self, prompt: str) -> tuple[str, dict]:
