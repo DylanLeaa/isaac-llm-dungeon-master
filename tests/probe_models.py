@@ -1,6 +1,8 @@
-"""Probe OpenRouter models as the DM and write backend/model_whitelist.json (needs a key: Settings or OPENROUTER_API_KEY).
+"""Probe OpenRouter and Google AI Studio models as the DM and write backend/model_whitelist.json.
+Needs an OpenRouter key (Settings or OPENROUTER_API_KEY); Google models are probed too when Settings has a Google key
+(they are whitelisted under "google:<model>", and only those with a known price in google_ai.PRICES, so the cap can hold).
 
-    python tests/probe_models.py [--max-price 0.50] [--budget 3.00] [--only SUBSTR] [--limit N] [--retest] [--dry-run]
+    python tests/probe_models.py [--max-price 0.50] [--budget 3.00] [--no-google] [--no-openrouter] [--only SUBSTR] [--limit N] [--retest] [--dry-run]
 
 Each candidate gets the eight decision calls of tests/live_smoke.py through the app's own OpenRouterDM (same system
 prompt, tools, token limit and reasoning fallback), then the same eight again if the first pass was clean. A model is
@@ -66,14 +68,25 @@ async def run_pass(dm: OpenRouterDM, mem: RunMemory, times: list[float]) -> tupl
         except Exception as e:                                       # noqa: BLE001 (any failure is a verdict)
             status = getattr(getattr(e, "response", None), "status_code", None)
             body = getattr(getattr(e, "response", None), "text", "") or ""
-            if status == 429:
+            if status in (429, 503) or type(e).__name__ == "CoolingDown":
                 return cost, "429"
             return cost, f"{kind}: {type(e).__name__} {status or ''} {body[:140]}".strip()
     return cost, ""
 
 
+def whitelist_key(m) -> str:
+    """How model_catalog.with_whitelist looks a model up: OpenRouter by id, the others by their stored value."""
+    return m.id if m.backend == "openrouter" else m.value
+
+
+def google_candidates(rows: list, max_price: float, only: str) -> list:
+    """Google's chat models whose (known) output price is within the cap."""
+    return [m for m in rows if m.completion is not None and 0 <= m.completion <= max_price
+            and (not only or only.lower() in m.id.lower())]
+
+
 async def probe(m, key: str) -> dict:
-    dm = OpenRouterDM(CRUELTY, model=m.id, api_key=key)
+    dm = OpenRouterDM(CRUELTY, model=m.id, api_key=key, google=m.backend == "google")
     times: list[float] = []
     cost = 0.0
     try:
@@ -84,7 +97,7 @@ async def probe(m, key: str) -> dict:
                 break
     finally:
         await dm.client.aclose()
-    res = {"cost": round(cost, 5), "calls": len(times), "effort": "low" if "effort" in dm.reasoning else "off",
+    res = {"cost": round(cost, 5), "calls": len(times), "effort": ("low" if dm.effort else "off") if dm.google else "low" if "effort" in dm.reasoning else "off",
            "price_out": m.completion}
     if why == "429":
         return {**res, "status": "limited", "reason": "rate limited"}
@@ -115,17 +128,23 @@ async def main(args) -> None:
     key = appdata.api_key(json.loads((appdata.data_dir() / "config.json").read_text(encoding="utf-8")))
     if not key and not args.dry_run:
         sys.exit("no OpenRouter key in Settings or OPENROUTER_API_KEY")
-    catalog = mc.parse(mc.fetch())
-    todo = candidates(catalog["text"], args.max_price, args.only)
+    cfg = json.loads((appdata.data_dir() / "config.json").read_text(encoding="utf-8"))
+    gkey = "" if args.no_google else appdata.google_key(cfg)
+    catalog = mc.parse(mc.fetch(google_key=gkey))
+    todo = ([] if args.no_openrouter else candidates(catalog["text"], args.max_price, args.only)) + google_candidates(
+        catalog["google"], args.max_price, args.only)
+    keys = {"openrouter": key, "google": gkey}
+    if not gkey:
+        print("no Google key in Settings: skipping Google models")
     data = load()
     done = data["models"]
-    todo = [m for m in todo if args.retest or done.get(m.id, {}).get("dm", {}).get("status") in (None, "limited")]
+    todo = [m for m in todo if args.retest or done.get(whitelist_key(m), {}).get("dm", {}).get("status") in (None, "limited")]
     if args.limit:
         todo = todo[:args.limit]
     print(f"{len(todo)} models to probe (completion <= ${args.max_price}/M, budget ${args.budget:.2f})")
     if args.dry_run:
         for m in todo:
-            print(f"  {m.id:55} ${m.completion}")
+            print(f"  {whitelist_key(m):55} ${m.completion}")
         return
     spent, sem, lock = 0.0, asyncio.Semaphore(args.parallel), asyncio.Lock()
 
@@ -134,12 +153,12 @@ async def main(args) -> None:
         async with sem:
             if spent >= args.budget:
                 return
-            res = await probe(m, key)
+            res = await probe(m, keys[m.backend])
             async with lock:
                 spent += res["cost"]
-                done.setdefault(m.id, {"name": m.name})["dm"] = {**res, "tested": date.today().isoformat()}
+                done.setdefault(whitelist_key(m), {"name": m.name})["dm"] = {**res, "tested": date.today().isoformat()}
                 save(data)
-                print(f"[{i + 1}/{len(todo)}] {m.id:55} {res['status']:8} "
+                print(f"[{i + 1}/{len(todo)}] {whitelist_key(m):55} {res['status']:8} "
                       f"{res.get('median_s', '-')!s:>5}s  ${res['cost']:.4f}  {res['reason']}", flush=True)
 
     await asyncio.gather(*(one(i, m) for i, m in enumerate(todo)))
@@ -157,6 +176,8 @@ if __name__ == "__main__":
     ap.add_argument("--only", default="", help="only model ids containing this text")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--parallel", type=int, default=4)
+    ap.add_argument("--no-google", action="store_true", help="skip Google AI Studio models")
+    ap.add_argument("--no-openrouter", action="store_true", help="only Google AI Studio models")
     ap.add_argument("--retest", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     asyncio.run(main(ap.parse_args()))

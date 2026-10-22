@@ -170,6 +170,48 @@
    },
    "name": "Google: Gemini 2.5 Flash Lite"
   },
+  "google/gemini-3.1-flash-lite": {
+   "dm": {
+    "calls": 16,
+    "cost": 0.01229,
+    "effort": "off",
+    "max_s": 5.8,
+    "median_s": 2.4,
+    "price_out": 1.5,
+    "reason": "",
+    "status": "ok",
+    "tested": "2026-10-22"
+   },
+   "name": "Google: Gemini 3.1 Flash Lite"
+  },
+  "google/gemini-3.1-flash-lite-preview": {
+   "dm": {
+    "calls": 16,
+    "cost": 0.01717,
+    "effort": "off",
+    "max_s": 5.4,
+    "median_s": 2.0,
+    "price_out": 1.5,
+    "reason": "",
+    "status": "ok",
+    "tested": "2026-10-22"
+   },
+   "name": "Google: Gemini 3.1 Flash Lite Preview"
+  },
+  "google/gemini-3.5-flash-lite": {
+   "dm": {
+    "calls": 16,
+    "cost": 0.02799,
+    "effort": "low",
+    "max_s": 6.3,
+    "median_s": 3.6,
+    "price_out": 2.5,
+    "reason": "",
+    "status": "ok",
+    "tested": "2026-10-22"
+   },
+   "name": "Google: Gemini 3.5 Flash Lite"
+  },
   "google/gemma-3-12b-it": {
    "dm": {
     "calls": 0,
@@ -245,6 +287,44 @@
     "tested": "2026-10-21"
    },
    "name": "Google: Gemma 4 31B (free)"
+  },
+  "google:gemini-2.5-flash-lite": {
+   "dm": {
+    "calls": 0,
+    "cost": 0.0,
+    "effort": "low",
+    "price_out": 0.4,
+    "reason": "room_layout: HTTPStatusError 404 [{\n  \"error\": {\n    \"code\": 404,\n    \"message\": \"This model models/gemini-2.5-flash-lite is no longer available to new users. Please update",
+    "status": "fail",
+    "tested": "2026-10-22"
+   },
+   "name": "Google: Gemini 2.5 Flash-Lite"
+  },
+  "google:gemini-3.1-flash-lite": {
+   "dm": {
+    "calls": 9,
+    "cost": 0.02078,
+    "effort": "low",
+    "price_out": 1.5,
+    "reason": "room_clear: ReadTimeout",
+    "status": "fail",
+    "tested": "2026-10-23"
+   },
+   "name": "Google: Gemini 3.1 Flash Lite"
+  },
+  "google:gemini-3.5-flash-lite": {
+   "dm": {
+    "calls": 16,
+    "cost": 0.04087,
+    "effort": "low",
+    "max_s": 3.2,
+    "median_s": 2.1,
+    "price_out": 2.5,
+    "reason": "",
+    "status": "ok",
+    "tested": "2026-10-23"
+   },
+   "name": "Google: Gemini 3.5 Flash Lite"
   },
   "ibm-granite/granite-4.2-8b": {
    "dm": {
@@ -1049,5 +1129,5 @@
    "name": "Z.ai: GLM 5.3 Flash"
   }
  },
- "updated": "2026-10-22"
+ "updated": "2026-10-23"
 }
