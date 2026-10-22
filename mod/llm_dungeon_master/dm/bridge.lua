@@ -238,6 +238,8 @@ local function handle(msg)
       return
     end
     outdated, welcomed, seen = nil, true, true
+    -- The backend now knows this run; a later hello (the app restarted mid-run) is a continue.
+    if runIdForHello then runIdForHello.new_run = false end
     pingAt, nextPing = nil, now() + PING_MS
     return
   end
