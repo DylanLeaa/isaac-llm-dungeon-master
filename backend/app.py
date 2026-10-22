@@ -29,7 +29,7 @@ import webbrowser
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk
 
 import appdata
 import bridge
@@ -140,6 +140,58 @@ def set_text(widget: tk.Text, value: str) -> None:
     widget.configure(state="disabled")
 
 
+class CellTip:
+    """Hover a Treeview cell whose text is cut off and a tooltip shows all of it."""
+
+    DELAY_MS = 400
+
+    def __init__(self, tree: ttk.Treeview) -> None:
+        self.tree, self.tip, self.cell, self.job = tree, None, None, None
+        tree.bind("<Motion>", self._move, add="+")
+        tree.bind("<Leave>", lambda _e: self._cancel(), add="+")
+        tree.bind("<ButtonPress>", lambda _e: self._cancel(), add="+")
+        tree.bind("<MouseWheel>", lambda _e: self._cancel(), add="+")
+
+    def _move(self, e) -> None:
+        row, col = self.tree.identify_row(e.y), self.tree.identify_column(e.x)
+        cell = (row, col) if row and col and self.tree.identify_region(e.x, e.y) == "cell" else None
+        if cell == self.cell:
+            return
+        self._cancel()
+        if cell:
+            self.cell = cell
+            self.job = self.tree.after(self.DELAY_MS, lambda: self._show(cell, e.x_root, e.y_root))
+
+    def _show(self, cell: tuple[str, str], x: int, y: int) -> None:
+        self.job = None
+        row, col = cell
+        try:
+            index = int(col.lstrip("#")) - 1
+            shown = self.tree["displaycolumns"]
+            key = self.tree["columns"][index] if shown in ("#all", ("#all",)) else shown[index]
+            text = str(self.tree.set(row, key))
+            width = self.tree.column(key, "width")
+        except (tk.TclError, ValueError, IndexError):
+            return
+        font = tkfont.nametofont("TkDefaultFont")
+        if not text or font.measure(text) <= width - 12:      # it all fits: nothing to add
+            return
+        self.tip = tip = tk.Toplevel(self.tree)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x + 14}+{y + 18}")
+        tk.Label(tip, text=text, justify="left", wraplength=620, bg="#2b2b2b", fg="#e4e4e4", relief="solid",
+                 borderwidth=1, padx=6, pady=4, font=("Segoe UI", 9)).pack()
+
+    def _cancel(self) -> None:
+        self.cell = None
+        if self.job:
+            self.tree.after_cancel(self.job)
+            self.job = None
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
 def open_path(path: Path) -> None:
     path = Path(path)
     if path.is_file() or path.is_dir():
@@ -240,6 +292,7 @@ class RunView(ttk.Frame):
         self.tree.pack(side="left", fill="both", expand=True)
         bar.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._show_selected())
+        CellTip(self.tree)
         panes.add(table, weight=3)
 
         self.details = tabs = ttk.Notebook(panes)
