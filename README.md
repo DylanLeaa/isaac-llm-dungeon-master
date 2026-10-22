@@ -104,8 +104,16 @@ the background while you play. The screen can't be skipped, but it gives up by i
 plans, and it doesn't come up at all if no backend has answered since the game started
 (`LOADING_SCREEN = false` turns it off). The time spent there isn't counted in the run's clock. Decisions
 are never written against a stale brief: a request waits up to 45s for its floor's brief. A floor brief
-waits up to 25s for the run narrative, then goes ahead without it. If a planner fails, it is logged and
-the DM carries on.
+waits up to 25s for the run narrative, then goes ahead without it. A planner's call is sent again after
+a 5xx (twice, backing off) and waits out a 429 that asks for 20s or less. If it still fails, it is logged
+and the DM carries on.
+
+Provider errors on decisions: a 5xx is sent again once after a short backoff. A 429 puts the DM's model in
+a cooldown, for the provider's Retry-After (Google's `retryDelay`) or else an exponential backoff (2s, 4s,
+8s... with jitter, reset by a call that goes through). Nothing is sent during it: a request is held until
+the cooldown ends and then made, or, if the cooldown outlasts its deadline, answered `cooldown` at the
+deadline (receipt status `cooldown`, nothing billed) so the game's re-ask lands after it. Every error in
+the receipt keeps the provider's response body (`body`, up to 2000 characters).
 
 Requests for the same key supersede each other: the backend cancels the stale Haiku call and
 the mod only replaces a result with one for a newer request. The p90 latency is measured live,

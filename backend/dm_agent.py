@@ -21,6 +21,9 @@ def build_user_message(kind: str, state: dict, ctx: dict, memory: dict) -> str:
 
 
 from google_ai import GOOGLE_URL, tidy, strip_cache_control
+from http_retry import Cooldown, post_retrying, raise_for_status
+
+DM_RETRIES = 1                  # a 5xx is sent again once: a decision has seconds, not minutes
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_DEFAULT_MODEL = "anthropic/claude-haiku-5.5"      # OpenRouter slugs use dots
@@ -81,6 +84,7 @@ class OpenRouterDM:
         self.effort: str | None = "none"               # Google's thinking switch: raised if the model insists, dropped if it has none
         self.max_tokens = max_tokens
         self.reasoning: dict = {"enabled": False}       # no thinking tokens: they eat max_tokens and add latency
+        self.cooldown = Cooldown(model)                 # this model's rate-limit window (429s)
         self.campaign = ""
         self.set_cruelty(cruelty)
 
@@ -103,7 +107,17 @@ class OpenRouterDM:
 
     async def _post(self, body: dict):
         """POST with thinking off. A model that can't run without it (400 "Reasoning is mandatory")
-        is retried, and from then on called, at low effort."""
+        is retried, and from then on called, at low effort. A 5xx is sent again after a short backoff;
+        a 429 starts this model's cooldown, and nothing is sent until it is over (CoolingDown)."""
+        self.cooldown.check()
+        resp = await self._post_once(body)
+        if resp.status_code == 429:
+            self.cooldown.hit(resp)
+        elif resp.status_code < 400:
+            self.cooldown.ok()
+        return resp
+
+    async def _post_once(self, body: dict):
         if self.google:
             body = {**{k: v for k, v in body.items() if k != "usage"}, "messages": strip_cache_control(body["messages"])}
             resp = await self._post_google(body)
@@ -114,14 +128,20 @@ class OpenRouterDM:
                 self.effort = None                                   # e.g. Gemma: no thinking setting at all
                 resp = await self._post_google(body)
             return resp
-        resp = await self.client.post(OPENROUTER_URL, json={**body, "reasoning": self.reasoning})
+        resp = await self._post_openrouter(body)
         if resp.status_code == 400 and "reasoning is mandatory" in resp.text.lower() and "effort" not in self.reasoning:
             self.reasoning = {"effort": "low"}
-            resp = await self.client.post(OPENROUTER_URL, json={**body, "reasoning": self.reasoning})
+            resp = await self._post_openrouter(body)
         return resp
 
     async def _post_google(self, body: dict):
-        return await self.client.post(GOOGLE_URL, json={**body, **({"reasoning_effort": self.effort} if self.effort else {})})
+        return await post_retrying(lambda: self.client.post(
+            GOOGLE_URL, json={**body, **({"reasoning_effort": self.effort} if self.effort else {})}),
+            what=self.model, retries=DM_RETRIES, base=0.5)
+
+    async def _post_openrouter(self, body: dict):
+        return await post_retrying(lambda: self.client.post(OPENROUTER_URL, json={**body, "reasoning": self.reasoning}),
+                                   what=self.model, retries=DM_RETRIES, base=0.5)
 
     async def decide(self, kind: str, state: dict, ctx: dict, memory: dict) -> dict[str, Any]:
         tool = TOOLS[kind]
@@ -134,7 +154,7 @@ class OpenRouterDM:
             "tool_choice": {"type": "function", "function": {"name": tool["name"]}},
             "usage": {"include": True},                 # token + cost accounting in the response
         })
-        resp.raise_for_status()
+        raise_for_status(resp)
         data = completion_json(resp, self.model, self.google)
         record = call_record(self.model, [b["text"] for b in self.system["content"]], data)
         if "error" in data:
@@ -163,7 +183,7 @@ class OpenRouterDM:
             "tool_choice": "none",
             "usage": {"include": True},
         })
-        resp.raise_for_status()
+        raise_for_status(resp)
         data = completion_json(resp, self.model, self.google)
         record = call_record(self.model, [b["text"] for b in self.system["content"]], data)
         if "error" in data:
