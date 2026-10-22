@@ -178,9 +178,14 @@ class CellTip:
             return
         self.tip = tip = tk.Toplevel(self.tree)
         tip.wm_overrideredirect(True)
-        tip.wm_geometry(f"+{x + 14}+{y + 18}")
         tk.Label(tip, text=text, justify="left", wraplength=620, bg="#2b2b2b", fg="#e4e4e4", relief="solid",
                  borderwidth=1, padx=6, pady=4, font=("Segoe UI", 9)).pack()
+        tip.update_idletasks()
+        w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
+        sw, sh = tip.winfo_screenwidth(), tip.winfo_screenheight()
+        left = max(0, min(x + 14, sw - w - 8))
+        top = y + 18 if y + 18 + h <= sh - 8 else max(0, y - h - 8)    # flip above the cursor near the bottom
+        tip.wm_geometry(f"+{left}+{top}")
 
     def _cancel(self) -> None:
         self.cell = None
