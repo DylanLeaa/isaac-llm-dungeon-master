@@ -30,6 +30,7 @@ import epilogue
 from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_CODE_LATE_GRACE_S,
                          CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeDM, ClaudeCodePlanner)
 from google_ai import GOOGLE_DEFAULT_MODEL
+from http_retry import CoolingDown, error_fields, error_line
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
 from memory import DECK_FIELD, RunMemory, kind_of
@@ -169,7 +170,8 @@ class Coordinator:
         """Log how many answers were requested, paid for, and actually used, per kind."""
         if not self.stats:
             return
-        cols = ("req", "ok", "late", "applied", "replaced", "reused", "superseded", "timeout", "error", "fallback")
+        cols = ("req", "ok", "late", "applied", "replaced", "reused", "superseded", "timeout", "error", "cooldown",
+                "fallback")
         log.info("summary %-11s %s", "kind", " ".join(f"{c:>10}" for c in cols))
         for kind in sorted(k for k in self.stats if k != "gate"):
             log.info("        %-11s %s", kind, " ".join(f"{self.stats[kind][c]:>10}" for c in cols))
@@ -385,6 +387,9 @@ class Coordinator:
         t0 = time.perf_counter()
         call = None
         try:
+            wait = self._cooldown_left()
+            if 0 < wait < EPITAPH_TIMEOUT_S:      # rate-limited: a short cooldown is worth waiting out
+                await asyncio.sleep(wait)
             async with self.sem:
                 text, call = await asyncio.wait_for(self.dm.epitaph(epilogue.epitaph_prompt(summary)),
                                                     EPITAPH_TIMEOUT_S)
@@ -393,9 +398,8 @@ class Coordinator:
                 raise ValueError("epitaph was empty after cleaning")
         except Exception as e:                    # noqa: BLE001 - the screen just goes without
             self.stats["epitaph"]["error"] += 1
-            log.warning("epitaph     failed (%s: %s)", type(e).__name__, e)
-            self._record("epitaph", "error", ms=_ms(t0), error=f"{type(e).__name__}: {e}",
-                         llm=getattr(e, "call", None) or call)
+            log.warning("epitaph     failed (%s: %s)", type(e).__name__, error_line(e))
+            self._record("epitaph", "error", ms=_ms(t0), **error_fields(e), llm=getattr(e, "call", None) or call)
             summary["epitaph"] = None
         else:
             self.stats["epitaph"]["ok"] += 1
@@ -503,6 +507,16 @@ class Coordinator:
                 await send({**base, "ok": True, "ms": _ms(t0), "decision": prev,
                             "drawn_base": self.memory.drawn_total.get(key, 0)})
                 return
+            # Rate-limited: hold the request until the model's cooldown is over, then make the call. A cooldown
+            # longer than the deadline is answered "cooldown" at the deadline instead: answered at once, the game
+            # would re-ask on the next frame and give up after HOLD_RETRIES. Like the slot queue, not the DM's time.
+            wait = self._cooldown_left()
+            if wait:
+                if wait >= deadline:
+                    await asyncio.sleep(deadline)
+                    raise CoolingDown(self._cooldown_left())
+                log.info("%-11s %-14s rate-limited: holding %.1fs for the cooldown", kind, key, wait)
+                await asyncio.sleep(wait)
             # the deadline counts from here: queueing for a slot isn't the DM's time
             async with self.sem.slot(_priority(kind, ctx)):
                 campaign = getattr(self.dm, "campaign", "")   # what this answer is written against
@@ -517,6 +531,13 @@ class Coordinator:
             # Superseded; the newer request will answer. A call already in flight may still be billed.
             self._record(kind, "superseded", ms=_ms(t0), **rec)
             return
+        except CoolingDown as e:
+            # Nothing was sent, so nothing is billed: the game re-asks if it is waiting.
+            self.stats[kind]["cooldown"] += 1
+            log.info("%-11s %-14s not sent: %s", kind, key, e)
+            self._record(kind, "cooldown", ms=_ms(t0), result=str(e), **rec)
+            await send({**base, "ok": False, "reason": "cooldown", "retry_ms": int(e.retry_in * 1000)})
+            return
         except asyncio.TimeoutError:
             self.stats[kind]["timeout"] += 1
             log.warning("%-11s %-14s TIMEOUT after %.0fms -> the game re-asks if it is waiting", kind, key, _ms(t0))
@@ -525,8 +546,8 @@ class Coordinator:
             return
         except Exception as e:                    # noqa: BLE001 - never crash the bridge
             self.stats[kind]["error"] += 1
-            log.exception("%s %s failed: %s", kind, key, e)
-            self._record(kind, "error", ms=_ms(t0), error=f"{type(e).__name__}: {e}",
+            log.exception("%s %s failed: %s", kind, key, error_line(e))
+            self._record(kind, "error", ms=_ms(t0), **error_fields(e),
                          llm=getattr(e, "call", None) or call, raw=raw or None, **rec)
             await send({**base, "ok": False, "reason": type(e).__name__})
             return
@@ -559,6 +580,11 @@ class Coordinator:
             self.trim_stale.add(key)
             await self._send_quietly(send, {"t": "stale", "session": self.session, "keys": [key],
                                             "why": "trimmed to the budget"})
+
+    def _cooldown_left(self) -> float:
+        """Seconds until the DM's model may be called again after a 429 (0: it may now)."""
+        cooldown = getattr(self.dm, "cooldown", None)
+        return cooldown.remaining() if cooldown else 0.0
 
     def _in_flight(self, key: str) -> list[tuple[str, str]]:
         """Decisions being made right now (no answer yet), other than `key`."""
@@ -612,9 +638,8 @@ class Coordinator:
                                                                 plan=self.campaign.brief)
         except Exception as e:                    # noqa: BLE001 - the gate is an optimisation, never a blocker
             self.stats["gate"]["error"] += 1
-            log.warning("%-11s %-14s gate failed (%s: %s) -> re-ask", kind, key, type(e).__name__, e)
-            self._record("gate", "error", ms=_ms(t0), error=f"{type(e).__name__}: {e}",
-                         llm=getattr(e, "call", None), key=key)
+            log.warning("%-11s %-14s gate failed (%s: %s) -> re-ask", kind, key, type(e).__name__, error_line(e))
+            self._record("gate", "error", ms=_ms(t0), **error_fields(e), llm=getattr(e, "call", None), key=key)
             return False
         if call and call.get("usage"):
             self.usage.update({**call["usage"], "calls": 1})

@@ -18,6 +18,7 @@ from typing import Callable
 
 from dm_agent import OPENROUTER_URL, LLMCallError, api_headers, call_record, completion_json
 from google_ai import GOOGLE_URL
+from http_retry import error_fields, error_line, post_retrying, raise_for_status
 from prompts import floor_prompt, narrative_prompt
 from receipt import plan_excerpt
 
@@ -28,6 +29,8 @@ FLOOR_DEFAULT_MODEL = "anthropic/claude-sonnet-5.5"
 
 NARRATIVE_WAIT_S = 25.0     # a floor brief waits this long for the run narrative, then goes without
 BRIEF_WAIT_S = 45.0         # a decision (or the loading screen) waits this long for its floor's brief
+PLANNER_RETRIES = 2         # a plan nobody re-asks for: a 5xx is sent again twice, after 1-2s then 2-4s
+PLANNER_429_WAIT_S = 20.0   # and a rate limit asking for no more than this is waited out
 
 
 def _compact_json(obj) -> str:
@@ -107,9 +110,10 @@ class OpenRouterPlanner:
         """The plan text, and usage with the receipt's call record under "_call"."""
         body = {"model": model, "max_tokens": self.max_tokens,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
-        resp = await self.client.post(GOOGLE_URL if self.google else OPENROUTER_URL,
-                                      json=body if self.google else {**body, "usage": {"include": True}})
-        resp.raise_for_status()
+        resp = await post_retrying(lambda: self.client.post(
+            GOOGLE_URL if self.google else OPENROUTER_URL, json=body if self.google else {**body, "usage": {"include": True}}),
+            what=model, retries=PLANNER_RETRIES, base=2.0, wait_429_up_to=PLANNER_429_WAIT_S)
+        raise_for_status(resp)
         data = completion_json(resp, model, self.google)
         record = {**call_record(model, [system], data), "user": user}
         if "error" in data:
@@ -281,8 +285,7 @@ class Campaign:
 
     def _failed(self, kind: str, e: Exception, t0: float, **fields) -> None:
         self.stats[kind]["error"] += 1
-        self.record(kind, "error", ms=_ms(t0), error=f"{type(e).__name__}: {e}",
-                    llm=getattr(e, "call", None), **fields)
+        self.record(kind, "error", ms=_ms(t0), **error_fields(e), llm=getattr(e, "call", None), **fields)
 
     async def _write_narrative(self, state: dict, cruelty: int, token: int) -> None:
         self.stats["narrative"]["req"] += 1
@@ -293,7 +296,7 @@ class Campaign:
             raise
         except Exception as e:                        # noqa: BLE001 - a planner must never break the DM
             self._failed("narrative", e, t0)
-            log.warning("narrative   failed (%s: %s) -> the DM runs without one", type(e).__name__, e)
+            log.warning("narrative   failed (%s: %s) -> the DM runs without one", type(e).__name__, error_line(e))
             return
         if token != self.run_token:
             return
@@ -323,7 +326,7 @@ class Campaign:
             raise
         except Exception as e:                        # noqa: BLE001
             self._failed("floor_brief", e, t0, key=floor)
-            log.warning("floor_brief failed (%s: %s) -> the DM improvises this floor", type(e).__name__, e)
+            log.warning("floor_brief failed (%s: %s) -> the DM improvises this floor", type(e).__name__, error_line(e))
             return
         if token != self.run_token:
             return                                    # the run moved on meanwhile

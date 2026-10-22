@@ -56,7 +56,7 @@ BAD, GOOD, MUTED, LINK = "#ff8a7a", "#7fd18b", "#9a9a9a", "#7fb8ff"
 
 # Treeview row colours, by receipt status.
 STATUS_TAGS = {"applied": "#7fd18b", "written": "#7fb8ff", "reused": "#7fd18b", "keep": "#7fd18b",
-               "timeout": "#ff8a7a", "error": "#ff8a7a", "fallback": "#ffb86b",
+               "timeout": "#ff8a7a", "error": "#ff8a7a", "fallback": "#ffb86b", "cooldown": "#ffb86b",
                "replaced": "#8a8a8a", "superseded": "#8a8a8a", "discarded": "#8a8a8a"}
 
 
