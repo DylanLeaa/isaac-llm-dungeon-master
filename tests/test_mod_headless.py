@@ -404,7 +404,9 @@ def run(tmp, game):
     W.kill(foe)
     vheart = W.spawnPickup(PV.PICKUP_HEART, g.HeartSubType.HEART_FULL, 300, 300, foe)
     assert vheart.removed, "the game's own drop is cancelled even with the deck empty"
-    tick(3)
+    # The hold starts on the next update; the floor's kill drops are spent by now, so the backend answers
+    # locally (no mock latency) and the hold can end a frame later: look on the frame it starts.
+    tick()
     assert Hold.holding("drops:1"), "the game freezes for the drops deck"
     wait(lambda: not Hold.holding("drops:1"), 8, "the drops answer for the empty-deck kill")
     tick(3)
