@@ -49,6 +49,7 @@ DEFAULT_CRUELTY = 6           # until the game's DM Settings menu says otherwise
 # nightmare most of all) goes quiet for a while. This long without a message and the game is gone.
 GAME_TIMEOUT_S = 15.0
 LOG_LINES = 3000
+HISTORY_POLL_MS = 2000         # how often the History tab looks for new or grown receipts while it's shown
 KEYS_URL = "https://openrouter.ai/keys"
 from google_ai import KEYS_URL as GOOGLE_KEYS_URL
 # Text colours, set on the widget: a colour in a derived ttk style doesn't always survive the theme.
@@ -355,6 +356,15 @@ class RunView(ttk.Frame):
             self.decks_run = r
             self.deck_toggled.clear()
         self.refresh()
+
+    def reload(self, r: Receipt) -> None:
+        """Show a newer copy of the same run, keeping the picked row, the scroll and the decks opened."""
+        picked, top = self.tree.selection(), self.tree.yview()[0]
+        self.decks_run = r
+        self.show(r)
+        self.tree.yview_moveto(top)
+        if picked and self.tree.exists(picked[0]):
+            self.tree.selection_set(picked[0])
 
     def added(self, seq: int) -> None:
         self._insert(seq)
@@ -788,6 +798,7 @@ class App:
         self.current = Receipt(None, keep_full=True)
         self.dirty = False
         self.history_rows: dict[str, Path] = {}
+        self.history_shown: tuple | None = None       # (path, stamp) of the receipt the History view shows
         # The model pickers: OpenRouter's catalogue (cached, refreshed in the background) and the unsaved picks.
         self.catalog_raw = model_catalog.load_cache()
         self.catalog = model_catalog.parse(self.catalog_raw)
@@ -817,6 +828,7 @@ class App:
         self.refresh_history()
         self.root.after(200, self._drain)
         self.root.after(500, self._tick)
+        self.root.after(HISTORY_POLL_MS, self._poll_history)
 
     # ------------------------------------------------------------ look
     def _styles(self) -> None:
@@ -961,17 +973,17 @@ class App:
 
     # ------------------------------------------------------------ history
     def _history_tab(self) -> None:
-        tab = ttk.Frame(self.tabs)
+        tab = self.history_tab = ttk.Frame(self.tabs)
         self.tabs.add(tab, text="  History  ")
+        self.tabs.bind("<<NotebookTabChanged>>", lambda _e: self._poll_history(again=False), add="+")
         panes = ttk.PanedWindow(tab, orient="horizontal")
         panes.pack(fill="both", expand=True)
 
         left = ttk.Frame(panes, padding=(10, 10, 0, 10))
         buttons = ttk.Frame(left)
         buttons.pack(fill="x", pady=(0, 8))
-        ttk.Button(buttons, text="Refresh", command=self.refresh_history).pack(side="left")
         ttk.Button(buttons, text="Open receipts folder",
-                   command=lambda: open_path(self.receipts_dir)).pack(side="left", padx=6)
+                   command=lambda: open_path(self.receipts_dir)).pack(side="left")
         cols = (("started", "Started", 118), ("seed", "Seed", 84), ("outcome", "Outcome", 64),
                 ("entries", "Entries", 56), ("cost", "Cost", 56))
         self.history = ttk.Treeview(left, columns=[c[0] for c in cols], show="headings", selectmode="browse")
@@ -994,33 +1006,51 @@ class App:
         # The run view asks for more width than there is: without this the list gets squeezed.
         panes.bind("<Map>", lambda _e: panes.sashpos(0, 400), add="+")
 
+    def _poll_history(self, again: bool = True) -> None:
+        """Keep the History tab current while it's on screen: new runs, and the picked run as it grows."""
+        if str(self.tabs.select()) == str(self.history_tab):
+            self.refresh_history()
+        if again:
+            self.root.after(HISTORY_POLL_MS, self._poll_history)
+
     def refresh_history(self) -> None:
-        """List every receipt file, newest first. Each is read once per change (they're small)."""
-        selected = self.history.selection()
-        self.history.delete(*self.history.get_children())
-        self.history_rows.clear()
+        """List every receipt file, newest first, in place (the picked row and the scroll stay put).
+        Each is read once per change (they're small)."""
         try:
             files = sorted(self.receipts_dir.glob("*.jsonl"), reverse=True)
         except OSError:
             files = []
-        for path in files:
+        rows = {str(path): path for path in files}
+        gone = [iid for iid in self.history_rows if iid not in rows]
+        if gone:
+            self.history.delete(*gone)
+        self.history_rows = rows
+        for i, (iid, path) in enumerate(rows.items()):
             info = self._history_info(path)
-            iid = str(path)
-            self.history_rows[iid] = path
-            self.history.insert("", "end", iid=iid, tags=(info["outcome"],),
-                                values=(info["started"], info["seed"], info["outcome"] or "-",
-                                        info["entries"], f'${info["cost"]:.2f}'))
-        if selected and self.history.exists(selected[0]):
-            self.history.selection_set(selected[0])
+            values = (info["started"], info["seed"], info["outcome"] or "-", info["entries"], f'${info["cost"]:.2f}')
+            if self.history.exists(iid):
+                self.history.item(iid, values=values, tags=(info["outcome"],))
+                self.history.move(iid, "", i)
+            else:
+                self.history.insert("", i, iid=iid, values=values, tags=(info["outcome"],))
+        # The picked run is still being written (it's the one being played): show what's new.
+        sel = self.history.selection()
+        if sel and self.history_shown and self.history_shown[0] == sel[0] \
+                and self.history_shown[1] != self._stamp(rows[sel[0]]):
+            self._open_history(keep=True)
 
     _info_cache: dict[str, tuple[tuple, dict]] = {}
 
-    def _history_info(self, path: Path) -> dict:
+    @staticmethod
+    def _stamp(path: Path) -> tuple | None:
         try:
             st = path.stat()
-            stamp = (st.st_mtime_ns, st.st_size)
+            return st.st_mtime_ns, st.st_size
         except OSError:
-            stamp = None
+            return None
+
+    def _history_info(self, path: Path) -> dict:
+        stamp = self._stamp(path)
         cached = self._info_cache.get(str(path))
         if cached and cached[0] == stamp:
             return cached[1]
@@ -1032,10 +1062,16 @@ class App:
         self._info_cache[str(path)] = (stamp, info)
         return info
 
-    def _open_history(self) -> None:
+    def _open_history(self, keep: bool = False) -> None:
         sel = self.history.selection()
         if sel and sel[0] in self.history_rows:
-            self.history_view.show(receipts.load(self.history_rows[sel[0]]))
+            path = self.history_rows[sel[0]]
+            self.history_shown = (sel[0], self._stamp(path))
+            r = receipts.load(path)
+            if keep:
+                self.history_view.reload(r)
+            else:
+                self.history_view.show(r)
 
     # ------------------------------------------------------------ settings
     def _settings_tab(self) -> None:
