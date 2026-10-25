@@ -14,13 +14,18 @@
 -- A result is a deck: each outcome the game draws from it is reported (`drawn`), so the backend
 -- counts what was actually handed out. The backend can push `stale` for keys whose unused entries
 -- another deck's spending made out of date (the floor's economy); decks.lua re-asks those.
+--
+-- In agent mode the backend can also push a deck nobody asked for (`res` with push = true): one turn
+-- restacks any open deck. It takes a local id newer than every request so far, so only a later request's
+-- answer replaces it, and its draws are reported under the backend's own id for it (`wire`).
 local json = require("json")
 
 local Bridge = {}
 
 -- Must match PROTO in backend/bridge.py. Bump both when a message changes shape.
 -- 2: decks (`drawn` per draw, `abandon`, the backend's `stale` push), cards/trinkets/pills/drops kinds.
-local PROTO = 2
+-- 3: pushed decks (agent mode): `res` with push = true, its draws reported under the pushed id.
+local PROTO = 3
 local HELLO_MS = 2000
 local PING_MS = 2000      -- how often a connected bridge checks the backend is still there
 local LINK_TIMEOUT_MS = 6000
@@ -262,6 +267,17 @@ local function handle(msg)
     return
   end
   if msg.t ~= "res" or msg.session ~= session then return end
+  if msg.push then
+    -- A deck nobody asked for: newer than anything asked so far. A request on its way is left alone; its
+    -- answer is older than this and won't replace it.
+    if msg.ok and type(msg.decision) == "table" then
+      local id = nextId
+      nextId = nextId + 1
+      results[msg.key] = { id = id, wire = msg.id, kind = msg.kind, decision = msg.decision, at = now(),
+                           ms = msg.ms, base = msg.drawn_base, pushed = true }
+    end
+    return
+  end
   local key, id = msg.key, msg.id
   local p = pending[key]
   if p and p.id == id then

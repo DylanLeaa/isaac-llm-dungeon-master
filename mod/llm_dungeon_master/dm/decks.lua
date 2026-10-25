@@ -81,8 +81,10 @@ local function sync(st)
     st.entries = {}
     for i = skip + 1, #list do st.entries[#st.entries + 1] = list[i] end
     st.resultId, st.decision = res.id, res.decision
+    st.wireId = res.wire or res.id        -- a pushed deck is drawn under the backend's id for it
     st.taunt, st.tauntShown = res.decision.taunt, false
-    st.answerHash = ask and ask.hash or nil
+    -- A pushed deck was written against the state as it is now (near enough): a later move still rewrites it.
+    st.answerHash = ask and ask.hash or (res.pushed and State.materialHash()) or nil
     st.answerAsk = ask
   end
   return st
@@ -155,7 +157,7 @@ function Decks.consume(st, e, roll)
   local spec = specs[st.type]
   st.drawn[#st.drawn + 1] = e
   local outcome = spec.outcome and spec.outcome(e, roll or {}) or e
-  Bridge.drawn(st.key, spec.kind and st.resultId or nil, outcome, roll and roll.cause or nil)
+  Bridge.drawn(st.key, spec.kind and st.wireId or nil, outcome, roll and roll.cause or nil)
   if not st.tauntShown then
     st.tauntShown = true
     if st.taunt then Taunt.show(st.taunt) end

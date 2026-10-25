@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from agent_tools import AGENT_TOOLS
 from dm_agent import LLMCallError, build_user_message
 from planners import OpenRouterPlanner
 from prompts import system_prompt
@@ -170,6 +171,42 @@ class ClaudeCodeDM:
     async def epitaph(self, prompt: str) -> tuple[str, dict]:
         """Free text in the DM's voice (the after-death screen)."""
         return await self.runner.complete(self.model, self.system, prompt)
+
+
+class ClaudeCodeAgent(ClaudeCodeDM):
+    """Agent mode through Claude Code. `claude -p` has no tool calls of its own, so the turn's calls come
+    back as one structured answer, {"calls": [{tool, key, args}]}; each tool's schema travels in the prompt."""
+
+    def _build_system(self) -> None:
+        self.system = system_prompt(self.cruelty, agent=True) + ("\n\n" + self.campaign if self.campaign else "")
+
+    async def act(self, message: str) -> tuple[list[dict], dict]:
+        user = _AGENT_TOOLS_TEXT + "\n\n" + message
+        answer, record = await self.runner.complete(self.model, self.system, user, _AGENT_SCHEMA)
+        calls = []
+        for c in answer.get("calls") or []:
+            if isinstance(c, dict) and isinstance(c.get("args"), dict):
+                calls.append({"tool": str(c.get("tool")), "args": {**c["args"], "key": c.get("key")}})
+        return calls, record
+
+
+_AGENT_SCHEMA = {
+    "type": "object",
+    "properties": {"calls": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"tool": {"type": "string", "enum": list(AGENT_TOOLS)},
+                       "key": {"type": "string"},
+                       "args": {"type": "object", "description": "The tool's input, as its schema below (without key)."}},
+        "required": ["tool", "key", "args"]}}},
+    "required": ["calls"],
+}
+_AGENT_TOOLS_TEXT = ("Answer with `calls`: one entry per tool call, in order, each {tool, key, args}. The tools:\n"
+                     + "\n".join(f"- {t['name']}: {t['description']}\n  args schema: "
+                                 + json.dumps(_soften({**t["input_schema"],
+                                                       "properties": {k: v for k, v in t["input_schema"]["properties"].items() if k != "key"},
+                                                       "required": [r for r in t["input_schema"]["required"] if r != "key"]}),
+                                              separators=(",", ":"))
+                                 for t in AGENT_TOOLS.values()))
 
 
 class ClaudeCodePlanner(OpenRouterPlanner):

@@ -8,6 +8,7 @@ Run:  python server.py                 # Haiku 5.5 DM + Opus narrative + Sonnet 
       python server.py --no-planners  # Haiku alone
       python server.py --mock          # no API key needed
       python server.py --backend claude-code   # same DM through your local Claude Code (claude -p)
+      python server.py --agent         # agent mode: one call per trigger stacks every deck it needs to
       python server.py --isaac-dir "D:/SteamLibrary/steamapps/common/The Binding of Isaac Rebirth"
 """
 from __future__ import annotations
@@ -28,9 +29,11 @@ import appdata
 import bridge
 import epilogue
 from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_CODE_LATE_GRACE_S,
-                         CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeDM, ClaudeCodePlanner)
+                         CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeAgent, ClaudeCodeDM, ClaudeCodePlanner)
 from google_ai import GOOGLE_DEFAULT_MODEL
 from http_retry import CoolingDown, error_fields, error_line
+from agent import MockAgent, OpenRouterAgent, build_turn_message
+from agent_tools import KEEP, SHUFFLE, shuffle_order, stack_kind
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
 from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
 from memory import DECK_FIELD, RunMemory, kind_of
@@ -50,6 +53,16 @@ EPITAPH_TIMEOUT_S = 20.0   # the stats screen shows without it; it only fills in
 # decks; the room the player is about to walk into (or is about to clear) must not queue behind it, and a
 # deck the game is frozen on (ctx.owed) goes first of all.
 URGENT, NEXT_DOOR, BACKGROUND = 0, 1, 2
+
+# Agent mode. A burst of requests (a floor start, a room entry) waits this long to share one turn; a deck the game
+# is frozen on, or a room clear, doesn't wait. Decks gone stale with no request behind them wait a little longer.
+AGENT_BATCH_S = 0.12
+AGENT_FLAG_WAIT_S = 0.5
+AGENT_MAX_KEYS = 6         # requests a turn answers; more start another turn
+AGENT_OPEN_DECKS = 12      # open decks a turn shows (and may restack), flagged first, then newest
+# Open decks a turn may restack unasked. Not pills (a colour may have been swallowed since it was written) nor
+# payouts (a machine's schedule is a story: it is only ever extended, when the game asks).
+AGENT_RESTACK_KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "cards", "trinkets", "drops")
 
 
 def _priority(kind: str, ctx: dict) -> int:
@@ -143,8 +156,20 @@ class Coordinator:
     """Routes requests to the DM, enforces latest-wins per key, applies guardrails."""
 
     def __init__(self, dm, cruelty: int, planner=None, max_concurrency: int = 6,
-                 receipt: Receipt | None = None, epitaph: bool = True, gate=None, late_grace_s: float = 0.0) -> None:
+                 receipt: Receipt | None = None, epitaph: bool = True, gate=None, late_grace_s: float = 0.0,
+                 agent=None) -> None:
         self.dm = dm
+        # Agent mode: one call per trigger stacks, shuffles or keeps any number of decks (None: one call per deck).
+        self.agent = agent
+        self.agent_queue: dict[str, dict] = {}    # key -> the newest request waiting for an agent turn
+        self.agent_flags: dict[str, str] = {}     # key -> why an open deck needs restacking (no request behind it)
+        self.agent_flagged: dict[str, float] = {} # key -> the answer (its issued time) already flagged once
+        self.agent_inflight: dict[str, tuple[int, asyncio.Task]] = {}   # key -> (rid, turn) deciding it now
+        self.agent_turns: set[asyncio.Task] = set()
+        self.agent_timer: asyncio.Task | None = None
+        self.push_id = 0                          # pushes count down from -1: never one of the game's request ids
+        self.agent_send: Send | None = None
+        self.last_state: dict = {}                # the freshest snapshot the game sent (a turn with no request uses it)
         self.late_grace_s = late_grace_s          # how long past its deadline a call may still be delivered
         self.gate = gate                          # fast model that vetoes re-asks the DM would answer the same
         self.last_req: dict[str, dict] = {}       # key -> what the issued answer was written against
@@ -172,9 +197,20 @@ class Coordinator:
         self.stats: dict[str, Counter] = defaultdict(Counter)
         self.usage = Counter()                    # in / cached / out tokens, cost, calls
         # Opus narrative once per run + Sonnet brief once per floor, fed to the DM's system prompt.
-        self.campaign = Campaign(planner, getattr(dm, "set_campaign", lambda _text: None), self.stats, self.usage,
+        self.campaign = Campaign(planner, self._set_campaign, self.stats, self.usage,
                                  self._record, on_brief=self._brief_written)
         self.memory.economy.cruelty = cruelty
+
+    def _set_campaign(self, text: str) -> None:
+        """The planners' narrative + floor brief, into the DM's and the agent's system prompts."""
+        for model in (self.dm, self.agent):
+            if hasattr(model, "set_campaign"):
+                model.set_campaign(text)
+
+    @property
+    def decider(self):
+        """Whoever writes the decks now: the agent in agent mode, else the DM."""
+        return self.agent if self.agent is not None else self.dm
 
     def summary(self) -> None:
         """Log how many answers were requested, paid for, and actually used, per kind."""
@@ -183,11 +219,16 @@ class Coordinator:
         cols = ("req", "ok", "local", "late", "applied", "replaced", "reused", "superseded", "timeout", "error",
                 "cooldown", "fallback")
         log.info("summary %-11s %s", "kind", " ".join(f"{c:>10}" for c in cols))
-        for kind in sorted(k for k in self.stats if k != "gate"):
+        for kind in sorted(k for k in self.stats if k not in ("gate", "agent")):
             log.info("        %-11s %s", kind, " ".join(f"{self.stats[kind][c]:>10}" for c in cols))
         g = self.stats.get("gate")
         if g:
             log.info("        gate        keep=%d (DM call saved) reask=%d error=%d", g["keep"], g["reask"], g["error"])
+        a = self.stats.get("agent")
+        if a:
+            log.info("        agent       turns=%d calls=%d stacked=%d shuffled=%d kept=%d pushed=%d rejected=%d "
+                     "skipped=%d timeout=%d error=%d", a["turn"], a["calls"], a["stack"], a["shuffle"], a["keep"],
+                     a["pushed"], a["rejected"], a["skipped"], a["timeout"], a["error"])
         u = self.usage
         if u["calls"]:
             log.info("        tokens in=%d (cached %d, %.0f%%) out=%d  cost=$%.4f over %d calls",
@@ -198,15 +239,25 @@ class Coordinator:
     def reconfigure(self, engine: "Engine") -> None:
         """Swap in other models mid-run (the app's Settings). The run, its receipt, memory and plans carry
         on; calls already in flight finish on the old models."""
-        old = (self.dm, self.campaign.planner, self.gate)
+        old = (self.dm, self.campaign.planner, self.gate, self.agent)
         self.dm, self.gate, self.late_grace_s = engine.dm, engine.gate, engine.late_grace
+        self.agent = engine.agent
         self.epitaph = self.epitaph_wanted and hasattr(engine.dm, "epitaph")
         self.sem = PrioritySemaphore(engine.concurrency)
         self.dm.set_cruelty(self.cruelty)
+        if self.agent is not None:
+            self.agent.set_cruelty(self.cruelty)
         self.campaign.planner = engine.planner
-        self.campaign.push = getattr(engine.dm, "set_campaign", lambda _text: None)
         self.campaign._push()
-        replaced = [o for o in old if hasattr(o, "client") and o not in (self.dm, engine.planner, self.gate)]
+        if self.agent is None and self.agent_queue:
+            # Agent mode switched off: what was waiting for a turn is asked one deck at a time.
+            queued, self.agent_queue = list(self.agent_queue.values()), {}
+            for msg in queued:
+                self._spawn_run(msg, self.agent_send)
+        if self.agent is None:
+            self.agent_flags.clear()
+        kept = (self.dm, engine.planner, self.gate, self.agent)
+        replaced = [o for o in old if hasattr(o, "client") and o not in kept]
         if replaced:
             task = asyncio.create_task(_close_later(replaced))
             self.bg.add(task)
@@ -235,6 +286,8 @@ class Coordinator:
                 for _rid, task in list(self.inflight.values()):
                     task.cancel()                 # asked in the old run: don't spend DM slots on it
                 self.inflight.clear()
+                self._cancel_agent()
+                self.push_id = 0
                 self.stats.clear()                # the summary above was the last run's; this one starts at zero
                 self.usage.clear()                # (cleared in place: the campaign counts into the same objects)
                 self.receipt.start_run(msg.get("run"), fresh=bool(msg.get("new_run")))
@@ -287,6 +340,7 @@ class Coordinator:
             for _rid, task in list(self.inflight.values()):
                 task.cancel()                     # the run is over: nothing still being decided can be used
             self.inflight.clear()
+            self._cancel_agent()
             await self._run_over(str(msg["name"]), msg.get("data") or {}, send)
         elif t == "event":
             self.memory.on_game_event(str(msg.get("name")), msg.get("data") or {})
@@ -305,12 +359,16 @@ class Coordinator:
             self._record("cruelty", "set", result=f"{self.cruelty} -> {cruelty}")
             self.cruelty = cruelty
             self.dm.set_cruelty(cruelty)
+            if self.agent is not None:
+                self.agent.set_cruelty(cruelty)
         self.memory.economy.cruelty = self.cruelty
 
     # ------------------------------------------------------------------ decks
     def _observe(self, state: dict) -> None:
         """Every snapshot the game sends: a new floor starts its economy ledger (synchronously, before any
         of its draws can come in), then the planners, whose floor brief sees last floor against vanilla."""
+        if state:
+            self.last_state = state
         if self.memory.economy.observe(state):
             log.info("economy     new floor ledger (%d normal rooms)", self.memory.economy.rooms)
         self.campaign.observe(state, {**self.memory.digest(), "economy": self.memory.report()}, self.cruelty)
@@ -346,9 +404,7 @@ class Coordinator:
         if overs:
             keys = self.memory.economy.stale_keys(overs, exclude=key)
             log.info("%-26s drew past the %s budget -> re-ask %s", key, "/".join(overs), ", ".join(keys) or "nothing")
-            if keys:
-                await self._send_quietly(send, {"t": "stale", "session": self.session, "keys": keys,
-                                                "why": "/".join(overs) + " over budget"})
+            await self._restack(send, keys, "/".join(overs) + " over budget")
 
     def _rolls(self, data: dict) -> None:
         """The mod's roll audit: how many of the game's rolls each owner took, and which no stream did. With
@@ -459,6 +515,14 @@ class Coordinator:
             return
         self.stats[kind]["req"] += 1
         self._observe(msg.get("state") or {})
+        if self.agent is not None:
+            self._queue_agent(msg, send)
+            return
+        self._spawn_run(msg, send)
+
+    def _spawn_run(self, msg: dict, send: Send) -> None:
+        """One DM call for this request (classic mode)."""
+        key, rid, kind = str(msg["key"]), int(msg["id"]), msg["kind"]
         old = self.inflight.get(key)
         if old and old[0] < rid and not old[1].done():
             old[1].cancel()                      # latest-wins: newer context supersedes
@@ -474,28 +538,22 @@ class Coordinator:
         if cur and cur[0] == rid:
             self.inflight.pop(key, None)
 
-    async def _run(self, msg: dict, send: Send) -> None:
-        key, rid, kind = str(msg["key"]), int(msg["id"]), msg["kind"]
-        state, ctx = msg.get("state") or {}, msg.get("ctx") or {}
-        # Never answer against a brief that is about to replace itself: wait for this floor's plan.
-        # Superseding cancels this wait too, so it costs nothing. Like the slot queue, not the DM's time.
+    async def _await_plans(self, state: dict) -> tuple[str, int]:
+        """Wait for this floor's plans: (the brief's status, ms waited). Never answer against a brief that is
+        about to replace itself. Superseding cancels this wait too, so it costs nothing. Like the slot queue,
+        not the DM's time. "cancelled" / "moved": a new run (or floor) replaced what this was asked against."""
         tb = time.perf_counter()
         try:                                      # the brief waits for it too, but not if the floor has no signature
             narrative = await asyncio.wait_for(self.campaign.narrative_waiter(), NARRATIVE_WAIT_S)
         except asyncio.TimeoutError:
             narrative = "timeout"
         brief = narrative if narrative == "cancelled" else await self.campaign.brief_waiter(floor_signature(state))
-        waited = _ms(tb)
-        if waited >= 50:
-            log.info("%-11s %-14s waited %dms for the floor brief (%s)", kind, key, waited, brief)
-        if brief in ("cancelled", "moved"):
-            # A new run (or floor) replaced what this was asked against: answering would be written with
-            # no campaign, and the game re-asks under the new one.
-            self._record(kind, "superseded", ms=waited, key=key, req_id=rid, reason=brief)
-            self.stats[kind]["superseded"] += 1
-            return
+        return brief, _ms(tb)
+
+    def _request_ctx(self, kind: str, key: str, state: dict, ctx: dict) -> tuple[dict, int | None]:
+        """The ctx the model sees for a request about `key`: the answer it replaces, the economy, and the
+        kind's own limits. Also the kill drops left (drops only, else None)."""
         prev = self.memory.previous(key)
-        asked_ctx = ctx                           # before the previous answer is mixed in: this is what the gate diffs
         if prev:                                  # a re-ask replaces this answer; show it so the model restates it
             ctx = {**ctx, "your_previous_answer": _compact(prev)}
         ctx = {**ctx, "economy": self.memory.economy.view(key)}
@@ -506,6 +564,22 @@ class Coordinator:
             ctx["economy"]["verdict"] += f"; kill drops: {kills_left} left this floor"
         elif kind == "floor_plan":
             ctx["allowed_curses"] = max_curses(self.cruelty, mercy_active(state))
+        return ctx, kills_left
+
+    async def _run(self, msg: dict, send: Send) -> None:
+        key, rid, kind = str(msg["key"]), int(msg["id"]), msg["kind"]
+        state, ctx = msg.get("state") or {}, msg.get("ctx") or {}
+        brief, waited = await self._await_plans(state)
+        if waited >= 50:
+            log.info("%-11s %-14s waited %dms for the floor brief (%s)", kind, key, waited, brief)
+        if brief in ("cancelled", "moved"):
+            # Answering would be written with no campaign, and the game re-asks under the new one.
+            self._record(kind, "superseded", ms=waited, key=key, req_id=rid, reason=brief)
+            self.stats[kind]["superseded"] += 1
+            return
+        prev = self.memory.previous(key)
+        asked_ctx = ctx                           # before the previous answer is mixed in: this is what the gate diffs
+        ctx, kills_left = self._request_ctx(kind, key, state, ctx)
         deadline = max(MIN_DEADLINE_S, min(MAX_DEADLINE_S, float(msg.get("deadline_ms", 4000)) / 1000))
         digest = self.memory.digest(exclude=key, in_flight=self._in_flight(key))
         # What the receipt keeps of the request: the user message is exactly these, as JSON.
@@ -552,10 +626,7 @@ class Coordinator:
                     raw, late = await self._decide(kind, key, state, ctx, digest, deadline, t0)
             usage = raw.pop("_usage", None)
             call = raw.pop("_call", None)
-            # Trimmed against the economy as it is now, and committed in the same step below: no other
-            # answer can land in between, so the first to finish takes the last coin.
-            budget = self.memory.economy.budget(key, kind, ctx)
-            decision = clamp(kind, raw, state, ctx, self.cruelty, self.memory.counters, budget)
+            decision, budget = self._clamp(kind, key, raw, state, ctx)
         except asyncio.CancelledError:
             # Superseded; the newer request will answer. A call already in flight may still be billed.
             self._record(kind, "superseded", ms=_ms(t0), **rec)
@@ -580,68 +651,103 @@ class Coordinator:
                          llm=getattr(e, "call", None) or call, raw=raw or None, **rec)
             await send({**base, "ok": False, "reason": type(e).__name__})
             return
-        ms = _ms(t0)
-        local = kills_left == 0
+        await self._issue(kind, key, rid, decision, budget, send, state=state, ctx=ctx, asked_ctx=asked_ctx,
+                          digest=digest, rec=rec, raw=raw, call=call, usage=usage, ms=_ms(t0), late=late,
+                          local=kills_left == 0, campaign=campaign)
+
+    def _clamp(self, kind: str, key: str, raw: dict, state: dict, ctx: dict):
+        """(the legal answer, its budget). Trimmed against the economy as it is now, and committed in the same
+        step by _issue: no other answer can land in between, so the first to finish takes the last coin."""
+        budget = self.memory.economy.budget(key, kind, ctx)
+        return clamp(kind, raw, state, ctx, self.cruelty, self.memory.counters, budget), budget
+
+    async def _issue(self, kind: str, key: str, rid: int, decision: dict, budget, send: Send, *, state: dict,
+                     ctx: dict, asked_ctx: dict, digest: dict, rec: dict, raw: dict, call: dict | None,
+                     usage: dict | None, ms: int, late: bool = False, local: bool = False, campaign: str = "",
+                     push: bool = False, turn: int | None = None) -> None:
+        """Commit a clamped answer and send it to the game: as the answer to request `rid`, or (push) as an
+        unasked rewrite of an open deck. `usage` is counted here only when this answer paid for its own call."""
         self.stats[kind]["ok"] += 1
         if local:
             self.stats[kind]["local"] += 1
         if late:
             self.stats[kind]["late"] += 1
+        if push:
+            self.stats[kind]["pushed"] += 1
         old_seq = self.receipt_seq.get(key)
         if self.memory.note_issued(key, kind, decision, ctx, rid):
             self.stats[kind]["replaced"] += 1    # paid for an answer the game never used
             self.receipt.update(old_seq, "replaced")
         self.receipt_seq[key] = self.answer_seq[(key, rid)] = self._record(
             kind, "ok", ms=ms, llm=call, raw=raw, decision=decision, **({"late": True} if late else {}),
-            **({"local": "kill drops spent"} if local else {}), **rec)
+            **({"local": "kill drops spent"} if local else {}), **({"push": True} if push else {}),
+            **({"turn": turn} if turn is not None else {}), **rec)
         self.last_req[key] = {"state": state, "ctx": asked_ctx, "events": digest["recent_events"],
                               "campaign": campaign}
         tok = ""
         if usage:
             self.usage.update({**usage, "calls": 1})
             tok = f'  [{usage["in"]}/{usage["cached"]}c/{usage["out"]} tok]'
-        log.info("%-11s %-14s %5dms%s%s  %s%s", kind, key, ms, " LATE" if late else (" LOCAL" if local else ""), tok,
+        log.info("%-11s %-14s %5dms%s%s  %s%s", kind, key, ms,
+                 " LATE" if late else (" LOCAL" if local else (" PUSH" if push else "")), tok,
                  decision.get("intent", ""),
                  f'  "{decision["taunt"]}"' if decision.get("taunt") else "")
         if sum(c["ok"] for c in self.stats.values()) % 25 == 0:
             self.summary()
         if decision.get("guardrails"):
             log.info("%28s guardrails: %s", "", "; ".join(decision["guardrails"]))
-        await send({**base, "ok": True, "ms": ms, "decision": decision})
+        res = {"t": "res", "session": self.session, "id": rid, "key": key, "kind": kind, "ok": True, "ms": ms,
+               "decision": decision}
+        if push:                                  # the game didn't ask: these draws are already accounted for
+            res.update(push=True, drawn_base=self.memory.drawn_total.get(key, 0))
+        await send(res)
         if budget.trimmed and key not in self.trim_stale:
             # Lost a race for the budget: its deck may now be a worse story. One re-ask, which sees the
             # winner in your_open_decks (and the gate drops it if nothing meaningful changed).
             self.trim_stale.add(key)
-            await self._send_quietly(send, {"t": "stale", "session": self.session, "keys": [key],
-                                            "why": "trimmed to the budget"})
+            await self._restack(send, [key], "trimmed to the budget")
+
+    async def _restack(self, send: Send, keys: list[str], why: str) -> None:
+        """These decks' unused entries are out of date. The game re-asks them (`stale`); in agent mode the
+        agent is woken to restack them itself."""
+        if not keys:
+            return
+        if self.agent is not None:
+            self._flag(keys, why, send)
+            return
+        await self._send_quietly(send, {"t": "stale", "session": self.session, "keys": keys, "why": why})
 
     def _cooldown_left(self) -> float:
-        """Seconds until the DM's model may be called again after a 429 (0: it may now)."""
-        cooldown = getattr(self.dm, "cooldown", None)
+        """Seconds until the deck writer's model may be called again after a 429 (0: it may now)."""
+        cooldown = getattr(self.decider, "cooldown", None)
         return cooldown.remaining() if cooldown else 0.0
 
-    def _in_flight(self, key: str) -> list[tuple[str, str]]:
+    def _in_flight(self, key: str | None) -> list[tuple[str, str]]:
         """Decisions being made right now (no answer yet), other than `key`."""
         out = []
-        for k, (_rid, task) in self.inflight.items():
+        for k, (_rid, task) in itertools.chain(self.inflight.items(), self.agent_inflight.items()):
             if k != key and not task.done():
                 out.append((k, self.inflight_kind.get(k, "?")))
         return out
 
     async def _decide(self, kind: str, key: str, state: dict, ctx: dict, digest: dict, deadline: float,
                       t0: float) -> tuple[dict, bool]:
-        """(raw answer, whether it came after the deadline). With a late grace, a call past its deadline
+        """(raw answer, whether it came after the deadline)."""
+        return await self._within(self.dm.decide(kind, state, ctx, digest), deadline, f"{kind:<11} {key:<14}", t0)
+
+    async def _within(self, coro, deadline: float, label: str, t0: float):
+        """(the call's result, whether it came after the deadline). With a late grace, a call past its deadline
         keeps running and is delivered when it lands: the game holds the key as pending meanwhile (so it
         doesn't re-ask) and takes a late result whenever it arrives. Without one, the deadline is final."""
-        call = asyncio.ensure_future(self.dm.decide(kind, state, ctx, digest))
+        call = asyncio.ensure_future(coro)
         try:
             try:
                 return await asyncio.wait_for(asyncio.shield(call), deadline), False
             except asyncio.TimeoutError:
                 if not self.late_grace_s:
                     raise
-            log.info("%-11s %-14s past its %.0fms deadline after %.0fms -> still waiting (up to %.0fs)",
-                     kind, key, deadline * 1000, _ms(t0), self.late_grace_s)
+            log.info("%s past its %.0fms deadline after %.0fms -> still waiting (up to %.0fs)",
+                     label, deadline * 1000, _ms(t0), self.late_grace_s)
             return await asyncio.wait_for(asyncio.shield(call), self.late_grace_s), True
         finally:
             if not call.done():
@@ -686,6 +792,323 @@ class Coordinator:
         self._record("gate", "reused", ms=_ms(t0), llm=call, key=key, result=why)
         log.info("%-11s %-14s gate: keep (%s) -> reused answer, %d change(s) ignored", kind, key, why, len(changes))
         return True
+
+
+    # ------------------------------------------------------------------ agent mode
+    def _queue_agent(self, msg: dict, send: Send) -> None:
+        """The request waits for the next agent turn; a newer one for the same key replaces it."""
+        key, rid, kind = str(msg["key"]), int(msg["id"]), msg["kind"]
+        self.agent_send = send
+        old = self.agent_queue.get(key)
+        if old and int(old["id"]) >= rid:
+            return
+        if old:
+            self.stats[kind]["superseded"] += 1
+            log.debug("%-11s %-14s superseded by a fresher request", kind, key)
+        self.agent_queue[key] = msg
+        self.agent_flags.pop(key, None)           # the request is its restack
+        urgent = _priority(kind, msg.get("ctx") or {}) == URGENT
+        self._kick_agent(send, 0.0 if urgent else AGENT_BATCH_S)
+
+    def _flag(self, keys: list[str], why: str, send: Send) -> None:
+        """Open decks gone out of date with no request behind them: the agent is woken to restack them. Each
+        answer is flagged once, so a restack that loses a budget race again is left as it is."""
+        self.agent_send = send
+        for k in keys:
+            entry = self.memory.issued.get(k)
+            if entry is None or k not in self.last_req or k in self.agent_queue \
+                    or self.agent_flagged.get(k) == entry["at"]:
+                continue
+            self.agent_flagged[k] = entry["at"]
+            self.agent_flags[k] = why
+        if self.agent_flags:
+            self._kick_agent(send, AGENT_FLAG_WAIT_S)
+
+    def _kick_agent(self, send: Send, delay: float) -> None:
+        """Start a turn after `delay`, so a burst of requests shares one. A turn already coming takes this one
+        too, unless this can't wait."""
+        t = self.agent_timer
+        if t is not None and not t.done():
+            if delay > 0:
+                return
+            t.cancel()
+        self.agent_timer = asyncio.create_task(self._agent_dispatch(send, delay))
+
+    async def _agent_dispatch(self, send: Send, delay: float) -> None:
+        """Start turns for everything waiting: the most urgent requests first, AGENT_MAX_KEYS to a turn. The
+        DM slots (self.sem) cap how many run at once."""
+        if delay:
+            await asyncio.sleep(delay)
+        while self.agent_queue or self.agent_flags:
+            queued = sorted(self.agent_queue.values(),
+                            key=lambda m: (_priority(m["kind"], m.get("ctx") or {}), int(m["id"])))
+            asks = queued[:AGENT_MAX_KEYS]
+            for m in asks:
+                self.agent_queue.pop(str(m["key"]), None)
+            flags, self.agent_flags = self.agent_flags, {}
+            task = asyncio.create_task(self._agent_turn(asks, flags, send))
+            self.agent_turns.add(task)
+            task.add_done_callback(self.agent_turns.discard)
+            for m in asks:
+                key, rid = str(m["key"]), int(m["id"])
+                self.agent_inflight[key] = (rid, task)
+                self.inflight_kind[key] = m["kind"]
+                task.add_done_callback(lambda _t, k=key, r=rid: self._agent_cleanup(k, r))
+
+    def _agent_cleanup(self, key: str, rid: int) -> None:
+        cur = self.agent_inflight.get(key)
+        if cur and cur[0] == rid:
+            self.agent_inflight.pop(key, None)
+
+    def _cancel_agent(self) -> None:
+        """A new run, or the run is over: nothing waiting for or being decided by the agent can be used."""
+        if self.agent_timer is not None:
+            self.agent_timer.cancel()
+        for task in list(self.agent_turns):
+            task.cancel()
+        self.agent_queue.clear()
+        self.agent_flags.clear()
+        self.agent_flagged.clear()
+        self.agent_inflight.clear()
+
+    def _open_deck(self, key: str, why: str | None) -> dict:
+        """An open deck as the agent sees it: what is left, what it was for, and what it was written against."""
+        e = self.memory.issued[key]
+        d = e["decision"]
+        ctx = {k: v for k, v in self.last_req[key]["ctx"].items() if k not in _OPEN_CTX_HIDDEN}
+        return {"key": key, "kind": e["kind"], "left": list(e["left"]), "drawn": self.memory.drawn_total.get(key, 0),
+                "intent": d.get("intent", ""), **({"scheme": d["scheme"]} if d.get("scheme") else {}),
+                "age_s": round(time.monotonic() - e["at"]), **({"restack": why} if why else {}), "context": ctx}
+
+    async def _agent_turn(self, asks: list[dict], flags: dict[str, str], send: Send) -> None:
+        """One agent call: every request in `asks` answered, and any open deck restacked, in one response."""
+        newest = max(asks, key=lambda m: int(m["id"])) if asks else None
+        state = (newest.get("state") if newest else None) or self.last_state
+        brief, waited = await self._await_plans(state)
+        if brief in ("cancelled", "moved"):
+            for m in asks:
+                self.stats[m["kind"]]["superseded"] += 1
+                self._record(m["kind"], "superseded", ms=waited, key=str(m["key"]), req_id=int(m["id"]), reason=brief)
+            return
+        t0 = time.perf_counter()
+        pending: dict[str, dict] = {}
+        spent: list[dict] = []
+        for m in asks:
+            key, kind, asked_ctx = str(m["key"]), m["kind"], m.get("ctx") or {}
+            st = m.get("state") or {}
+            ctx, kills_left = self._request_ctx(kind, key, st, asked_ctx)
+            p = {"key": key, "rid": int(m["id"]), "kind": kind, "state": st, "ctx": ctx, "asked_ctx": asked_ctx,
+                 "deadline_ms": m.get("deadline_ms", 4000)}
+            if kills_left == 0:
+                spent.append(p)
+            else:
+                pending[key] = p
+        digest = self.memory.digest(in_flight=[(k, kd) for k, kd in self._in_flight(None) if k not in pending])
+        for p in spent:                           # this floor's kill drops are spent: no call needed for these
+            raw = _spent_drops(p["ctx"])
+            decision, budget = self._clamp(p["kind"], p["key"], raw, p["state"], p["ctx"])
+            await self._issue(p["kind"], p["key"], p["rid"], decision, budget, send, state=p["state"], ctx=p["ctx"],
+                              asked_ctx=p["asked_ctx"], digest=digest, raw=raw, call=None, usage=None, ms=_ms(t0),
+                              local=True, rec={"key": p["key"], "req_id": p["rid"],
+                                               "request": {"state": p["state"], "ctx": p["ctx"]}})
+        # The open decks it may restack: none being decided elsewhere or waiting for a request of their own.
+        me = asyncio.current_task()
+        busy = set(self.agent_queue) | {k for k, (_r, t) in itertools.chain(self.inflight.items(),
+                                                                            self.agent_inflight.items())
+                                        if t is not me and not t.done()}
+        open_keys = [k for k, e in reversed(list(self.memory.issued.items()))
+                     if k not in pending and k not in busy and k in self.last_req and e["left"]
+                     and e["kind"] in AGENT_RESTACK_KINDS]
+        open_keys.sort(key=lambda k: k not in flags)    # flagged first, then newest
+        open_keys = open_keys[:AGENT_OPEN_DECKS]
+        if not pending and not any(k in flags for k in open_keys):
+            return                                # the flagged decks were used up or asked for meanwhile
+        trigger = "; ".join([f'{k} asked ({p["asked_ctx"].get("reason") or "no reason given"})'
+                             for k, p in pending.items()]
+                            + [f"{k} needs a restack ({w})" for k, w in flags.items() if k in open_keys])
+        turn = {"trigger": trigger,
+                "pending": [{"key": k, "kind": p["kind"], "context": _turn_ctx(p["ctx"])} for k, p in pending.items()],
+                "open_decks": [self._open_deck(k, flags.get(k)) for k in open_keys],
+                "state": state, "economy": self.memory.economy.view(None),
+                "memory": {k: v for k, v in digest.items() if k != "your_open_decks"}}
+        deadline = max(MIN_DEADLINE_S, min(MAX_DEADLINE_S, max(float(p["deadline_ms"]) for p in pending.values()) / 1000)) \
+            if pending else MAX_DEADLINE_S
+        priority = min((_priority(p["kind"], p["asked_ctx"]) for p in pending.values()), default=BACKGROUND)
+        rec = {"trigger": trigger, "keys": list(pending), "open_decks": open_keys, "deadline_ms": int(deadline * 1000),
+               **({"brief_wait_ms": waited} if waited >= 50 else {}), "request": turn}
+        a = self.stats["agent"]
+        a["req"] += 1
+        call = None
+        try:
+            wait = self._cooldown_left()
+            if wait:
+                if wait >= deadline:
+                    await asyncio.sleep(deadline)
+                    raise CoolingDown(self._cooldown_left())
+                log.info("%-11s %-14s rate-limited: holding %.1fs for the cooldown", "agent", "turn", wait)
+                await asyncio.sleep(wait)
+            async with self.sem.slot(priority):
+                agent = self.agent
+                if agent is None:                 # agent mode was switched off while this waited
+                    for p in pending.values():
+                        self._spawn_run({"t": "req", "id": p["rid"], "key": p["key"], "kind": p["kind"],
+                                         "deadline_ms": p["deadline_ms"], "state": p["state"], "ctx": p["asked_ctx"]},
+                                        send)
+                    return
+                campaign = getattr(agent, "campaign", "")
+                (calls, call), late = await self._within(agent.act(build_turn_message(turn)), deadline,
+                                                         f"{'agent':<11} {'turn':<14}", t0)
+        except asyncio.CancelledError:
+            for p in pending.values():
+                self.stats[p["kind"]]["superseded"] += 1
+            self._record("agent", "superseded", ms=_ms(t0), **rec)
+            return
+        except Exception as e:                    # noqa: BLE001 - never crash the bridge (cooldown and timeout too)
+            await self._agent_failed(e, pending, rec, t0, call, send)
+            return
+        ms = _ms(t0)
+        usage = (call or {}).get("usage")
+        tok = ""
+        if usage:                                 # one call, however many decks it wrote
+            self.usage.update({**usage, "calls": 1})
+            tok = f'  [{usage["in"]}/{usage["cached"]}c/{usage["out"]} tok]'
+        a["turn"] += 1
+        a["calls"] += len(calls)
+        if late:
+            a["late"] += 1
+        summary = ", ".join(f'{c.get("tool")}({(c.get("args") or {}).get("key")})' for c in calls) or "no calls"
+        turn_seq = self._record("agent", "turn", ms=ms, llm=call, result=summary, **({"late": True} if late else {}),
+                                calls=[{"tool": c.get("tool"), "key": (c.get("args") or {}).get("key")} for c in calls],
+                                **rec)
+        log.info("%-11s %-14s %5dms%s%s  %d call(s): %s", "agent", "turn", ms, " LATE" if late else "", tok, len(calls),
+                 summary)
+        answered: set[str] = set()
+        for c in calls:
+            why = await self._agent_call(c, pending, set(open_keys), answered, state, digest, campaign, turn_seq, ms,
+                                         late, send)
+            if why:
+                key = str((c.get("args") or {}).get("key"))
+                a["rejected"] += 1
+                self._record("agent", "rejected", key=key, tool=c.get("tool"), turn=turn_seq, result=why)
+                log.info("%-11s %-14s rejected %s: %s", "agent", key, c.get("tool"), why)
+        for key, p in pending.items():
+            if key not in answered:
+                a["skipped"] += 1
+                self.stats[p["kind"]]["skipped"] += 1
+                self._record(p["kind"], "skipped", key=key, req_id=p["rid"], turn=turn_seq,
+                             result="the agent didn't decide it")
+                log.info("%-11s %-14s skipped by the agent -> the game re-asks if it is waiting", p["kind"], key)
+                await self._send_quietly(send, {"t": "res", "session": self.session, "id": p["rid"], "key": key,
+                                                "kind": p["kind"], "ok": False, "reason": "agent_skipped"})
+
+    async def _agent_failed(self, e: BaseException, pending: dict[str, dict], rec: dict, t0: float, call,
+                            send: Send) -> None:
+        """The turn's call failed: every request it held is answered "no decision", as _run answers one."""
+        a = self.stats["agent"]
+        if isinstance(e, CoolingDown):
+            status, reason = "cooldown", "cooldown"
+            log.info("%-11s %-14s not sent: %s", "agent", "turn", e)
+            self._record("agent", "cooldown", ms=_ms(t0), result=str(e), **rec)
+        elif isinstance(e, asyncio.TimeoutError):
+            status, reason = "timeout", "timeout"
+            log.warning("%-11s %-14s TIMEOUT after %.0fms -> the game re-asks if it is waiting", "agent", "turn", _ms(t0))
+            self._record("agent", "timeout", ms=_ms(t0), **rec)
+        else:
+            status, reason = "error", type(e).__name__
+            log.error("%-11s %-14s failed: %s", "agent", "turn", error_line(e), exc_info=e)
+            self._record("agent", "error", ms=_ms(t0), **error_fields(e), llm=getattr(e, "call", None) or call, **rec)
+        a[status] += 1
+        for key, p in pending.items():
+            self.stats[p["kind"]][status] += 1
+            res = {"t": "res", "session": self.session, "id": p["rid"], "key": key, "kind": p["kind"], "ok": False,
+                   "reason": reason}
+            if isinstance(e, CoolingDown):
+                res["retry_ms"] = int(e.retry_in * 1000)
+            await self._send_quietly(send, res)
+
+    async def _agent_call(self, c: dict, pending: dict[str, dict], open_keys: set[str], answered: set[str],
+                          state: dict, digest: dict, campaign: str, turn_seq: int, ms: int, late: bool,
+                          send: Send) -> str | None:
+        """Apply one of the turn's tool calls, in order. None when it was applied, else why it wasn't."""
+        tool, args = str(c.get("tool")), dict(c.get("args") or {})
+        key = str(args.pop("key", "") or "")
+        if key in answered:
+            return "this deck was already decided this turn"
+        p = pending.get(key)
+        if p is not None:
+            kind, rid, st, ctx, asked_ctx, push = p["kind"], p["rid"], p["state"], p["ctx"], p["asked_ctx"], False
+        elif key in open_keys and key in self.memory.issued and key in self.last_req:
+            entry = self.memory.issued[key]
+            kind, rid, st, push = entry["kind"], 0, state, True
+            asked_ctx = {**self.last_req[key]["ctx"], "reason": "restacked by the agent"}
+            if kind in DECK_FIELD:                # a restack replaces what is left: as many entries
+                asked_ctx.update(wanted=max(1, len(entry["left"])), deck_left=list(entry["left"]))
+            ctx, _kills_left = self._request_ctx(kind, key, st, asked_ctx)
+        else:
+            return "not a pending request or an open deck"
+        a = self.stats["agent"]
+        if tool == KEEP:
+            if push:
+                return "keep_deck is for pending requests (an open deck is kept by leaving it alone)"
+            prev = self.memory.previous(key)
+            if not prev:
+                return "there is no deck to keep"
+            # The same deck answers this request: what is left of it, and how many draws that already accounts for.
+            self.memory.reissue(key, rid)
+            seq = self.receipt_seq.get(key, self.used_seq.get(key))
+            if seq is not None:
+                self.answer_seq[(key, rid)] = seq
+            self.stats[kind]["reused"] += 1
+            a["keep"] += 1
+            self._record("agent", "kept", key=key, req_id=rid, turn=turn_seq, result=str(args.get("why") or ""))
+            log.info("%-11s %-14s kept by the agent (%s)", kind, key, args.get("why") or "no reason given")
+            await send({"t": "res", "session": self.session, "id": rid, "key": key, "kind": kind, "ok": True, "ms": ms,
+                        "decision": prev, "drawn_base": self.memory.drawn_total.get(key, 0)})
+            answered.add(key)
+            return None
+        if tool == SHUFFLE:
+            prev, field = self.memory.previous(key), DECK_FIELD.get(kind)
+            if not prev or not field or not prev.get(field):
+                return f"a {kind} deck has nothing to shuffle"
+            raw = _compact(prev)
+            items = list(raw.get(field) or [])
+            raw[field] = [items[i] for i in shuffle_order(args.get("order"), len(items))]
+            if isinstance(args.get("taunt"), str):
+                raw["taunt"] = args["taunt"]
+            action = "shuffle"
+        elif stack_kind(tool) == kind:
+            raw, action = args, "stack"
+        elif stack_kind(tool):
+            return f"{tool} can't write {key}, a {kind} deck"
+        else:
+            return f"unknown tool {tool!r}"
+        try:
+            decision, budget = self._clamp(kind, key, raw, st, ctx)
+        except Exception as e:                    # noqa: BLE001 - one bad call doesn't sink the turn
+            return f"its answer couldn't be made legal ({type(e).__name__}: {e})"
+        a[action] += 1
+        if push:
+            self.push_id -= 1
+            rid = self.push_id
+            a["pushed"] += 1
+        await self._issue(kind, key, rid, decision, budget, send, state=st, ctx=ctx, asked_ctx=asked_ctx,
+                          digest=digest, rec={"key": key, "req_id": rid, "request": {"state": st, "ctx": ctx}},
+                          raw=raw, call=None, usage=None, ms=ms, late=late, campaign=campaign, push=push, turn=turn_seq)
+        answered.add(key)
+        return None
+
+
+# What an open deck's stored ctx shows the agent: not the live deck (`left` has that), nor the economy (the turn's).
+_OPEN_CTX_HIDDEN = ("deck_left", "drawn_so_far", "economy", "your_previous_answer", "owed", "reason")
+
+
+def _turn_ctx(ctx: dict) -> dict:
+    """A pending request's ctx in a turn: the economy is the turn's, once; its kill drops note stays."""
+    out = {k: v for k, v in ctx.items() if k != "economy"}
+    kill_drops = (ctx.get("economy") or {}).get("kill_drops")
+    if kill_drops:
+        out["kill_drops"] = kill_drops
+    return out
 
 
 async def _close_later(models: list, after_s: float = 60.0) -> None:
@@ -748,10 +1171,14 @@ class Engine:
     concurrency: int = 6
     late_grace: float = 0.0
     label: str = ""
+    agent: object = None          # agent mode: writes every deck (the DM only writes the epitaph)
 
     def describe(self) -> None:
-        log.info("Dungeon Master: %s", self.label)
-        if self.gate:
+        log.info("Dungeon Master: %s%s", self.label, "  [agent mode: one call stacks every deck it needs]"
+                 if self.agent is not None else "")
+        if self.agent is not None:
+            log.info("Re-ask gate: not used in agent mode (the agent keeps decks itself)")
+        elif self.gate:
             log.info("Re-ask gate: %s", self.gate.model)
         else:
             log.info("Re-ask gate: off, every re-ask goes to the DM")
@@ -763,13 +1190,15 @@ def build_dm(backend: str, api_key: str, *, cruelty: int, model: str | None = No
              narrative_model: str | None = None, floor_model: str | None = None, planner_backend: str | None = None,
              gate_model: str = GATE_DEFAULT_MODEL, gate_threshold: float = GATE_THRESHOLD, no_gate: bool = False,
              no_planners: bool = False, claude_bin: str | None = None, google_key: str = "",
-             mock_latency: tuple[float, float] = (0.25, 1.2)) -> Engine:
+             mock_latency: tuple[float, float] = (0.25, 1.2), agent: bool = False) -> Engine:
     """The DM, planners and gate for a backend: "openrouter", "google", "claude-code" or "mock". The planners can run
-    on another backend than the DM (planner_backend, default the DM's).
+    on another backend than the DM (planner_backend, default the DM's). agent: agent mode, an agent on the DM's
+    backend and model writes the decks, and there is no gate.
     ValueError, with a message for the player, when it can't be set up."""
     if backend == "mock":
         return Engine(MockDM(cruelty, latency=mock_latency), None if no_planners else MockPlanner(),
-                      None if no_gate else MockGate(), label="MOCK (offline)")
+                      None if no_gate or agent else MockGate(), label="MOCK (offline)",
+                      agent=MockAgent(cruelty, latency=mock_latency) if agent else None)
     planner_backend = planner_backend or backend
     used = (backend, None if no_planners else planner_backend)
     if not api_key and "openrouter" in used:
@@ -778,16 +1207,20 @@ def build_dm(backend: str, api_key: str, *, cruelty: int, model: str | None = No
         raise ValueError("No Google AI Studio API key: add one in Settings.")
     try:
         dm, model = _make_dm(backend, model, cruelty, api_key, claude_bin, google_key)
+        deck_agent = _make_agent(backend, model, cruelty, api_key, claude_bin, google_key) if agent else None
+        if deck_agent is not None and hasattr(dm, "cooldown"):
+            deck_agent.cooldown = dm.cooldown     # one model, one rate limit
         planner = None if no_planners else _make_planner(planner_backend, narrative_model, floor_model, api_key,
                                                          claude_bin, google_key)
     except SystemExit as e:                       # find_claude's message, for the CLI
         raise ValueError(str(e)) from None
     # The gate isn't a Claude model: it stays on OpenRouter, when there's a key for it.
-    gate = OpenRouterGate(gate_model, gate_threshold, api_key=api_key) if api_key and not no_gate else None
+    gate = OpenRouterGate(gate_model, gate_threshold, api_key=api_key) if api_key and not no_gate and not agent else None
     if backend == "claude-code":
         return Engine(dm, planner, gate, CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_LATE_GRACE_S,
-                      f"{model} via Claude Code ({dm.runner.bin})")
-    return Engine(dm, planner, gate, label=f"{model} via {'Google AI Studio' if backend == 'google' else 'OpenRouter'}")
+                      f"{model} via Claude Code ({dm.runner.bin})", agent=deck_agent)
+    return Engine(dm, planner, gate, label=f"{model} via {'Google AI Studio' if backend == 'google' else 'OpenRouter'}",
+                  agent=deck_agent)
 
 
 def _make_dm(backend: str, model: str | None, cruelty: int, api_key: str, claude_bin: str | None,
@@ -800,6 +1233,14 @@ def _make_dm(backend: str, model: str | None, cruelty: int, api_key: str, claude
         return OpenRouterDM(cruelty, model=model, api_key=google_key, google=True), model
     model = model or OPENROUTER_DEFAULT_MODEL
     return OpenRouterDM(cruelty, model=model, api_key=api_key), model
+
+
+def _make_agent(backend: str, model: str, cruelty: int, api_key: str, claude_bin: str | None, google_key: str = ""):
+    if backend == "claude-code":
+        return ClaudeCodeAgent(cruelty, model=model, claude_bin=claude_bin)
+    if backend == "google":
+        return OpenRouterAgent(cruelty, model=model, api_key=google_key, google=True)
+    return OpenRouterAgent(cruelty, model=model, api_key=api_key)
 
 
 def _make_planner(backend: str, narrative_model: str | None, floor_model: str | None, api_key: str,
@@ -837,6 +1278,8 @@ def main() -> None:
                     help="re-ask the DM when the gate's P(new answer needed) is at least this (lower = more re-asks)")
     ap.add_argument("--no-gate", action="store_true", help="always re-ask the DM (no fast gate)")
     ap.add_argument("--no-planners", action="store_true", help="no narrative / floor brief: the DM plays solo")
+    ap.add_argument("--agent", action="store_true", default=os.environ.get("LLMDM_AGENT") == "1",
+                    help="agent mode: each trigger is one call that stacks, shuffles or keeps every deck it needs to")
     ap.add_argument("--cruelty", type=int, default=6, help="0 (generous) .. 10 (merciless)")
     ap.add_argument("--mock", action="store_true", help="use the offline rule-based DM")
     ap.add_argument("--mock-latency", type=float, nargs=2, default=(0.25, 1.2), metavar=("MIN", "MAX"),
@@ -856,14 +1299,15 @@ def main() -> None:
                           google_key=os.environ.get("GOOGLE_API_KEY", ""), cruelty=args.cruelty, model=args.model, narrative_model=args.narrative_model,
                           floor_model=args.floor_model, gate_model=args.gate_model,
                           gate_threshold=args.gate_threshold, no_gate=args.no_gate, no_planners=args.no_planners,
-                          claude_bin=args.claude_bin, mock_latency=tuple(args.mock_latency))
+                          claude_bin=args.claude_bin, mock_latency=tuple(args.mock_latency), agent=args.agent)
     except ValueError as e:
         raise SystemExit(f"{e} Set OPENROUTER_API_KEY, or run with --backend claude-code or --mock.")
     engine.describe()
 
     coord = Coordinator(engine.dm, args.cruelty, engine.planner, max_concurrency=engine.concurrency,
                         receipt=Receipt(None if args.no_receipts else args.receipts),
-                        epitaph=not args.no_epitaph, gate=engine.gate, late_grace_s=engine.late_grace)
+                        epitaph=not args.no_epitaph, gate=engine.gate, late_grace_s=engine.late_grace,
+                        agent=engine.agent)
 
     isaac_dirs = args.isaac_dir or bridge.isaac_installs()
     logs = args.log or bridge.default_logs()

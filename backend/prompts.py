@@ -59,7 +59,33 @@ _ECONOMY = """WHAT PICKUPS ARE REALLY WORTH (vanilla is stingy; generosity is th
   gifts. Two or three pickups from one clear is a jackpot by vanilla standards."""
 
 
-def system_prompt(cruelty: int) -> str:
+AGENT_RULES = """AGENT MODE
+You don't answer one decision at a time here. You run the decks: the engine wakes you when
+something happens (the game asked for decks, or another deck spent a budget) and shows you the
+whole table at once. Each turn's message has:
+- `trigger`: why you were woken.
+- `pending`: decisions the game is asking for right now, each with its `key`, `kind` and the
+  `context` a single decision would get (wanted, deck_left, candidates, owed, your_previous_answer).
+- `open_decks`: every other deck you have written that still has entries left: its `left` (in draw
+  order), intent, scheme and the context it was written with. One flagged `restack` is out of date
+  (another deck spent its budget, or it lost a budget race): restack or shuffle it, or leave it.
+- `state`, `economy` (the whole floor's budget, every deck counted) and `memory`.
+
+Answer with tool calls, as many as the turn needs, all in this one response:
+- stack_<kind>(key, ...): write that deck, exactly as the single decision would. For an open deck
+  it replaces what is `left`: write as many entries as it has left.
+- shuffle_deck(key, order): reorder what is left of a deck without changing it (costs no budget).
+- keep_deck(key): a pending deck that still fits as it is.
+Every key in `pending` gets exactly one call; a pending key you skip is asked again later. Open
+decks are optional: touch one only when the plan or the state gives you a reason (set up a
+punchline across decks, move a reward to where it lands better, undo a deck the budget gutted).
+One call per key per turn. Calls are applied in order against one budget, so write the deck
+that matters most first. Use only keys listed in `pending` or `open_decks`."""
+
+
+def system_prompt(cruelty: int, agent: bool = False) -> str:
+    """The DM's persona and rules. agent: the rules for agent mode instead of one tool call."""
+    closing = AGENT_RULES if agent else "Always answer by calling the provided tool exactly once."
     return f"""You are THE DUNGEON MASTER of a Binding of Isaac run. The game's RNG has been unplugged;
 every "random" event - room-clear drops, which item sits on a pedestal, how a room is
 dressed, what curses a floor carries, which card or trinket turns up, what a pill does -
@@ -162,7 +188,7 @@ keeps those.
 
 {_menus()}
 
-Always answer by calling the provided tool exactly once."""
+{closing}"""
 
 
 _LEVERS = """WHAT THE DUNGEON MASTER CONTROLS (a fast executor model makes each call, seconds before it happens)

@@ -3,7 +3,7 @@
 The same backend as server.py, with a window instead of a console:
   Current run   what the DM is doing this run: its bill, its work, every decision, its plans, its decks
   History       every past run's receipt
-  Settings      OpenRouter / Google AI Studio key or Claude Code, and the models, applied to the running DM straight away
+  Settings      OpenRouter / Google AI Studio key or Claude Code, the models and agent mode, applied to the running DM straight away
   Log           what the console used to show
 
 Settings live in %APPDATA%/LLM Dungeon Master/config.json, the backend's log next to them.
@@ -94,7 +94,7 @@ class DMThread:
     async def _main(self) -> None:
         e = self.engine
         self.coord = Coordinator(e.dm, DEFAULT_CRUELTY, e.planner, max_concurrency=e.concurrency,
-                                 receipt=self.receipt, gate=e.gate, late_grace_s=e.late_grace)
+                                 receipt=self.receipt, gate=e.gate, late_grace_s=e.late_grace, agent=e.agent)
         self.loop, self.task = asyncio.get_running_loop(), asyncio.current_task()
         self.ready.set()
         e.describe()
@@ -595,6 +595,8 @@ class RunView(ttk.Frame):
 def engine_text(engine: Engine) -> str:
     """Who plays the DM, for the header: "DM: <model> via <backend>  |  planners: <model>"."""
     text = "DM: " + engine.label.split(" (")[0]
+    if engine.agent is not None:
+        text += " (agent mode)"
     if engine.planner:
         text += f"  |  planners: {engine.planner.narrative_model}"
     return text
@@ -861,14 +863,15 @@ class App:
 
     # ------------------------------------------------------------ the DM
     def _engine(self, cfg: dict) -> Engine:
+        agent = bool(cfg.get("agent_mode"))
         if self.args.mock:
-            return build_dm("mock", "", cruelty=DEFAULT_CRUELTY)
+            return build_dm("mock", "", cruelty=DEFAULT_CRUELTY, agent=agent)
         dm_backend, dm_model = model_catalog.resolve(cfg, "minor")
         planner_backend, planner_model = model_catalog.resolve(cfg, "major")
         return build_dm(dm_backend, appdata.api_key(cfg), google_key=appdata.google_key(cfg),
                         cruelty=DEFAULT_CRUELTY, model=dm_model,
                         planner_backend=planner_backend, narrative_model=planner_model, floor_model=planner_model,
-                        gate_model=model_catalog.resolve(cfg, "gate")[1])
+                        gate_model=model_catalog.resolve(cfg, "gate")[1], agent=agent)
 
     def start_dm(self, first: bool = False) -> None:
         try:
@@ -1057,6 +1060,18 @@ class App:
         outer.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
 
         ttk.Label(tab, text="AI Settings", style="Header.TLabel").pack(anchor="w", pady=(0, 8))
+
+        box = ttk.LabelFrame(tab, text=" Mode ", padding=(14, 10))
+        box.pack(fill="x", pady=(0, 14))
+        self.agent_var = tk.BooleanVar(value=bool(self.cfg.get("agent_mode")))
+        ttk.Checkbutton(box, text="Agent mode", variable=self.agent_var, style="Switch.TCheckbutton",
+                        command=lambda: self.settings_msg.configure(text="Press Save and apply to use it.",
+                                                                    foreground=MUTED)).pack(anchor="w")
+        ttk.Label(box, text="On: each time something happens, one DM call sees every deck and stacks, shuffles or "
+                            "keeps as many as it needs to.\n"
+                            "Off: one DM call per deck, as the game asks for it. Uses the DM model below; "
+                            "the re-ask gate isn't used in agent mode.",
+                  foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
 
         box = ttk.LabelFrame(tab, text=" Models ", padding=(14, 10))
         box.pack(fill="x")
@@ -1260,7 +1275,7 @@ class App:
     def save_settings(self) -> None:
         cfg = {"openrouter_api_key": self.key_var.get().strip(),
                "google_api_key": self.google_key_var.get().strip(), "use_claude_code": self.cc_var.get(),
-               "spoiler_mode": self.spoiler_var.get(),
+               "spoiler_mode": self.spoiler_var.get(), "agent_mode": self.agent_var.get(),
                **{f"{role}_model": pick for role, pick in self.model_picks.items()}}
         try:
             engine = self._engine(cfg)

@@ -28,7 +28,7 @@ log = logging.getLogger("llmdm")
 
 # Must match PROTO in mod/llm_dungeon_master/dm/bridge.lua. Bump both when a message changes shape.
 # 2: decks (`drawn` per draw, `abandon`, the backend's `stale` push), cards/trinkets/pills/drops kinds.
-PROTO = 2
+PROTO = 3                  # 3: pushed decks (agent mode)
 
 LINE_RE = re.compile(rb"\[LLMDM:(\d+):(\d+)/(\d+)\](.*)")
 MAX_OUTBOX = 300            # unacked messages kept for the mod; the oldest go first if the game is gone

@@ -201,11 +201,11 @@ def test_protocol():
             w = m.recv(lambda x: x["t"] == "welcome")
             assert w == {"t": "welcome", "session": "OLD", "proto": PROTO}, "mismatch: just the backend's protocol"
             # A mod from before decks (PROTO 1: no `drawn`, one consumables plan) is told so, and not served.
-            assert PROTO == 2
+            assert PROTO == 3
             m.save_own({"link": "OLD1", "cruelty": 9})
             m.send({"t": "hello", "session": "OLD1", "proto": 1, "run": "R", "new_run": True})
             w = m.recv(lambda x: x["t"] == "welcome" and x["session"] == "OLD1")
-            assert w == {"t": "welcome", "session": "OLD1", "proto": 2}
+            assert w == {"t": "welcome", "session": "OLD1", "proto": PROTO}
 
             m.save_own({"link": "S", "cruelty": 9, "pills": {"3": "x"}})
             m.send({"t": "hello", "session": "S", "proto": PROTO, "run": "R", "new_run": True, "cruelty": 9})
@@ -247,6 +247,29 @@ def test_protocol():
             print("  protocol ok: mismatch, chunking, superseding, timeout, mod saves, acks")
         finally:
             stop(srv)
+
+
+def test_agent_mode_answers_a_burst_through_the_link():
+    """server.py --mock --agent: a burst of requests is one agent turn, every one answered."""
+    with tempfile.TemporaryDirectory() as d:
+        game = fake_game(d)
+        srv = start_server(game, "--agent", "--mock-latency", "0.1", "0.2")
+        try:
+            m = FakeMod(game)
+            m.save_own({"link": "S"})
+            m.send({"t": "hello", "session": "S", "proto": PROTO, "run": "R", "new_run": True})
+            m.recv(lambda x: x["t"] == "welcome")
+            for rid, key, kind, ctx in [(1, "drops:2", "drops", {"wanted": 3}), (2, "clear:2:85", "room_clear", {}),
+                                        (3, "cards:2", "cards", {"wanted": 3})]:
+                m.send({"t": "req", "id": rid, "key": key, "kind": kind, "deadline_ms": 5000, "state": STATE, "ctx": ctx})
+            got = {}
+            while len(got) < 3:
+                r = m.recv(lambda x: x["t"] == "res" and not x.get("push"))
+                got[r["key"]] = r
+            assert all(r["ok"] for r in got.values()), got
+        finally:
+            out = stop(srv)
+        assert "agent mode" in out and "agent       turn" in out, out
 
 
 def test_log_tail():
