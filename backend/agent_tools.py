@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from schemas import KINDS, TOOLS
+from schemas import KINDS, MAX_DROPS, TOOLS
 
 STACK = "stack_"
 SHUFFLE = "shuffle_deck"
@@ -23,6 +23,9 @@ _KEY = {"type": "string",
 def _stack_tool(kind: str) -> dict[str, Any]:
     t = TOOLS[kind]
     schema = t["input_schema"]
+    if kind == "drops":                           # a turn's drops deck lasts several rooms (context.wanted says how many)
+        props = schema["properties"]
+        schema = {**schema, "properties": {**props, "outcomes": {**props["outcomes"], "maxItems": MAX_DROPS}}}
     return {
         "name": STACK + kind,
         "description": f"Stack the {kind} deck under `key`. {t['description']}",

@@ -292,6 +292,10 @@ def max_curses(cruelty: int, mercy: bool = False) -> int:
     return min(n, 1) if mercy else n
 
 
+# The longest drops deck: an agent turn writes one to last several rooms (the single decision's schema allows 8).
+MAX_DROPS = 16
+
+
 def _wanted(ctx: dict, default: int, cap: int) -> int:
     """How many entries a deck answer may hold: context.wanted, within the schema's maximum."""
     return max(1, min(cap, _int(ctx.get("wanted"), default)))
@@ -429,7 +433,7 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         out["rewards"] = rewards
 
     elif kind == "drops":
-        wanted = _wanted(ctx, 8, 8)
+        wanted = _wanted(ctx, 8, MAX_DROPS)
         left = kill_drops_left(state, cruelty, counters)
         outcomes = []
         for r in (raw.get("outcomes") or [])[:wanted]:

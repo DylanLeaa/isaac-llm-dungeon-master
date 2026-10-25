@@ -17,7 +17,9 @@
 --
 -- In agent mode the backend can also push a deck nobody asked for (`res` with push = true): one turn
 -- restacks any open deck. It takes a local id newer than every request so far, so only a later request's
--- answer replaces it, and its draws are reported under the backend's own id for it (`wire`).
+-- answer replaces it, and its draws are reported under the backend's own id for it (`wire`). The backend says
+-- whether agent mode is on in its welcome (and `mode` when Settings switch it): the streams then ask for every
+-- room's layout and clear at floor start, so the agent writes the floor ahead in a few turns.
 local json = require("json")
 
 local Bridge = {}
@@ -36,6 +38,7 @@ local session
 local welcomed = false
 local seen = false     -- the backend has welcomed us since the game started
 local outdated         -- the backend's protocol, when it isn't ours
+local agentMode = false -- the backend writes the floor ahead (agent mode)
 local nextId = 1
 local pending = {}     -- key -> {id, sentAt, kind, sends}
 local results = {}     -- key -> {id, kind, decision, at, ms}
@@ -80,6 +83,9 @@ function Bridge.status()
 end
 
 function Bridge.ready() return welcomed end
+
+--- The backend is in agent mode: ask for the whole floor up front.
+function Bridge.agentMode() return welcomed and agentMode end
 
 --- The backend has answered since the game started (it may have gone since).
 function Bridge.seen() return seen end
@@ -243,6 +249,7 @@ local function handle(msg)
       return
     end
     outdated, welcomed, seen = nil, true, true
+    agentMode = msg.agent == true
     -- The backend now knows this run; a later hello (the app restarted mid-run) is a continue.
     if runIdForHello then runIdForHello.new_run = false end
     pingAt, nextPing = nil, now() + PING_MS
@@ -260,6 +267,10 @@ local function handle(msg)
   end
   if msg.t == "run_summary" then
     if onSummary then onSummary(msg) end
+    return
+  end
+  if msg.t == "mode" then
+    if msg.session == session then agentMode = msg.agent == true end
     return
   end
   if msg.t == "stale" then

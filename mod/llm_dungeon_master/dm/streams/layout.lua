@@ -3,13 +3,16 @@
 -- A deck of one, keyed by the room, written for its shape, enemies and difficulty. Asked the moment the
 -- player enters a room next to it (the soonest they could walk in is about a second away), and rewritten
 -- if their state changes while they linger (MAX_LAYOUT_SENDS a room). Not in when they walk in: the game
--- is held and the room dressed late. The layout's tinted_rock_loot seeds that room's rock deck.
+-- is held and the room dressed late. The layout's tinted_rock_loot seeds that room's rock deck. In agent mode
+-- every room on the floor is asked at floor start instead, so the agent dresses the floor in a few turns; asking
+-- again from next door then only reaches the agent if the re-ask gate finds the player's state has moved.
 local Layout = {}
 
 local game = Game()
 local D, cfg, Bridge, State, Apply, Decks, Rolls
 
 local roomKeys = {}       -- key -> idx: the neighbours asked about from this room (the loading screen waits on these)
+local floorAsked = -1     -- the floor whose every room was asked at its start (agent mode)
 
 local function curIdx() return game:GetLevel():GetCurrentRoomDesc().SafeGridIndex end
 local function eligible(t) return t == RoomType.ROOM_DEFAULT end
@@ -35,7 +38,7 @@ function Layout.init(deps)
                room_difficulty = desc.Data.Difficulty,
                distance_from_start = State.gridDistance(level:GetStartingRoomIndex(), desc.SafeGridIndex),
                first_room_of_floor = desc.SafeGridIndex == level:GetStartingRoomIndex(),
-               player_is_next_door = curIdx() ~= st.arg }
+               player_is_next_door = reason ~= "floor start" and curIdx() ~= st.arg }
     end,
     wants = function()
       local out = {}
@@ -96,10 +99,27 @@ function Layout.onNewRoom(room)
   end
 end
 
+--- Agent mode: every unvisited room on the floor, once, after the start room's neighbours.
+local function askFloor()
+  local level = game:GetLevel()
+  local rooms, start = level:GetRooms(), level:GetStartingRoomIndex()
+  for i = 0, rooms.Size - 1 do
+    local d = rooms:Get(i)
+    if d and d.Data and d.VisitedCount == 0 and eligible(d.Data.Type) and d.SafeGridIndex ~= start then
+      local st = Decks.get("layout", d.SafeGridIndex)
+      if st.sends == 0 and not Bridge.isPending(st.key) then Decks.request("layout", d.SafeGridIndex, "floor start") end
+    end
+  end
+end
+
 function Layout.update(room)
   if not room.layoutPrefetched and Bridge.ready() then   -- the backend connected after we walked in
     room.layoutPrefetched = true
     prefetch("backend connected")
+  end
+  if cfg.CONTROL_ROOM_LAYOUT and Bridge.agentMode() and floorAsked ~= D.Sched.floor() then
+    floorAsked = D.Sched.floor()
+    askFloor()
   end
 end
 
@@ -108,6 +128,6 @@ function Layout.readyKeys(add)
 end
 
 function Layout.onNewFloor() roomKeys = {} end
-function Layout.resetRun() roomKeys = {} end
+function Layout.resetRun() roomKeys, floorAsked = {}, -1 end
 
 return Layout

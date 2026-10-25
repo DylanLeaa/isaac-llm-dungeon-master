@@ -4,12 +4,22 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 import server  # noqa: E402
 from agent import tool_calls  # noqa: E402
+from bridge import PROTO  # noqa: E402
+from gate import MockGate  # noqa: E402
 from server import Coordinator, Engine, build_dm  # noqa: E402
 
 FLOOR = {"stage": 1, "stage_type": 0, "name": "Basement I", "room_types": {"default": 10}}
+
+
+@pytest.fixture(autouse=True)
+def quick_batches(monkeypatch):
+    """The batch windows, short enough for a test's settle time (a burst still shares one turn)."""
+    monkeypatch.setattr(server, "AGENT_BATCH_S", {server.URGENT: 0.0, server.NEXT_DOOR: 0.05, server.BACKGROUND: 0.1})
 
 
 class NoDM:
@@ -29,8 +39,8 @@ class NoDM:
 class ScriptedAgent:
     """Each turn answers with the next script: a list of calls, or a function of the turn that returns one."""
 
-    def __init__(self, turns):
-        self.turns, self.seen, self.campaign = list(turns), [], ""
+    def __init__(self, turns, delay=0.0):
+        self.turns, self.seen, self.campaign, self.delay = list(turns), [], "", delay
 
     def set_cruelty(self, cruelty):
         pass
@@ -41,6 +51,7 @@ class ScriptedAgent:
     async def act(self, message):
         turn = json.loads(message)
         self.seen.append(turn)
+        await asyncio.sleep(self.delay)
         script = self.turns.pop(0)
         if isinstance(script, Exception):
             raise script
@@ -123,7 +134,7 @@ def test_an_open_deck_is_restacked_unasked_and_its_draws_count_under_the_push():
                         "cause": "enemy_death"}])
     opened = agent.seen[1]["open_decks"]
     assert [d["key"] for d in opened] == ["drops:1"] and opened[0]["left"] == ["nothing", "nothing"]
-    assert opened[0]["drawn"] == 1 and opened[0]["context"]["wanted"] == 3 and "deck_left" not in opened[0]["context"]
+    assert opened[0]["drawn"] == 1 and "context" not in opened[0], "only a deck flagged for a restack carries it"
     push = [m for m in results(sent) if m.get("push")]
     assert len(push) == 1 and push[0]["key"] == "drops:1" and push[0]["id"] == -1 and push[0]["drawn_base"] == 1
     assert [o["reward"] for o in push[0]["decision"]["outcomes"]] == ["bomb", "nothing"]
@@ -249,12 +260,67 @@ def test_switching_agent_mode_off_hands_what_waits_to_the_dm():
 
 def test_the_mock_agent_answers_a_whole_floor_start():
     engine = build_dm("mock", "", cruelty=6, agent=True, mock_latency=(0.01, 0.02))
-    assert engine.agent is not None and engine.gate is None
-    coord = Coordinator(engine.dm, cruelty=6, agent=engine.agent)
+    assert engine.agent is not None and engine.gate is not None, "the gate screens the agent's re-asks too"
+    coord = Coordinator(engine.dm, cruelty=6, agent=engine.agent, gate=engine.gate)
     sent = run(coord, [req(1, "drops:1", "drops", {"wanted": 3}), req(2, "clear:1:85", "room_clear"),
                        req(3, "cards:1", "cards", {"wanted": 4}), 0.3, req(4, "clear:1:86", "room_clear")])
     res = {m["key"]: m for m in results(sent) if not m.get("push")}
     assert set(res) == {"drops:1", "clear:1:85", "cards:1", "clear:1:86"} and all(m["ok"] for m in res.values())
+
+
+def test_a_re_ask_goes_to_the_gate_first_and_only_a_moved_state_wakes_the_agent():
+    agent = ScriptedAgent([[stack("drops", "drops:1", **drops("nothing", "penny"))],
+                           [stack("drops", "drops:1", **drops("key"))]])
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent, gate=MockGate())
+    sent = run(coord, [req(1, "drops:1", "drops", {"wanted": 2}), 0.3,
+                       req(2, "drops:1", "drops", {"wanted": 2}), 0.3,              # nothing changed: kept, no turn
+                       req(3, "drops:1", "drops", {"wanted": 2}, keys=3)])          # a resource moved: the agent
+    res = {m["id"]: m for m in results(sent)}
+    assert res[2]["ok"] and res[2]["drawn_base"] == 0
+    assert [o["reward"] for o in res[2]["decision"]["outcomes"]] == ["nothing", "penny"]
+    assert len(agent.seen) == 2 and agent.seen[1]["pending"][0]["key"] == "drops:1"
+    assert [o["reward"] for o in res[3]["decision"]["outcomes"]] == ["key"]
+    assert coord.stats["gate"]["reask"] == 1 and coord.stats["drops"]["reused"] == 1
+
+
+def test_a_re_ask_made_while_its_deck_is_being_written_waits_for_it_then_meets_the_gate():
+    agent = ScriptedAgent([[stack("drops", "drops:1", **drops("nothing", "penny"))]], delay=0.2)
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent, gate=MockGate())
+    sent = run(coord, [req(1, "drops:1", "drops", {"wanted": 2}), 0.1,
+                       req(2, "drops:1", "drops", {"wanted": 2})], settle=0.5)   # asked again mid-turn
+    assert len(agent.seen) == 1, "no second turn for the same deck"
+    res = {m["id"]: m for m in results(sent)}
+    assert res[1]["ok"] and res[2]["ok"] and res[2]["drawn_base"] == 0
+    assert coord.memory.issued["drops:1"]["rid"] == 2 and coord.stats["drops"]["reused"] == 1
+
+
+def test_a_turn_writes_a_drops_deck_to_last_several_rooms():
+    agent = ScriptedAgent([[stack("drops", "drops:1", **drops(*["nothing"] * 12))]])
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent)
+    sent = run(coord, [req(1, "drops:1", "drops", {"wanted": 3})])
+    assert agent.seen[0]["pending"][0]["context"]["wanted"] == server.AGENT_DROPS_DEPTH
+    assert len(results(sent)[0]["decision"]["outcomes"]) == 12
+
+
+def test_the_game_is_told_when_agent_mode_is_on():
+    dm, agent = NoDM(), ScriptedAgent([])
+    coord = Coordinator(dm, cruelty=6, agent=agent)
+    sent = run(coord, [{"t": "hello", "proto": PROTO, "session": "S", "run": "R"}], settle=0)
+    assert [m for m in sent if m["t"] == "welcome"][0]["agent"] is True
+
+    async def switch_off():
+        coord.reconfigure(Engine(dm))
+        await asyncio.sleep(0.01)
+
+    asyncio.run(switch_off())
+    assert sent[-1] == {"t": "mode", "session": "S", "agent": False}
+
+
+def test_a_floor_start_ask_waits_for_the_rest_of_the_floor():
+    assert server._priority("room_clear", {"reason": "floor start"}) == server.BACKGROUND
+    assert server._priority("room_layout", {"reason": "floor start"}) == server.BACKGROUND
+    assert server._priority("room_clear", {"reason": "eta under lead time"}) == server.URGENT
+    assert server._priority("drops", {"reason": "floor start", "owed": 1}) == server.URGENT
 
 
 def test_tool_calls_drops_the_unreadable_and_keeps_the_rest():

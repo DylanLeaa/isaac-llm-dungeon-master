@@ -1067,10 +1067,9 @@ class App:
         ttk.Checkbutton(box, text="Agent mode", variable=self.agent_var, style="Switch.TCheckbutton",
                         command=lambda: self.settings_msg.configure(text="Press Save and apply to use it.",
                                                                     foreground=MUTED)).pack(anchor="w")
-        ttk.Label(box, text="On: each time something happens, one DM call sees every deck and stacks, shuffles or "
-                            "keeps as many as it needs to.\n"
-                            "Off: one DM call per deck, as the game asks for it. Uses the DM model below; "
-                            "the re-ask gate isn't used in agent mode.",
+        ttk.Label(box, text="On: the DM writes the whole floor ahead in a few calls (every room, pool and deck), "
+                            "then is only called when\nthe re-ask gate finds a deck no longer fits, or one runs out. "
+                            "Off: one DM call per deck, as the game asks for it.\nBoth use the DM and gate models below.",
                   foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
 
         box = ttk.LabelFrame(tab, text=" Models ", padding=(14, 10))

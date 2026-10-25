@@ -13,7 +13,7 @@ from pathlib import Path
 APP_NAME = "LLM Dungeon Master"
 # The model picks: blank = the default for the backend (model_catalog.resolve).
 DEFAULTS = {"openrouter_api_key": "", "google_api_key": "", "use_claude_code": False, "spoiler_mode": False,
-            "major_model": "", "minor_model": "", "gate_model": ""}
+            "major_model": "", "minor_model": "", "gate_model": "", "agent_mode": False}
 
 
 def frozen() -> bool:

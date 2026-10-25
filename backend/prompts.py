@@ -66,10 +66,18 @@ whole table at once. Each turn's message has:
 - `trigger`: why you were woken.
 - `pending`: decisions the game is asking for right now, each with its `key`, `kind` and the
   `context` a single decision would get (wanted, deck_left, candidates, owed, your_previous_answer).
-- `open_decks`: every other deck you have written that still has entries left: its `left` (in draw
-  order), intent, scheme and the context it was written with. One flagged `restack` is out of date
-  (another deck spent its budget, or it lost a budget race): restack or shuffle it, or leave it.
+- `open_decks`: the other decks you have written that still have entries left: their `left` (in
+  draw order), intent and scheme. One flagged `restack` is out of date (another deck spent its
+  budget, or it lost a budget race) and also shows the context it was written with: restack or
+  shuffle it, or leave it.
 - `state`, `economy` (the whole floor's budget, every deck counted) and `memory`.
+
+You are woken rarely, so write ahead. At a floor's start the game asks for every room's layout and
+room-clear reward, every item pool, and the floor's card, trinket and drops decks: write each for the
+room or floor as you see it now (a room-clear reward asked at floor start comes before its fight).
+A drops deck's context.wanted can run to 16: write that many and it lasts several rooms. A request
+for a deck you already wrote only reaches you when a quick check found the player's state moved
+enough to matter.
 
 Answer with tool calls, as many as the turn needs, all in this one response:
 - stack_<kind>(key, ...): write that deck, exactly as the single decision would. For an open deck

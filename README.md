@@ -119,29 +119,38 @@ Requests for the same key supersede each other: the backend cancels the stale Ha
 the mod only replaces a result with one for a newer request. The p90 latency is measured live,
 so the lead time adapts to your connection.
 
-## Agent mode (one call runs every deck)
+## Agent mode (the floor written ahead in a few calls)
 
 Off by default: **Settings → Mode → Agent mode** in the app (saved, applied mid-run by Save and apply), or
 `python server.py --agent`. Only one of the two modes runs at a time. With it on, the DM stops answering one
-deck per call. It is woken by events, and each wake-up is one **turn**
-([backend/server.py](backend/server.py) `_agent_turn`, the models in [backend/agent.py](backend/agent.py)):
-- **Triggers**: the mod's requests, exactly as above. A burst (a floor start, a room entry) waits `AGENT_BATCH_S`
-  to share one turn, up to `AGENT_MAX_KEYS` requests; a deck the game is frozen on and a room clear don't wait.
-  A deck the economy made stale (another deck spent its budget, or it lost a budget race) wakes the agent
-  directly instead of being sent back to the mod as `stale`.
-- **What it sees**: every pending request with its full context, every open deck (what is `left`, its
-  intent, scheme and what it was written against; the stale ones flagged `restack`), the state, the whole
+deck per call. It writes the floor ahead and is woken again only when something no longer fits; each
+wake-up is one **turn** ([backend/server.py](backend/server.py) `_agent_turn`, the models in
+[backend/agent.py](backend/agent.py)):
+- **Floor start**: the backend's welcome (and a `mode` message when Settings switch it) tells the mod agent
+  mode is on, and the mod then asks for every room's layout and room-clear reward at floor start, on top of
+  every item pool and the card, trinket, pill and drops decks. A room-clear reward asked this way is written
+  before its fight; a room found already clear gives its reward back to the budget. A drops deck written by
+  a turn is `AGENT_DROPS_DEPTH` (16) entries long, so it lasts several rooms.
+- **Re-asks go to the gate first**: a request for a deck the agent already wrote (the next-door re-ask, a
+  refresh, a room clear's end-of-fight ask) is screened by the re-ask gate exactly as in classic mode: kept
+  without a call when nothing that matters moved, and only otherwise queued for a turn.
+- **Batching**: a request waits to share a turn, by priority (`AGENT_BATCH_S`): a deck the game is frozen on
+  and a room clear's late ask don't wait, the room next door waits 0.25s, a floor start's burst 1s; up to
+  `AGENT_MAX_KEYS` (8) requests a turn. A deck the economy made stale (another deck spent its budget, or it
+  lost a budget race) wakes the agent directly instead of being sent back to the mod as `stale`.
+- **What it sees**: every pending request with its full context, the open decks (what is `left`, intent and
+  scheme; the stale ones flagged `restack`, with what they were written against), the state, the whole
   floor's economy and memory.
 - **What it does**: as many tool calls as it needs in one response
   ([backend/agent_tools.py](backend/agent_tools.py)): `stack_<kind>` writes a deck (the same schema as the
   single decision), `shuffle_deck` reorders what is left of one (costs no budget), `keep_deck` answers a
-  re-ask with the deck as it stands (the gate isn't used in this mode). The calls go through `clamp()` one
-  after the other against one budget. A pending deck the agent skips is answered `agent_skipped`, so the
-  game asks again.
+  re-ask with the deck as it stands. The calls go through `clamp()` one after the other against one budget.
+  A pending deck the agent skips is answered `agent_skipped`, so the game asks again.
 - **Unasked decks are pushed**: a restacked open deck goes to the mod as a `res` with `push = true` and a
   negative id. The mod gives it a local id newer than every request so far, so only a later request's
   answer replaces it, and reports its draws under the pushed id (PROTO 3). Pills and payout schedules are
   only rewritten when the game asks.
+- **Cost**: through Claude Code the tools' schemas ride in the cached system prompt, not each turn's message.
 
 ## Guardrails (the DM may be cruel, not unfair)
 

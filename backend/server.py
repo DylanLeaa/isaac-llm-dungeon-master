@@ -40,7 +40,7 @@ from memory import DECK_FIELD, RunMemory, kind_of
 from planners import (FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, NARRATIVE_WAIT_S, Campaign, MockPlanner, OpenRouterPlanner,
                       floor_signature, parse_economy)
 from receipt import Receipt
-from schemas import KINDS, clamp, kill_drop_cap, kill_drops_left, max_curses, mercy_active
+from schemas import KINDS, MAX_DROPS, clamp, kill_drop_cap, kill_drops_left, max_curses, mercy_active
 
 log = logging.getLogger("llmdm")
 Send = Callable[[dict], Awaitable[None]]
@@ -54,23 +54,28 @@ EPITAPH_TIMEOUT_S = 20.0   # the stats screen shows without it; it only fills in
 # deck the game is frozen on (ctx.owed) goes first of all.
 URGENT, NEXT_DOOR, BACKGROUND = 0, 1, 2
 
-# Agent mode. A burst of requests (a floor start, a room entry) waits this long to share one turn; a deck the game
-# is frozen on, or a room clear, doesn't wait. Decks gone stale with no request behind them wait a little longer.
-AGENT_BATCH_S = 0.12
-AGENT_FLAG_WAIT_S = 0.5
-AGENT_MAX_KEYS = 6         # requests a turn answers; more start another turn
-AGENT_OPEN_DECKS = 12      # open decks a turn shows (and may restack), flagged first, then newest
+# Agent mode. A request waits to share a turn with the ones after it, longer the less it is needed: a deck the
+# game is frozen on, or a room clear, doesn't wait; the room next door waits a moment; a floor start's burst (every
+# room, pool and deck on the floor) a second, so it lands in a few turns. Decks gone stale with no request behind
+# them wait too. A request for a deck already written goes to the re-ask gate first and only waits if it says so.
+AGENT_BATCH_S = {URGENT: 0.0, NEXT_DOOR: 0.25, BACKGROUND: 1.0}
+AGENT_FLAG_WAIT_S = 1.0
+AGENT_MAX_KEYS = 8         # requests a turn answers; more start another turn
+AGENT_OPEN_DECKS = 8       # open decks a turn shows (and may restack), flagged first, then newest
+AGENT_DROPS_DEPTH = MAX_DROPS   # a turn's drops deck: enough for several rooms, so the game rarely asks
 # Open decks a turn may restack unasked. Not pills (a colour may have been swallowed since it was written) nor
 # payouts (a machine's schedule is a story: it is only ever extended, when the game asks).
 AGENT_RESTACK_KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "cards", "trinkets", "drops")
 
 
 def _priority(kind: str, ctx: dict) -> int:
-    if kind == "room_clear" or ctx.get("owed"):
+    if ctx.get("owed"):
         return URGENT
-    if kind in ("room_layout", "payout_plan", "drops"):
-        return NEXT_DOOR
-    if kind == "item_choice" and ctx.get("reason") != "floor start":
+    if ctx.get("reason") == "floor start":        # asked ahead (agent mode asks every room's layout and clear too)
+        return BACKGROUND
+    if kind == "room_clear":
+        return URGENT
+    if kind in ("room_layout", "payout_plan", "drops", "item_choice"):
         return NEXT_DOOR
     return BACKGROUND
 
@@ -165,10 +170,12 @@ class Coordinator:
         self.agent_flags: dict[str, str] = {}     # key -> why an open deck needs restacking (no request behind it)
         self.agent_flagged: dict[str, float] = {} # key -> the answer (its issued time) already flagged once
         self.agent_inflight: dict[str, tuple[int, asyncio.Task]] = {}   # key -> (rid, turn) deciding it now
+        self.agent_gating: dict[str, tuple[int, asyncio.Task]] = {}     # key -> (rid, task) the gate is checking
         self.agent_turns: set[asyncio.Task] = set()
         self.agent_timer: asyncio.Task | None = None
+        self.agent_due = 0.0                      # monotonic time agent_timer starts the next turn
         self.push_id = 0                          # pushes count down from -1: never one of the game's request ids
-        self.agent_send: Send | None = None
+        self.agent_send: Send | None = None       # how the game was last reached (a switch of mode tells it)
         self.last_state: dict = {}                # the freshest snapshot the game sent (a turn with no request uses it)
         self.late_grace_s = late_grace_s          # how long past its deadline a call may still be delivered
         self.gate = gate                          # fast model that vetoes re-asks the DM would answer the same
@@ -242,6 +249,11 @@ class Coordinator:
         old = (self.dm, self.campaign.planner, self.gate, self.agent)
         self.dm, self.gate, self.late_grace_s = engine.dm, engine.gate, engine.late_grace
         self.agent = engine.agent
+        if (old[3] is None) != (self.agent is None) and self.agent_send and self.session:
+            task = asyncio.create_task(self._send_quietly(self.agent_send, {
+                "t": "mode", "session": self.session, "agent": self.agent is not None}))
+            self.bg.add(task)
+            task.add_done_callback(self.bg.discard)
         self.epitaph = self.epitaph_wanted and hasattr(engine.dm, "epitaph")
         self.sem = PrioritySemaphore(engine.concurrency)
         self.dm.set_cruelty(self.cruelty)
@@ -266,6 +278,7 @@ class Coordinator:
 
     async def handle(self, msg: dict, send: Send) -> None:
         self.last_seen = time.monotonic()
+        self.agent_send = send
         t = msg.get("t")
         if t == "hello":
             if msg.get("proto") != bridge.PROTO:
@@ -304,7 +317,9 @@ class Coordinator:
                     log.info("receipt -> %s", self.receipt.path)
             self._set_cruelty(msg.get("cruelty"))
             log.info("game connected  session=%s run=%s cruelty=%s", self.session, msg.get("run"), self.cruelty)
-            await send({"t": "welcome", "session": self.session, "proto": bridge.PROTO, "cruelty": self.cruelty})
+            # agent: the game asks every room's layout and clear at floor start (the agent writes ahead).
+            await send({"t": "welcome", "session": self.session, "proto": bridge.PROTO, "cruelty": self.cruelty,
+                        "agent": self.agent is not None})
         elif t == "settings":
             # Changed from the in-game DM Settings menu; takes effect for the next decision.
             self._set_cruelty(msg.get("cruelty"))
@@ -516,7 +531,14 @@ class Coordinator:
         self.stats[kind]["req"] += 1
         self._observe(msg.get("state") or {})
         if self.agent is not None:
-            self._queue_agent(msg, send)
+            old = self.agent_gating.get(key)
+            if old and old[0] < rid and not old[1].done():
+                old[1].cancel()                  # latest-wins: newer context supersedes
+                self.stats[kind]["superseded"] += 1
+            if self.memory.previous(key) and key not in self.agent_queue and key not in self.agent_inflight:
+                self._spawn_gate(msg, send)      # a deck already written: the gate may keep it, no turn needed
+            else:
+                self._queue_agent(msg, send)
             return
         self._spawn_run(msg, send)
 
@@ -600,14 +622,7 @@ class Coordinator:
             else:
                 if prev and not _deck_short(kind, prev, asked_ctx) \
                         and await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
-                    # The same deck answers this request too: what is left of it, and how many draws that
-                    # already accounts for (the mod skips only draws made since).
-                    self.memory.reissue(key, rid)
-                    seq = self.receipt_seq.get(key, self.used_seq.get(key))
-                    if seq is not None:
-                        self.answer_seq[(key, rid)] = seq
-                    await send({**base, "ok": True, "ms": _ms(t0), "decision": prev,
-                                "drawn_base": self.memory.drawn_total.get(key, 0)})
+                    await self._reissue(kind, key, rid, prev, send, _ms(t0))
                     return
                 # Rate-limited: hold the request until the model's cooldown is over, then make the call. A
                 # cooldown longer than the deadline is answered "cooldown" at the deadline instead: answered at
@@ -654,6 +669,16 @@ class Coordinator:
         await self._issue(kind, key, rid, decision, budget, send, state=state, ctx=ctx, asked_ctx=asked_ctx,
                           digest=digest, rec=rec, raw=raw, call=call, usage=usage, ms=_ms(t0), late=late,
                           local=kills_left == 0, campaign=campaign)
+
+    async def _reissue(self, kind: str, key: str, rid: int, prev: dict, send: Send, ms: int) -> None:
+        """The same deck answers request `rid` too: what is left of it, and how many draws that already accounts
+        for (the mod skips only draws made since)."""
+        self.memory.reissue(key, rid)
+        seq = self.receipt_seq.get(key, self.used_seq.get(key))
+        if seq is not None:
+            self.answer_seq[(key, rid)] = seq
+        await send({"t": "res", "session": self.session, "id": rid, "key": key, "kind": kind, "ok": True, "ms": ms,
+                    "decision": prev, "drawn_base": self.memory.drawn_total.get(key, 0)})
 
     def _clamp(self, kind: str, key: str, raw: dict, state: dict, ctx: dict):
         """(the legal answer, its budget). Trimmed against the economy as it is now, and committed in the same
@@ -722,10 +747,14 @@ class Coordinator:
         cooldown = getattr(self.decider, "cooldown", None)
         return cooldown.remaining() if cooldown else 0.0
 
+    def _deciding(self):
+        """(key, (rid, task)) for every request being answered now: DM calls, agent turns, gate checks."""
+        return itertools.chain(self.inflight.items(), self.agent_inflight.items(), self.agent_gating.items())
+
     def _in_flight(self, key: str | None) -> list[tuple[str, str]]:
         """Decisions being made right now (no answer yet), other than `key`."""
         out = []
-        for k, (_rid, task) in itertools.chain(self.inflight.items(), self.agent_inflight.items()):
+        for k, (_rid, task) in self._deciding():
             if k != key and not task.done():
                 out.append((k, self.inflight_kind.get(k, "?")))
         return out
@@ -762,7 +791,7 @@ class Coordinator:
             return False
         if ctx.get("owed"):                       # the game is frozen on this deck: the old answer didn't cover it
             return False
-        campaign_changed = last["campaign"] != getattr(self.dm, "campaign", "")
+        campaign_changed = last["campaign"] != getattr(self.decider, "campaign", "")
         changes = diff({"state": last["state"], "ctx": last["ctx"]}, {"state": state, "ctx": ctx})
         fresh = new_events(last["events"], digest["recent_events"])
         if fresh:
@@ -807,8 +836,36 @@ class Coordinator:
             log.debug("%-11s %-14s superseded by a fresher request", kind, key)
         self.agent_queue[key] = msg
         self.agent_flags.pop(key, None)           # the request is its restack
-        urgent = _priority(kind, msg.get("ctx") or {}) == URGENT
-        self._kick_agent(send, 0.0 if urgent else AGENT_BATCH_S)
+        self._kick_agent(send, AGENT_BATCH_S[_priority(kind, msg.get("ctx") or {})])
+
+    def _spawn_gate(self, msg: dict, send: Send) -> None:
+        key, rid = str(msg["key"]), int(msg["id"])
+        task = asyncio.create_task(self._agent_gate(msg, send))
+        self.agent_gating[key] = (rid, task)
+        self.inflight_kind[key] = msg["kind"]
+        task.add_done_callback(lambda _t, k=key, r=rid: self._release(self.agent_gating, k, r))
+
+    async def _agent_gate(self, msg: dict, send: Send) -> None:
+        """A request for a deck the agent already wrote: the re-ask gate decides whether it still fits (answered
+        here, no turn) or the agent should look again (it waits for the next turn), as it does for the DM."""
+        key, rid, kind = str(msg["key"]), int(msg["id"]), msg["kind"]
+        state, asked_ctx = msg.get("state") or {}, msg.get("ctx") or {}
+        brief, waited = await self._await_plans(state)
+        if brief in ("cancelled", "moved"):
+            self._record(kind, "superseded", ms=waited, key=key, req_id=rid, reason=brief)
+            self.stats[kind]["superseded"] += 1
+            return
+        t0 = time.perf_counter()
+        prev = self.memory.previous(key)
+        if prev and not _deck_short(kind, prev, asked_ctx):
+            digest = self.memory.digest(exclude=key, in_flight=self._in_flight(key))
+            if await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
+                await self._reissue(kind, key, rid, prev, send, _ms(t0))
+                return
+        if self.agent is None:                    # agent mode was switched off meanwhile
+            self._spawn_run(msg, send)
+        else:
+            self._queue_agent({**msg, "gated": True}, send)
 
     def _flag(self, keys: list[str], why: str, send: Send) -> None:
         """Open decks gone out of date with no request behind them: the agent is woken to restack them. Each
@@ -826,22 +883,33 @@ class Coordinator:
 
     def _kick_agent(self, send: Send, delay: float) -> None:
         """Start a turn after `delay`, so a burst of requests shares one. A turn already coming takes this one
-        too, unless this can't wait."""
+        too, brought forward if this can't wait as long."""
+        due = time.monotonic() + delay
         t = self.agent_timer
         if t is not None and not t.done():
-            if delay > 0:
+            if due >= self.agent_due:
                 return
             t.cancel()
+        self.agent_due = due
         self.agent_timer = asyncio.create_task(self._agent_dispatch(send, delay))
 
     async def _agent_dispatch(self, send: Send, delay: float) -> None:
         """Start turns for everything waiting: the most urgent requests first, AGENT_MAX_KEYS to a turn. The
-        DM slots (self.sem) cap how many run at once."""
+        DM slots (self.sem) cap how many run at once. A request for a deck a turn is still deciding waits for
+        it; then, like any request for a deck already written, it goes to the gate before it may join a turn."""
         if delay:
             await asyncio.sleep(delay)
-        while self.agent_queue or self.agent_flags:
-            queued = sorted(self.agent_queue.values(),
-                            key=lambda m: (_priority(m["kind"], m.get("ctx") or {}), int(m["id"])))
+        while True:
+            busy = {k for k, (_r, t) in self.agent_inflight.items() if not t.done()}
+            for m in list(self.agent_queue.values()):
+                key = str(m["key"])
+                if key not in busy and not m.get("gated") and self.memory.previous(key):
+                    del self.agent_queue[key]
+                    self._spawn_gate(m, send)
+            ready = [m for m in self.agent_queue.values() if str(m["key"]) not in busy]
+            if not ready and not self.agent_flags:
+                return
+            queued = sorted(ready, key=lambda m: (_priority(m["kind"], m.get("ctx") or {}), int(m["id"])))
             asks = queued[:AGENT_MAX_KEYS]
             for m in asks:
                 self.agent_queue.pop(str(m["key"]), None)
@@ -853,32 +921,40 @@ class Coordinator:
                 key, rid = str(m["key"]), int(m["id"])
                 self.agent_inflight[key] = (rid, task)
                 self.inflight_kind[key] = m["kind"]
-                task.add_done_callback(lambda _t, k=key, r=rid: self._agent_cleanup(k, r))
+                task.add_done_callback(lambda _t, k=key, r=rid: self._release(self.agent_inflight, k, r))
+            # After the releases above: what waited on these keys can go now.
+            task.add_done_callback(lambda _t: self._kick_agent(send, 0.0) if self.agent_queue else None)
 
-    def _agent_cleanup(self, key: str, rid: int) -> None:
-        cur = self.agent_inflight.get(key)
+    @staticmethod
+    def _release(table: dict[str, tuple[int, asyncio.Task]], key: str, rid: int) -> None:
+        cur = table.get(key)
         if cur and cur[0] == rid:
-            self.agent_inflight.pop(key, None)
+            table.pop(key, None)
 
     def _cancel_agent(self) -> None:
         """A new run, or the run is over: nothing waiting for or being decided by the agent can be used."""
         if self.agent_timer is not None:
             self.agent_timer.cancel()
-        for task in list(self.agent_turns):
+        for task in [*self.agent_turns, *(t for _rid, t in self.agent_gating.values())]:
             task.cancel()
+        self.agent_gating.clear()
         self.agent_queue.clear()
         self.agent_flags.clear()
         self.agent_flagged.clear()
         self.agent_inflight.clear()
 
     def _open_deck(self, key: str, why: str | None) -> dict:
-        """An open deck as the agent sees it: what is left, what it was for, and what it was written against."""
+        """An open deck as the agent sees it: what is left and what it was for. One flagged for a restack also
+        shows what it was written against (an item ranking's candidates, a room's shape), to rewrite it from."""
         e = self.memory.issued[key]
         d = e["decision"]
-        ctx = {k: v for k, v in self.last_req[key]["ctx"].items() if k not in _OPEN_CTX_HIDDEN}
-        return {"key": key, "kind": e["kind"], "left": list(e["left"]), "drawn": self.memory.drawn_total.get(key, 0),
-                "intent": d.get("intent", ""), **({"scheme": d["scheme"]} if d.get("scheme") else {}),
-                "age_s": round(time.monotonic() - e["at"]), **({"restack": why} if why else {}), "context": ctx}
+        out = {"key": key, "kind": e["kind"], "left": list(e["left"]), "drawn": self.memory.drawn_total.get(key, 0),
+               "intent": d.get("intent", ""), **({"scheme": d["scheme"]} if d.get("scheme") else {}),
+               "age_s": round(time.monotonic() - e["at"])}
+        if why:
+            out.update(restack=why, context={k: v for k, v in self.last_req[key]["ctx"].items()
+                                             if k not in _OPEN_CTX_HIDDEN})
+        return out
 
     async def _agent_turn(self, asks: list[dict], flags: dict[str, str], send: Send) -> None:
         """One agent call: every request in `asks` answered, and any open deck restacked, in one response."""
@@ -897,6 +973,8 @@ class Coordinator:
             key, kind, asked_ctx = str(m["key"]), m["kind"], m.get("ctx") or {}
             st = m.get("state") or {}
             ctx, kills_left = self._request_ctx(kind, key, st, asked_ctx)
+            if kind == "drops":                   # written to last several rooms, not just the one asked about
+                ctx["wanted"] = AGENT_DROPS_DEPTH
             p = {"key": key, "rid": int(m["id"]), "kind": kind, "state": st, "ctx": ctx, "asked_ctx": asked_ctx,
                  "deadline_ms": m.get("deadline_ms", 4000)}
             if kills_left == 0:
@@ -913,9 +991,7 @@ class Coordinator:
                                                "request": {"state": p["state"], "ctx": p["ctx"]}})
         # The open decks it may restack: none being decided elsewhere or waiting for a request of their own.
         me = asyncio.current_task()
-        busy = set(self.agent_queue) | {k for k, (_r, t) in itertools.chain(self.inflight.items(),
-                                                                            self.agent_inflight.items())
-                                        if t is not me and not t.done()}
+        busy = set(self.agent_queue) | {k for k, (_r, t) in self._deciding() if t is not me and not t.done()}
         open_keys = [k for k, e in reversed(list(self.memory.issued.items()))
                      if k not in pending and k not in busy and k in self.last_req and e["left"]
                      and e["kind"] in AGENT_RESTACK_KINDS]
@@ -1041,8 +1117,9 @@ class Coordinator:
             entry = self.memory.issued[key]
             kind, rid, st, push = entry["kind"], 0, state, True
             asked_ctx = {**self.last_req[key]["ctx"], "reason": "restacked by the agent"}
-            if kind in DECK_FIELD:                # a restack replaces what is left: as many entries
-                asked_ctx.update(wanted=max(1, len(entry["left"])), deck_left=list(entry["left"]))
+            if kind in DECK_FIELD:                # a restack replaces what is left: as many entries (drops: a full deck)
+                asked_ctx.update(wanted=max(1, len(entry["left"]), AGENT_DROPS_DEPTH if kind == "drops" else 0),
+                                 deck_left=list(entry["left"]))
             ctx, _kills_left = self._request_ctx(kind, key, st, asked_ctx)
         else:
             return "not a pending request or an open deck"
@@ -1176,9 +1253,7 @@ class Engine:
     def describe(self) -> None:
         log.info("Dungeon Master: %s%s", self.label, "  [agent mode: one call stacks every deck it needs]"
                  if self.agent is not None else "")
-        if self.agent is not None:
-            log.info("Re-ask gate: not used in agent mode (the agent keeps decks itself)")
-        elif self.gate:
+        if self.gate:
             log.info("Re-ask gate: %s", self.gate.model)
         else:
             log.info("Re-ask gate: off, every re-ask goes to the DM")
@@ -1193,11 +1268,11 @@ def build_dm(backend: str, api_key: str, *, cruelty: int, model: str | None = No
              mock_latency: tuple[float, float] = (0.25, 1.2), agent: bool = False) -> Engine:
     """The DM, planners and gate for a backend: "openrouter", "google", "claude-code" or "mock". The planners can run
     on another backend than the DM (planner_backend, default the DM's). agent: agent mode, an agent on the DM's
-    backend and model writes the decks, and there is no gate.
+    backend and model writes the decks (the gate still screens its re-asks).
     ValueError, with a message for the player, when it can't be set up."""
     if backend == "mock":
         return Engine(MockDM(cruelty, latency=mock_latency), None if no_planners else MockPlanner(),
-                      None if no_gate or agent else MockGate(), label="MOCK (offline)",
+                      None if no_gate else MockGate(), label="MOCK (offline)",
                       agent=MockAgent(cruelty, latency=mock_latency) if agent else None)
     planner_backend = planner_backend or backend
     used = (backend, None if no_planners else planner_backend)
@@ -1215,7 +1290,7 @@ def build_dm(backend: str, api_key: str, *, cruelty: int, model: str | None = No
     except SystemExit as e:                       # find_claude's message, for the CLI
         raise ValueError(str(e)) from None
     # The gate isn't a Claude model: it stays on OpenRouter, when there's a key for it.
-    gate = OpenRouterGate(gate_model, gate_threshold, api_key=api_key) if api_key and not no_gate and not agent else None
+    gate = OpenRouterGate(gate_model, gate_threshold, api_key=api_key) if api_key and not no_gate else None
     if backend == "claude-code":
         return Engine(dm, planner, gate, CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_LATE_GRACE_S,
                       f"{model} via Claude Code ({dm.runner.bin})", agent=deck_agent)

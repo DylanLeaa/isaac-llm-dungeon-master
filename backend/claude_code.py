@@ -175,14 +175,15 @@ class ClaudeCodeDM:
 
 class ClaudeCodeAgent(ClaudeCodeDM):
     """Agent mode through Claude Code. `claude -p` has no tool calls of its own, so the turn's calls come
-    back as one structured answer, {"calls": [{tool, key, args}]}; each tool's schema travels in the prompt."""
+    back as one structured answer, {"calls": [{tool, key, args}]}; each tool's schema travels in the system
+    prompt, ahead of the campaign, so it is cached with the persona instead of paid for on every turn."""
 
     def _build_system(self) -> None:
-        self.system = system_prompt(self.cruelty, agent=True) + ("\n\n" + self.campaign if self.campaign else "")
+        self.system = (system_prompt(self.cruelty, agent=True) + "\n\n" + _AGENT_TOOLS_TEXT
+                       + ("\n\n" + self.campaign if self.campaign else ""))
 
     async def act(self, message: str) -> tuple[list[dict], dict]:
-        user = _AGENT_TOOLS_TEXT + "\n\n" + message
-        answer, record = await self.runner.complete(self.model, self.system, user, _AGENT_SCHEMA)
+        answer, record = await self.runner.complete(self.model, self.system, message, _AGENT_SCHEMA)
         calls = []
         for c in answer.get("calls") or []:
             if isinstance(c, dict) and isinstance(c.get("args"), dict):
