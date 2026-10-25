@@ -623,7 +623,8 @@ class ModelPicker(tk.Toplevel):
     """Every model a role can use: filter, sort by any column (intelligence first), pick one.
     Claude Code's models, when it's on, are pinned to the top whatever the sort."""
 
-    COLUMNS = (("whitelisted", "Whitelisted", 85), ("name", "Model", 300), ("intelligence", "Intelligence", 95),
+    COLUMNS = (("whitelisted", "Whitelisted", 85), ("name", "Model", 300), ("backend", "Provider", 120),
+               ("intelligence", "Intelligence", 95),
                ("prompt", "Input $/M", 85), ("completion", "Output $/M", 90), ("cache_read", "Cached $/M", 90),
                ("turn_cost", "Turn cost", 85), ("latency", "Latency", 70))
     NUMERIC = ("intelligence", "prompt", "completion", "cache_read", "turn_cost", "latency")
@@ -755,7 +756,8 @@ class ModelPicker(tk.Toplevel):
         listed = "-" if m.whitelisted is None else "✓" if m.whitelisted else "✗"
         score = "-" if m.intelligence is None else f"{m.intelligence:g}"
         latency = "-" if m.latency is None else f"{m.latency:.1f}s"
-        return (listed, m.name, score, *prices, model_catalog.turn_price(m.turn_cost), latency)
+        provider = model_catalog.PROVIDERS.get(m.backend, m.backend)
+        return (listed, m.name, provider, score, *prices, model_catalog.turn_price(m.turn_cost), latency)
 
     def _show_selected(self) -> None:
         sel = self.tree.selection()

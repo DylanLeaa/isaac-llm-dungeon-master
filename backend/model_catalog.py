@@ -228,7 +228,7 @@ def filter_rows(rows: list[ModelInfo], query: str = "", author: str = "", scored
 
 
 SORT_KEYS = ("intelligence", "name", "id", "prompt", "completion", "cache_read", "context", "reasoning", "created",
-             "whitelisted", "turn_cost", "latency")
+             "whitelisted", "turn_cost", "latency", "backend")
 
 
 def sort_rows(rows: list[ModelInfo], key: str = "intelligence", desc: bool = True) -> list[ModelInfo]:
