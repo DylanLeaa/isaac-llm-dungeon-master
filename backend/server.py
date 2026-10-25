@@ -61,11 +61,17 @@ URGENT, NEXT_DOOR, BACKGROUND = 0, 1, 2
 AGENT_BATCH_S = {URGENT: 0.0, NEXT_DOOR: 0.25, BACKGROUND: 1.0}
 AGENT_FLAG_WAIT_S = 1.0
 AGENT_MAX_KEYS = 8         # requests a turn answers; more start another turn
-AGENT_OPEN_DECKS = 8       # open decks a turn shows (and may restack), flagged first, then newest
+AGENT_OPEN_DECKS = 16       # open decks a turn shows (and may restack), flagged first, then newest
 AGENT_DROPS_DEPTH = MAX_DROPS   # a turn's drops deck: enough for several rooms, so the game rarely asks
 # Open decks a turn may restack unasked. Not pills (a colour may have been swallowed since it was written) nor
 # payouts (a machine's schedule is a story: it is only ever extended, when the game asks).
 AGENT_RESTACK_KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "cards", "trinkets", "drops")
+# Re-asks of a deck the agent already wrote that never changed what the game did (run E989E1E1: 0 of 79): the
+# player nearing its room, a state-change refresh, the boss's curse re-check. The deck answers them as it stands,
+# with no gate and no turn; a deck that has really gone stale is flagged (_flag) and still goes to the agent.
+AGENT_REUSE_REASONS = ("eta under lead time", "player entered an adjacent room", "player is next to this room",
+                       "boss defeated")
+AGENT_REUSE_PREFIXES = ("refresh:",)
 
 
 def _priority(kind: str, ctx: dict) -> int:
@@ -91,6 +97,12 @@ def _deck_short(kind: str, prev: dict, ctx: dict) -> bool:
     except (TypeError, ValueError):
         wanted = 1
     return len(prev.get(field) or []) < wanted
+
+
+def _routine_reask(ctx: dict) -> bool:
+    """A re-ask the agent's deck answers as it stands (AGENT_REUSE_REASONS)."""
+    reason = str(ctx.get("reason") or "")
+    return not ctx.get("owed") and (reason in AGENT_REUSE_REASONS or reason.startswith(AGENT_REUSE_PREFIXES))
 
 
 def _spent_drops(ctx: dict) -> dict:
@@ -858,6 +870,13 @@ class Coordinator:
         t0 = time.perf_counter()
         prev = self.memory.previous(key)
         if prev and not _deck_short(kind, prev, asked_ctx):
+            if _routine_reask(asked_ctx) and key not in self.agent_flags:
+                self.stats[kind]["reused"] += 1
+                self._record(kind, "reused", ms=_ms(t0), key=key, req_id=rid,
+                             result=f"{asked_ctx.get('reason')}: the agent's deck stands")
+                log.info("%-11s %-14s %s -> reused the agent's deck", kind, key, asked_ctx.get("reason"))
+                await self._reissue(kind, key, rid, prev, send, _ms(t0))
+                return
             digest = self.memory.digest(exclude=key, in_flight=self._in_flight(key))
             if await self._gate_keeps(kind, key, state, asked_ctx, digest, prev, t0):
                 await self._reissue(kind, key, rid, prev, send, _ms(t0))

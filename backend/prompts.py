@@ -84,9 +84,15 @@ Answer with tool calls, as many as the turn needs, all in this one response:
   it replaces what is `left`: write as many entries as it has left.
 - shuffle_deck(key, order): reorder what is left of a deck without changing it (costs no budget).
 - keep_deck(key): a pending deck that still fits as it is.
-Every key in `pending` gets exactly one call; a pending key you skip is asked again later. Open
-decks are optional: touch one only when the plan or the state gives you a reason (set up a
-punchline across decks, move a reward to where it lands better, undo a deck the budget gutted).
+Every key in `pending` gets exactly one call; a pending key you skip is asked again later.
+Open decks must stay true to the state. Each one's intent and scheme say what it assumed about
+the player; check that against `state` every turn. When the assumption no longer holds (he can now
+afford what a penny was meant to leave out of reach, a shortage a deck plays on is gone, he already
+holds what a pool was baiting), restack that deck for the state as it is now, or shuffle it if a new
+order is enough. A deck whose assumption still holds stays as it is: never restack it to the same
+entries, and answer a pending one that still fits with keep_deck. Beyond that, touch an open deck
+only when the plan gives you a reason (set up a punchline across decks, move a reward to where it
+lands better, undo a deck the budget gutted).
 One call per key per turn. Calls are applied in order against one budget, so write the deck
 that matters most first. Use only keys listed in `pending` or `open_decks`."""
 

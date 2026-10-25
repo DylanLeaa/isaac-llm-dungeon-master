@@ -283,6 +283,29 @@ def test_a_re_ask_goes_to_the_gate_first_and_only_a_moved_state_wakes_the_agent(
     assert coord.stats["gate"]["reask"] == 1 and coord.stats["drops"]["reused"] == 1
 
 
+@pytest.mark.parametrize("reason", ["eta under lead time", "player entered an adjacent room",
+                                    "player is next to this room", "refresh: player state changed", "boss defeated"])
+def test_a_routine_re_ask_is_answered_by_the_deck_with_no_gate_and_no_turn(reason):
+    agent = ScriptedAgent([[stack("drops", "drops:1", **drops("nothing", "penny"))]])
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent, gate=MockGate())
+    sent = run(coord, [req(1, "drops:1", "drops", {"wanted": 2}), 0.3,
+                       req(2, "drops:1", "drops", {"wanted": 2, "reason": reason}, keys=3)])   # even with the state moved
+    res = {m["id"]: m for m in results(sent)}
+    assert res[2]["ok"] and [o["reward"] for o in res[2]["decision"]["outcomes"]] == ["nothing", "penny"]
+    assert len(agent.seen) == 1 and coord.stats["gate"]["reask"] == coord.stats["gate"]["keep"] == 0
+    assert coord.stats["drops"]["reused"] == 1 and coord.memory.issued["drops:1"]["rid"] == 2
+
+
+def test_a_routine_re_ask_still_goes_to_the_agent_when_the_deck_is_short():
+    agent = ScriptedAgent([[stack("drops", "drops:1", **drops("nothing"))],
+                           [stack("drops", "drops:1", **drops("nothing", "key"))]])
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent, gate=MockGate())
+    sent = run(coord, [req(1, "drops:1", "drops", {"wanted": 1}), 0.3,
+                       req(2, "drops:1", "drops", {"wanted": 2, "reason": "refresh: player state changed"})])
+    assert len(agent.seen) == 2, "a deck shorter than the game wants is restocked"
+    assert [o["reward"] for o in {m["id"]: m for m in results(sent)}[2]["decision"]["outcomes"]] == ["nothing", "key"]
+
+
 def test_a_re_ask_made_while_its_deck_is_being_written_waits_for_it_then_meets_the_gate():
     agent = ScriptedAgent([[stack("drops", "drops:1", **drops("nothing", "penny"))]], delay=0.2)
     coord = Coordinator(NoDM(), cruelty=6, agent=agent, gate=MockGate())

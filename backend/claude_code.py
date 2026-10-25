@@ -27,6 +27,8 @@ CLAUDE_CODE_DM_MODEL = "claude-haiku-5-5"
 CLAUDE_CODE_PLANNER_MODEL = "claude-sonnet-5-5"
 # Haiku thinks by default under Claude Code (~1K hidden output tokens a decision); low effort roughly halves that.
 CLAUDE_CODE_DM_EFFORT = "low"
+# Agent mode: one turn runs every deck at once and has to check the open ones against the state.
+CLAUDE_CODE_AGENT_EFFORT = "medium"
 # Each call is a whole claude.exe; a burst of six slows every one of them past its deadline.
 CLAUDE_CODE_CONCURRENCY = 3
 # How long a decision may run past its deadline and still be delivered (the game keeps late answers).
@@ -177,6 +179,10 @@ class ClaudeCodeAgent(ClaudeCodeDM):
     """Agent mode through Claude Code. `claude -p` has no tool calls of its own, so the turn's calls come
     back as one structured answer, {"calls": [{tool, key, args}]}; each tool's schema travels in the system
     prompt, ahead of the campaign, so it is cached with the persona instead of paid for on every turn."""
+
+    def __init__(self, cruelty: int, model: str = CLAUDE_CODE_DM_MODEL, claude_bin: str | None = None,
+                 timeout: float = 60.0, effort: str | None = CLAUDE_CODE_AGENT_EFFORT) -> None:
+        super().__init__(cruelty, model, claude_bin, timeout, effort)
 
     def _build_system(self) -> None:
         self.system = (system_prompt(self.cruelty, agent=True) + "\n\n" + _AGENT_TOOLS_TEXT
