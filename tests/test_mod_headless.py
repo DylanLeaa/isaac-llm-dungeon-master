@@ -92,12 +92,6 @@ def run(tmp, game):
         return modules[name]
 
     g.include = include
-    # Minimal Mod Config Menu: records what the mod registers.
-    mcm = lua.execute("""
-        local M = { OptionType = { TEXT = 1, SPACE = 2, NUMBER = 3, TITLE = 9 }, settings = {} }
-        function M.AddSetting(cat, sub, s) M.settings[#M.settings + 1] = { cat = cat, sub = sub, s = s } end
-        return M""")
-    g.ModConfigMenu = mcm
     lua.execute(open(MOD / "main.lua").read())
     Bridge, Sched, Decks = modules["dm.bridge"], modules["dm.scheduler"], modules["dm.decks"]
     MC = g.ModCallbacks
@@ -151,19 +145,6 @@ def run(tmp, game):
     assert any(m.get("t") == "prepare" for m in sent(game))
     print("   loading screen held input until the narrative was in, then released it")
 
-    # --- DM Settings menu: cruelty slider, applied live and saved -----------------
-    menu = [mcm.settings[i] for i in range(1, len(mcm.settings) + 1)]
-    general = [e for e in menu if e.sub == "General"]
-    assert len(general) == 1, "DM Settings registered once (again on game start is a no-op)"
-    entry = general[0]
-    assert entry.cat == "DM Settings" and entry.s.CurrentSetting() == -1
-    assert entry.s.Display() == "Cruelty: backend default"
-    entry.s.OnChange(3)
-    tick(3)
-    settings = [m for m in sent(game) if m.get("t") == "settings"]
-    assert settings and settings[-1]["cruelty"] == 3, "cruelty change should reach the backend"
-    assert entry.s.Display() == "Cruelty: 3/10 (mischievous)" and json.loads(W.saved)["cruelty"] == 3
-    print("   DM Settings -> cruelty 3 sent to backend and saved")
     wait(lambda: Bridge.peek("layout:1:85") and Bridge.peek("items:1:0"), 6, "neighbour prefetch")
     print("2. prefetched before the player moved: layout for room 85, treasure pool ranking")
 
@@ -244,7 +225,7 @@ def run(tmp, game):
     print(f"8. pill colour 5 -> {pill5['effect']} (effect {effect}), horse pill -> {horse}; saved: {W.saved}")
     assert effect == g.PillEffect[pill5["enum"]] and horse == effect
     assert '"5"' in W.saved
-    assert json.loads(W.saved)["cruelty"] == 3, "pill save must not wipe the DM Settings"
+    assert "pills" in json.loads(W.saved), "pill save keeps the mod's data"
     assert W.fire(MC.MC_GET_PILL_EFFECT, 3, 9) is None             # no plan for colour 9: vanilla
     W.fire(MC.MC_USE_PILL, 3)
     assert W.fire(MC.MC_GET_PILL_EFFECT, 3, 9) is None             # ...and it stays vanilla's
@@ -541,8 +522,7 @@ def run(tmp, game):
         "LOG_SPAWNS samples go with the counts"
     print("15f. roll audit:", {f"{h}/{c}": n for (h, c, o), n in tally.items() if o != "uncontrolled"})
 
-    # --- the receipt: on disk for the app, no longer in the game's menu ----------------
-    assert not [e for e in menu if e.sub == "Receipt"], "the receipt lives in the app, not the menu"
+    # --- the receipt: on disk for the app ----------------
     files = list((Path(tmp) / "receipts").glob("*.jsonl"))
     assert len(files) == 1, files
     recs = [json.loads(l) for l in files[0].read_text().splitlines()]
@@ -554,7 +534,6 @@ def run(tmp, game):
     assert any(line.startswith("item offered: ") for line in effects), effects
     icons = {W.drawn[i].file for i in range(1, len(W.drawn) + 1)}
     assert any(f.startswith("gfx/005.") for f in icons), "used decisions show in the corner, as pickup icons"
-    assert any(r.get("what") == "cruelty" and r.get("result") == "6 -> 3" for r in recs)
     audits = [r for r in recs if r.get("what") == "rolls"]
     assert audits and any(r.get("samples") for r in audits), "the roll audit is in the receipt"
     assert any(r["type"] == "drawn" and r["key"] == "drops:1" for r in recs), "every draw is in the receipt"
@@ -618,21 +597,22 @@ def run(tmp, game):
     gaper = lua.table_from({"Entity": lua.table_from({"Type": g.EntityType.ENTITY_GAPER, "Variant": 0})})
     W.fire(MC.MC_ENTITY_TAKE_DMG, g.Isaac.GetPlayer(0), 2, 0, gaper)
     W.fire(MC.MC_POST_GAME_END, True)
-    last_run = [e.s for e in menu if e.sub == "Last run"]
 
     def last():
-        return " | ".join(l for l in (s.Display() for s in last_run) if l)
+        run = json.loads(W.saved).get("last_run") or {}
+        rows = [f"{r[0]}: {r[1]}" for sec in run.get("sections", []) for r in sec.get("rows", [])]
+        return " | ".join([run.get("title") or "", *rows, run.get("epitaph") or ""])
 
     text = last()
-    assert text.startswith("HERE LIES ISAAC") and "Reached: Basement II" in text and "Last hit by: gaper" in text
-    assert "Rooms cleared: 4" in text and "Pills eaten: 2" in text and "tallying" in text, text
+    assert "Reached: Basement II" in text and "Last hit by: gaper" in text
+    assert "Rooms cleared: 4" in text and "Pills eaten: 2" in text, text
     death = [m for m in sent(game) if m.get("t") == "event" and m.get("name") == "death"]
     assert death and death[0]["data"]["run"] == "TEST 1234" and death[0]["data"]["rows"][0] == ["Reached", "Basement II"]
     wait(lambda: "Extra enemies" in last(), 5, "the DM's side of the stats")
     wait(lambda: "The dice were mine" in last(), 5, "the DM's epitaph")
     tick(3)                                   # the overlay draws without errors
     assert "The dice were mine" in json.loads(W.saved)["last_run"]["epitaph"], "kept for the next session"
-    print("19. death -> DM Settings > Last run:\n      " + last().replace(" | ", "\n      "))
+    print("19. death -> kept in the save file:\n      " + last().replace(" | ", "\n      "))
 
     errors = [p for p in printed if "error" in p.lower()]
     assert not errors, errors

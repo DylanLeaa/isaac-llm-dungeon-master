@@ -75,29 +75,25 @@ def test_fallback_event_is_counted_not_remembered():
     assert not coord.memory.events
 
 
-def test_cruelty_follows_hello_and_settings():
+def test_cruelty_is_set_by_the_app_not_the_game():
     class DM(ScriptedDM):
         def set_cruelty(self, cruelty):
             self.cruelty = cruelty
 
     dm = DM([])
     coord = Coordinator(dm, cruelty=6)
-    sent = []
 
     async def send(msg):
-        sent.append(msg)
+        pass
 
-    def handle(msg):
-        asyncio.run(coord.handle(msg, send))
-        return coord.cruelty
-
-    assert handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R", "cruelty": 9}) == 9 and dm.cruelty == 9
-    assert handle({"t": "settings", "cruelty": 2}) == 2 and dm.cruelty == 2
-    assert [m for m in sent if m["t"] == "settings_ok"][-1] == {"t": "settings_ok", "session": "S", "cruelty": 2}
-    assert handle({"t": "settings"}) == 6 and dm.cruelty == 6        # menu's "backend default"
-    assert handle({"t": "settings", "cruelty": 42}) == 10
-    assert handle({"t": "settings", "cruelty": "lots"}) == 10        # garbage is ignored
-    assert handle({"t": "hello", "proto": PROTO, "session": "S2", "run": "R"}) == 6  # reconnect without override
+    asyncio.run(coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R", "cruelty": 9}, send))
+    assert coord.cruelty == 6, "the game's cruelty is ignored"
+    asyncio.run(coord.handle({"t": "settings", "cruelty": 2}, send))
+    assert coord.cruelty == 6
+    coord.set_cruelty(2)
+    assert coord.cruelty == 2 and dm.cruelty == 2 and coord.memory.economy.cruelty == 2
+    coord.set_cruelty(42)
+    assert coord.cruelty == 10
 
 
 def test_clean_text_cuts_on_word_boundary():
@@ -554,19 +550,19 @@ def test_reconfigure_swaps_models_mid_run_and_keeps_the_run():
         sent.append(msg)
 
     async def go():
-        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True,
-                            "cruelty": 8}, send)
+        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True}, send)
         await coord.handle(floor_req(1, 1, "Basement I"), send)
         await asyncio.sleep(0.05)
         path = coord.receipt.path
-        coord.reconfigure(Engine(new_dm, ScriptedPlanner(), None, concurrency=2, late_grace=1.5, label="new"))
+        coord.reconfigure(Engine(new_dm, ScriptedPlanner(), None, concurrency=2, late_grace=1.5, label="new",
+                                 cruelty=8))
         await coord.handle(floor_req(2, 1, "Basement I"), send)
         await asyncio.sleep(0.05)
         return path
 
     path = asyncio.run(go())
     assert len(old_dm.seen) == 1 and len(new_dm.seen) == 1        # the second decision went to the new DM
-    assert new_dm.cruelties == [8]                                 # told the run's cruelty, not the default
+    assert new_dm.cruelties == [8]                                 # told the cruelty from Settings
     assert "NARRATIVE for Isaac" in new_dm.campaigns[0] and "BRIEF for Basement I" in new_dm.campaigns[0]
     assert coord.late_grace_s == 1.5 and coord.gate is None
     assert coord.receipt.path == path and coord.memory.run_id == "R1"

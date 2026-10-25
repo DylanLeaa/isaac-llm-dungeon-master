@@ -1,5 +1,5 @@
 -- The after-death stats screen: the run's numbers from both sides of the table, drawn over the
--- game-over screen and kept under Mod Config Menu > DM Settings > Last run.
+-- game-over screen, and kept in the save file for the next launch.
 --
 -- The mod's side (floor reached, time, damage, items...) is ready the moment the run ends, so
 -- the screen never waits on the backend. The backend answers the death event with the DM's side
@@ -29,7 +29,6 @@ end
 local summary
 local runId
 local shown = false
-local version, menuCache = 0, {}
 
 local font = Font()
 local fontOk = pcall(function() font:Load("font/pftempestasevencondensed.fnt") end) and font:IsLoaded()
@@ -52,7 +51,7 @@ local function setHud(visible)
 end
 
 local function set(s)
-  summary, version = s, version + 1
+  summary = s
   Settings.save({ last_run = summary })
 end
 
@@ -101,28 +100,6 @@ end
 
 local function dmMissing()
   return summary.dm_pending and "tallying..." or "offline this run"
-end
-
---- The last run as plain lines for the menu, wrapped to `width` chars.
-function Death.menuLines(width)
-  if not summary then return { "No finished run yet." } end
-  if menuCache.version == version and menuCache.width == width then return menuCache.lines end
-  local out = {}
-  local function add(text) wrap(text, width, out) end
-  add(heading())
-  if summary.title then add(summary.title) end
-  for _, sec in ipairs(summary.sections) do
-    out[#out + 1] = ""
-    add("- " .. tostring(sec.title) .. " -")
-    for _, row in ipairs(sec.rows or {}) do add(tostring(row[1]) .. ": " .. tostring(row[2])) end
-  end
-  if #summary.sections < 2 then add("- THE DM - " .. dmMissing()) end
-  for _, q in ipairs(quotes()) do
-    out[#out + 1] = ""
-    add(q[1])
-  end
-  menuCache = { version = version, width = width, lines = out }
-  return out
 end
 
 -- ----------------------------------------------------------------- drawing

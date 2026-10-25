@@ -51,7 +51,6 @@ local onSummary        -- optional callback(msg) for the backend's run_summary (
 local onReady          -- optional callback(msg) for the backend's "ready" (the run narrative is in)
 local onEffect         -- optional callback(lines) for every effect sent (the on-screen effect list)
 local onStale          -- optional callback(keys) for the backend's "stale" (decks to rewrite)
-local cruelty          -- nil = backend's --cruelty; set from config / the DM Settings menu
 
 local lineNo = 0       -- numbers our messages in the log
 local boot             -- the backend run whose messages we're reading
@@ -154,14 +153,6 @@ function Bridge.request(kind, key, state, ctx, deadlineMs)
          state = state, ctx = ctx or {} })
   return id
 end
-
---- Change cruelty (0..10, nil = backend default). Sent now if connected, else with the next hello.
-function Bridge.setCruelty(v)
-  cruelty = v
-  if Bridge.ready() then send({ t = "settings", cruelty = v }) end
-end
-
-function Bridge.getCruelty() return cruelty end
 
 --- Where the backend's after-death stats go. Not filtered by session: they can arrive after the
 --- next run has started, so the handler matches them to the run they describe.
@@ -344,7 +335,7 @@ function Bridge.update()
   end
   if not welcomed and t - lastHello > (outdated and 5 * HELLO_MS or HELLO_MS) then
     lastHello = t
-    local h = { t = "hello", session = session, proto = PROTO, cruelty = cruelty }
+    local h = { t = "hello", session = session, proto = PROTO }
     if runIdForHello then h.run, h.new_run = runIdForHello.run, runIdForHello.new_run end
     send(h)
   end

@@ -44,7 +44,7 @@ from server import Coordinator, Engine, build_dm, coverage_table
 
 log = logging.getLogger("llmdm")
 
-DEFAULT_CRUELTY = 6           # until the game's DM Settings menu says otherwise
+DEFAULT_CRUELTY = 6           # until Settings says otherwise
 # The mod pings every 2 s, but only while the game renders: a floor's stage transition (a chapter's
 # nightmare most of all) goes quiet for a while. This long without a message and the game is gone.
 GAME_TIMEOUT_S = 15.0
@@ -94,7 +94,7 @@ class DMThread:
 
     async def _main(self) -> None:
         e = self.engine
-        self.coord = Coordinator(e.dm, DEFAULT_CRUELTY, e.planner, max_concurrency=e.concurrency,
+        self.coord = Coordinator(e.dm, e.cruelty, e.planner, max_concurrency=e.concurrency,
                                  receipt=self.receipt, gate=e.gate, late_grace_s=e.late_grace, agent=e.agent)
         self.loop, self.task = asyncio.get_running_loop(), asyncio.current_task()
         self.ready.set()
@@ -877,11 +877,11 @@ class App:
     def _engine(self, cfg: dict) -> Engine:
         agent = bool(cfg.get("agent_mode"))
         if self.args.mock:
-            return build_dm("mock", "", cruelty=DEFAULT_CRUELTY, agent=agent)
+            return build_dm("mock", "", cruelty=self._cruelty(cfg), agent=agent)
         dm_backend, dm_model = model_catalog.resolve(cfg, "minor")
         planner_backend, planner_model = model_catalog.resolve(cfg, "major")
         return build_dm(dm_backend, appdata.api_key(cfg), google_key=appdata.google_key(cfg),
-                        cruelty=DEFAULT_CRUELTY, model=dm_model,
+                        cruelty=self._cruelty(cfg), model=dm_model,
                         planner_backend=planner_backend, narrative_model=planner_model, floor_model=planner_model,
                         gate_model=model_catalog.resolve(cfg, "gate")[1], agent=agent)
 
@@ -982,8 +982,6 @@ class App:
         left = ttk.Frame(panes, padding=(10, 10, 0, 10))
         buttons = ttk.Frame(left)
         buttons.pack(fill="x", pady=(0, 8))
-        ttk.Button(buttons, text="Open receipts folder",
-                   command=lambda: open_path(self.receipts_dir)).pack(side="left")
         cols = (("started", "Started", 118), ("seed", "Seed", 84), ("outcome", "Outcome", 64),
                 ("entries", "Entries", 56), ("cost", "Cost", 56))
         self.history = ttk.Treeview(left, columns=[c[0] for c in cols], show="headings", selectmode="browse")
@@ -1097,17 +1095,6 @@ class App:
 
         ttk.Label(tab, text="AI Settings", style="Header.TLabel").pack(anchor="w", pady=(0, 8))
 
-        box = ttk.LabelFrame(tab, text=" Mode ", padding=(14, 10))
-        box.pack(fill="x", pady=(0, 14))
-        self.agent_var = tk.BooleanVar(value=bool(self.cfg.get("agent_mode")))
-        ttk.Checkbutton(box, text="Agent mode", variable=self.agent_var, style="Switch.TCheckbutton",
-                        command=lambda: self.settings_msg.configure(text="Press Save and apply to use it.",
-                                                                    foreground=MUTED)).pack(anchor="w")
-        ttk.Label(box, text="On: the DM writes the whole floor ahead in a few calls (every room, pool and deck), "
-                            "then is only called when\nthe re-ask gate finds a deck no longer fits, or one runs out. "
-                            "Off: one DM call per deck, as the game asks for it.\nBoth use the DM and gate models below.",
-                  foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
-
         box = ttk.LabelFrame(tab, text=" Models ", padding=(14, 10))
         box.pack(fill="x")
         ttk.Label(box, text="Set the models the DM will use. Narrative plans the story, DM implements it. "
@@ -1166,7 +1153,7 @@ class App:
         box = ttk.LabelFrame(tab, text=" Claude Code ", padding=(14, 10))
         box.pack(fill="x", pady=(14, 0))
         self.cc_var = tk.BooleanVar(value=bool(self.cfg.get("use_claude_code")))
-        ttk.Checkbutton(box, text="Enable Claude Code", variable=self.cc_var,
+        ttk.Checkbutton(box, text="Route billing through Claude Code", variable=self.cc_var,
                         style="Switch.TCheckbutton", command=self._claude_status).pack(anchor="w")
         ttk.Label(box, text="Enables routing through your own signed-in Claude Code, billed to your Claude plan.",
                   foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
@@ -1174,6 +1161,29 @@ class App:
         self.cc_status.pack(anchor="w", pady=(6, 0))
 
         self._claude_status()
+
+        box = ttk.LabelFrame(tab, text=" Cruelty ", padding=(14, 10))
+        box.pack(fill="x", pady=(14, 0))
+        self.cruelty_var = tk.IntVar(value=self._cruelty())
+        self.cruelty_label = ttk.Label(box, width=28)
+        self.cruelty_label.pack(anchor="w")
+        ttk.Scale(box, from_=0, to=10, orient="horizontal", variable=self.cruelty_var, length=320,
+                  command=self._show_cruelty).pack(anchor="w", pady=(4, 0))
+        ttk.Label(box, text="How hard the Dungeon Master trolls you, from generous (0) to merciless (10). "
+                            "Applies mid-run once saved.",
+                  foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
+        self._show_cruelty()
+
+        box = ttk.LabelFrame(tab, text=" Mode ", padding=(14, 10))
+        box.pack(fill="x", pady=(14, 0))
+        self.agent_var = tk.BooleanVar(value=bool(self.cfg.get("agent_mode")))
+        ttk.Checkbutton(box, text="Agent mode", variable=self.agent_var, style="Switch.TCheckbutton",
+                        command=lambda: self.settings_msg.configure(text="Press Save and apply to use it.",
+                                                                    foreground=MUTED)).pack(anchor="w")
+        ttk.Label(box, text="On: the DM writes the whole floor ahead in a few calls (every room, pool and deck), "
+                            "then is only called when\nthe re-ask gate finds a deck no longer fits, or one runs out. "
+                            "Off: one DM call per deck, as the game asks for it.\nBoth use the DM and gate models above.",
+                  foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
 
         row = ttk.Frame(tab)
         row.pack(fill="x", pady=(16, 0))
@@ -1205,6 +1215,19 @@ class App:
             ttk.Label(files, text=str(path) if path else "not found").grid(row=i, column=1, sticky="w", padx=12)
             if path:
                 ttk.Button(files, text="Open", command=lambda p=path: open_path(p)).grid(row=i, column=2, pady=2)
+
+    def _cruelty(self, cfg: dict | None = None) -> int:
+        try:
+            return max(0, min(10, int((cfg or self.cfg).get("cruelty", DEFAULT_CRUELTY))))
+        except (TypeError, ValueError):
+            return DEFAULT_CRUELTY
+
+    def _show_cruelty(self, _value=None) -> None:
+        c = round(float(self.cruelty_var.get()))
+        band = "generous" if c <= 2 else "mischievous" if c <= 5 else "cruel" if c <= 8 else "merciless"
+        self.cruelty_label.configure(text=f"{c}/10 ({band})")
+        if hasattr(self, "settings_msg") and c != self._cruelty():
+            self.settings_msg.configure(text="Press Save and apply to use it.", foreground=MUTED)
 
     def _claude_status(self) -> None:
         self._show_models()                 # Claude Code's models come and go with the switch
@@ -1311,6 +1334,7 @@ class App:
         cfg = {"openrouter_api_key": self.key_var.get().strip(),
                "google_api_key": self.google_key_var.get().strip(), "use_claude_code": self.cc_var.get(),
                "spoiler_mode": self.spoiler_var.get(), "agent_mode": self.agent_var.get(),
+               "cruelty": round(float(self.cruelty_var.get())),
                **{f"{role}_model": pick for role, pick in self.model_picks.items()}}
         try:
             engine = self._engine(cfg)

@@ -65,9 +65,8 @@ local function safe(name, fn)
   end
 end
 
--- Saved DM Settings (cruelty) go out with the first hello.
 SaveFile.init(mod)
-Settings.init(SaveFile, cfg, Bridge, Death)
+Settings.init(SaveFile)
 Death.init(cfg, Bridge, State, Pills, Settings)
 Bridge.setSummaryHandler(Death.handle)
 Loading.init(cfg, Bridge, State, Taunt, Sched)
@@ -88,7 +87,6 @@ local started = false
 local function live() return started and game:GetFrameCount() > 0 end
 
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, safe("game_started", function(_, continued)
-  Settings.registerMenu()   -- in case Mod Config Menu loaded after this mod
   Settings.reload()
   local seed = game:GetSeeds():GetStartSeedString()
   runSeed = seed

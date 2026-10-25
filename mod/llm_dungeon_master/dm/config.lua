@@ -5,10 +5,6 @@ return {
   POLL_MS = 30,
   LOG_CHUNK = 900,
 
-  -- nil = use the backend's --cruelty. 0 (generous) .. 10 (merciless).
-  -- Only the starting value: once changed in Mod Config Menu > DM Settings, the saved value wins.
-  CRUELTY = nil,
-
   -- What the DM controls. Anything switched off stays vanilla.
   CONTROL_ROOM_LAYOUT = true,
   CONTROL_ROOM_CLEAR  = true,
@@ -61,9 +57,6 @@ return {
   -- payout_plan requests per machine (first ask + re-asks once its schedule runs low)
   MAX_PAYOUT_SENDS = 4,
 
-  -- Characters per line in Mod Config Menu > DM Settings > Last run. Lower it if lines get cut off.
-  MENU_WIDTH = 32,
-
   -- Every floor waits on a loading screen until the DM is ready for it: the run
   -- narrative (first floor), the floor brief, and answers for the rooms next to the start room.
   -- It gives up on its own: CONNECT if the backend isn't there, TIMEOUT (run start) or
@@ -84,7 +77,7 @@ return {
   -- corner for a few seconds.
   SHOW_EFFECTS = true,
   -- After-death stats (yours and the DM's, plus its epitaph) over the game-over screen; the map
-  -- button hides it. Always kept under Mod Config Menu > DM Settings > Last run.
+  -- button hides it.
   SHOW_DEATH_SCREEN = true,
   SHOW_DEBUG_HUD = true,   -- small latency / connection readout in the corner
 }

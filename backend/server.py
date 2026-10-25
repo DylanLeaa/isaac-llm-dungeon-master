@@ -194,7 +194,7 @@ class Coordinator:
         self.last_req: dict[str, dict] = {}       # key -> what the issued answer was written against
         self.epitaph_wanted = epitaph
         self.epitaph = epitaph and hasattr(dm, "epitaph")
-        self.cruelty = self.default_cruelty = cruelty
+        self.cruelty = cruelty
         self.memory = RunMemory()
         self.session: str | None = None
         self.mismatched = None                    # the last session whose hello had the wrong protocol
@@ -268,9 +268,7 @@ class Coordinator:
             task.add_done_callback(self.bg.discard)
         self.epitaph = self.epitaph_wanted and hasattr(engine.dm, "epitaph")
         self.sem = PrioritySemaphore(engine.concurrency)
-        self.dm.set_cruelty(self.cruelty)
-        if self.agent is not None:
-            self.agent.set_cruelty(self.cruelty)
+        self.set_cruelty(engine.cruelty)
         self.campaign.planner = engine.planner
         self.campaign._push()
         if self.agent is None and self.agent_queue:
@@ -327,15 +325,11 @@ class Coordinator:
                 self.last_req.clear()
                 if self.receipt.path:
                     log.info("receipt -> %s", self.receipt.path)
-            self._set_cruelty(msg.get("cruelty"))
+            self.memory.economy.cruelty = self.cruelty
             log.info("game connected  session=%s run=%s cruelty=%s", self.session, msg.get("run"), self.cruelty)
             # agent: the game asks every room's layout and clear at floor start (the agent writes ahead).
             await send({"t": "welcome", "session": self.session, "proto": bridge.PROTO, "cruelty": self.cruelty,
                         "agent": self.agent is not None})
-        elif t == "settings":
-            # Changed from the in-game DM Settings menu; takes effect for the next decision.
-            self._set_cruelty(msg.get("cruelty"))
-            await send({"t": "settings_ok", "session": self.session, "cruelty": self.cruelty})
         elif t == "prepare":
             self._prepare(msg, send)
         elif t == "req":
@@ -374,21 +368,17 @@ class Coordinator:
         elif t == "ping":
             await send({"t": "pong", "session": self.session, "id": msg.get("id")})
 
-    def _set_cruelty(self, value) -> None:
-        """None (the game's 'backend default') means the --cruelty this server was started with."""
-        try:
-            cruelty = self.default_cruelty if value is None else max(0, min(10, int(value)))
-        except (TypeError, ValueError):
-            log.warning("ignoring bad cruelty %r", value)
-            return
+    def set_cruelty(self, value: int) -> None:
+        """From the app's Settings; takes effect for the next decision."""
+        cruelty = max(0, min(10, int(value)))
         if cruelty != self.cruelty:
             log.info("cruelty %d -> %d", self.cruelty, cruelty)
             self._record("cruelty", "set", result=f"{self.cruelty} -> {cruelty}")
             self.cruelty = cruelty
-            self.dm.set_cruelty(cruelty)
-            if self.agent is not None:
-                self.agent.set_cruelty(cruelty)
-        self.memory.economy.cruelty = self.cruelty
+        self.dm.set_cruelty(cruelty)
+        if self.agent is not None:
+            self.agent.set_cruelty(cruelty)
+        self.memory.economy.cruelty = cruelty
 
     # ------------------------------------------------------------------ decks
     def _observe(self, state: dict) -> None:
@@ -1268,6 +1258,7 @@ class Engine:
     late_grace: float = 0.0
     label: str = ""
     agent: object = None          # agent mode: writes every deck (the DM only writes the epitaph)
+    cruelty: int = 6              # 0 (generous) .. 10 (merciless)
 
     def describe(self) -> None:
         log.info("Dungeon Master: %s%s", self.label, "  [agent mode: one call stacks every deck it needs]"
@@ -1292,7 +1283,7 @@ def build_dm(backend: str, api_key: str, *, cruelty: int, model: str | None = No
     if backend == "mock":
         return Engine(MockDM(cruelty, latency=mock_latency), None if no_planners else MockPlanner(),
                       None if no_gate else MockGate(), label="MOCK (offline)",
-                      agent=MockAgent(cruelty, latency=mock_latency) if agent else None)
+                      agent=MockAgent(cruelty, latency=mock_latency) if agent else None, cruelty=cruelty)
     planner_backend = planner_backend or backend
     used = (backend, None if no_planners else planner_backend)
     if not api_key and "openrouter" in used:
@@ -1312,9 +1303,9 @@ def build_dm(backend: str, api_key: str, *, cruelty: int, model: str | None = No
     gate = OpenRouterGate(gate_model, gate_threshold, api_key=api_key) if api_key and not no_gate else None
     if backend == "claude-code":
         return Engine(dm, planner, gate, CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_LATE_GRACE_S,
-                      f"{model} via Claude Code ({dm.runner.bin})", agent=deck_agent)
+                      f"{model} via Claude Code ({dm.runner.bin})", agent=deck_agent, cruelty=cruelty)
     return Engine(dm, planner, gate, label=f"{model} via {'Google AI Studio' if backend == 'google' else 'OpenRouter'}",
-                  agent=deck_agent)
+                  agent=deck_agent, cruelty=cruelty)
 
 
 def _make_dm(backend: str, model: str | None, cruelty: int, api_key: str, claude_bin: str | None,

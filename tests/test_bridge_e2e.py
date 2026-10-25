@@ -209,9 +209,7 @@ def test_protocol():
 
             m.save_own({"link": "S", "cruelty": 9, "pills": {"3": "x"}})
             m.send({"t": "hello", "session": "S", "proto": PROTO, "run": "R", "new_run": True, "cruelty": 9})
-            assert m.recv(lambda x: x["t"] == "welcome")["cruelty"] == 9
-            m.send({"t": "settings", "cruelty": 3, "ack": m.seen, "boot": m.boot})
-            assert m.recv(lambda x: x["t"] == "settings_ok")["cruelty"] == 3
+            assert m.recv(lambda x: x["t"] == "welcome")["cruelty"] == 6, "cruelty is the app's, not the mod's"
             # A long request (several log lines, and a % that must survive the escaping) superseded by another.
             big = {**STATE, "note": "100% " + "x" * 400}
             m.send({"t": "req", "id": 1, "key": "k", "kind": "room_layout", "deadline_ms": 5000, "state": big, "ctx": {}})

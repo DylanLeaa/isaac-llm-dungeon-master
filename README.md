@@ -121,7 +121,7 @@ so the lead time adapts to your connection.
 
 ## Agent mode (the floor written ahead in a few calls)
 
-Off by default: **Settings → Mode → Agent mode** in the app (saved, applied mid-run by Save and apply), or
+Off by default: **Settings → Mode → Agent mode** (bottom of AI Settings) in the app (saved, applied mid-run by Save and apply), or
 `python server.py --agent`. Only one of the two modes runs at a time. With it on, the DM stops answering one
 deck per call. It writes the floor ahead and is woken again only when something no longer fits; each
 wake-up is one **turn** ([backend/server.py](backend/server.py) `_agent_turn`, the models in
@@ -159,9 +159,8 @@ Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the
 - `--cruelty 0..10` scales extra-enemy budget (0–3/room), champion chance cap, curse count (0–2)
   and troll-bomb budget per floor (none below cruelty 4; no curses below 3). Max one live troll bomb
   per room. The planners' prompts list these limits for the current cruelty, and a floor plan is told
-  `allowed_curses`; a curse cut by them is noted in the guardrails. With
-  Mod Config Menu (Pure) installed,
-  **DM Settings → Cruelty** changes it in-game (even mid-run), overrides `--cruelty` and is saved.
+  `allowed_curses`; a curse cut by them is noted in the guardrails. The app's
+  **Settings → Cruelty** slider changes it (even mid-run, on Save and apply) and is saved.
 - **Mercy**: at ≤1 heart, no troll bombs, ≤1 extra enemy, no Curse of the Unknown, and a half
   heart sneaks into the drop after a long heart drought.
 - **Drought breaker**: 0 keys + locked doors seen + 7 key-less clears → a key is added (same for bombs).
@@ -182,7 +181,7 @@ Haiku can choose anything inside the schema; `backend/schemas.py:clamp()` is the
 **1. Backend**
 
 *The app (what players run).* `LLM Dungeon Master.exe` opens a window instead of a console. In
-**Settings**, paste an OpenRouter key or switch on **Use Claude Code**, then press **Save and apply**.
+**Settings**, paste an OpenRouter key or switch on **Route billing through Claude Code**, then press **Save and apply**.
 Changes apply to the running DM straight away, mid-run included. The window has four tabs:
 - **Current run**: the receipt summary (LLM bill, tokens, decisions used / unused / the DM gave up on,
   what the DM did to you, its scheme, last taunt and epitaph), every entry live with its intent and
@@ -192,7 +191,7 @@ Changes apply to the running DM straight away, mid-run included. The window has 
   already been drawn and each deck's intent. Rebuilt from the receipt (`backend/deckview.py`).
 - **History**: every past run's receipt in the same view. Its Deck view shows the decks as they stood
   when the row picked in the receipt was recorded.
-- **Settings**: the key, the Claude Code switch, the models, and the files the backend found. **Models** picks
+- **Settings**: the key, the Claude Code switch, the models, the cruelty slider, agent mode, and the files the backend found. **Models** picks
   three models from OpenRouter's live list, with their prices. **Major** writes the run narrative and floor briefs,
   **Minor** makes every decision (only tool-capable models are listed), and the **re-ask gate** uses one of
   OpenRouter's typed-decisions models. The list is sorted by intelligence (the Artificial Analysis index) by default.
@@ -345,9 +344,7 @@ then the DM's epitaph and its con. The note positions are measured constants at 
   epitaph arrives a second or two after the rest (`--no-epitaph` turns it off).
 
 `SHOW_DEATH_SCREEN = false` in `dm/config.lua` turns
-the overlay off. The last finished run, including a victory, is kept in the save file under
-Mod Config Menu → **DM Settings → Last run** (if lines get cut off there, lower `MENU_WIDTH` in
-`dm/config.lua`). The backend also logs it and adds `run_summary` and
+the overlay off. The last finished run, including a victory, is kept in the save file. The backend also logs it and adds `run_summary` and
 `epitaph` entries to the receipt.
 
 ## What's tested, and what isn't
@@ -369,7 +366,7 @@ Mod Config Menu → **DM Settings → Last run** (if lines get cut off there, lo
   → kills popping the drops deck with the game's drops cancelled (a cancelled card drop takes nothing
   from the cards deck) → tinted rock, beggar, chests and a grab bag paying their schedules (a golden
   chest's item drawn once, from its pool) → the roll audit with nothing covered left to vanilla → the
-  receipt file on disk → death: the stats screen, the DM's side and its epitaph in DM Settings → Last run.
+  receipt file on disk → death: the stats screen, the DM's side and its epitaph.
 - `tests/test_receipt.py` — the receipt: call records, applied/replaced updates, effects, errors,
   planners, resuming a continued run.
 - `tests/test_epilogue.py` — the after-death stats: only applied decisions count, the epitaph
