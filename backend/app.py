@@ -40,7 +40,7 @@ import modinstall
 import receipt as receipts
 from claude_code import find_claude
 from receipt import Receipt
-from server import Coordinator, Engine, build_dm, coverage_table
+from server import Coordinator, Engine, build_dm, coverage_table, restored_count
 
 log = logging.getLogger("llmdm")
 
@@ -570,7 +570,9 @@ class RunView(ttk.Frame):
         cov = coverage_table(r.coverage)
         if cov:
             ctl, free = sum(c[2] for c in cov), sum(c[3] for c in cov)
+            restored = restored_count(r.coverage)
             sections.append(("ROLLS", [["controlled / vanilla", f"{ctl} / {free}"]] +
+                             ([["restored on re-entry", str(restored)]] if restored else []) +
                              [[f"{h} {c}", f"{a} / {b}"] for h, c, a, b in cov[:7]]))
         col = 0
         for name, sec_rows in sections:

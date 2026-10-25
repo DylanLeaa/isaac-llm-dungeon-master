@@ -32,9 +32,11 @@ from claude_code import (CLAUDE_CODE_CONCURRENCY, CLAUDE_CODE_DM_MODEL, CLAUDE_C
                          CLAUDE_CODE_PLANNER_MODEL, ClaudeCodeAgent, ClaudeCodeDM, ClaudeCodePlanner)
 from google_ai import GOOGLE_DEFAULT_MODEL
 from http_retry import CoolingDown, error_fields, error_line
+from item_effects import with_effects
 from agent import MockAgent, OpenRouterAgent, build_turn_message
 from agent_tools import KEEP, SHUFFLE, shuffle_order, stack_kind
 from dm_agent import OPENROUTER_DEFAULT_MODEL, MockDM, OpenRouterDM
+from economy import floor_sig
 from gate import GATE_DEFAULT_MODEL, GATE_THRESHOLD, MockGate, OpenRouterGate, diff, new_events
 from memory import DECK_FIELD, RunMemory, kind_of
 from planners import (FLOOR_DEFAULT_MODEL, NARRATIVE_DEFAULT_MODEL, NARRATIVE_WAIT_S, Campaign, MockPlanner, OpenRouterPlanner,
@@ -61,7 +63,6 @@ URGENT, NEXT_DOOR, BACKGROUND = 0, 1, 2
 AGENT_BATCH_S = {URGENT: 0.0, NEXT_DOOR: 0.25, BACKGROUND: 1.0}
 AGENT_FLAG_WAIT_S = 1.0
 AGENT_MAX_KEYS = 8         # requests a turn answers; more start another turn
-AGENT_OPEN_DECKS = 16       # open decks a turn shows (and may restack), flagged first, then newest
 AGENT_DROPS_DEPTH = MAX_DROPS   # a turn's drops deck: enough for several rooms, so the game rarely asks
 # Open decks a turn may restack unasked. Not pills (a colour may have been swallowed since it was written) nor
 # payouts (a machine's schedule is a story: it is only ever extended, when the game asks).
@@ -245,9 +246,9 @@ class Coordinator:
             log.info("        gate        keep=%d (DM call saved) reask=%d error=%d", g["keep"], g["reask"], g["error"])
         a = self.stats.get("agent")
         if a:
-            log.info("        agent       turns=%d calls=%d stacked=%d shuffled=%d kept=%d pushed=%d rejected=%d "
-                     "skipped=%d timeout=%d error=%d", a["turn"], a["calls"], a["stack"], a["shuffle"], a["keep"],
-                     a["pushed"], a["rejected"], a["skipped"], a["timeout"], a["error"])
+            log.info("        agent       turns=%d calls=%d stacked=%d shuffled=%d kept=%d unchanged=%d pushed=%d "
+                     "rejected=%d skipped=%d timeout=%d error=%d", a["turn"], a["calls"], a["stack"], a["shuffle"],
+                     a["keep"], a["unchanged"], a["pushed"], a["rejected"], a["skipped"], a["timeout"], a["error"])
         u = self.usage
         if u["calls"]:
             log.info("        tokens in=%d (cached %d, %.0f%%) out=%d  cost=$%.4f over %d calls",
@@ -440,8 +441,10 @@ class Coordinator:
                 rows.append([*row, n])
         if rows:
             free = sum(r[3] for r in rows if r[2] == "uncontrolled")
+            restored = sum(r[3] for r in rows if r[2] == RESTORED)
             samples = data.get("samples") if isinstance(data.get("samples"), list) else None
-            self._record("rolls", "tally", result=f"{sum(r[3] for r in rows) - free} controlled, {free} uncontrolled",
+            self._record("rolls", "tally", result=f"{sum(r[3] for r in rows) - free - restored} controlled, "
+                                                  f"{free} uncontrolled" + (f", {restored} restored" if restored else ""),
                          rolls=rows, **({"samples": samples[:100]} if samples else {}))
 
     # ------------------------------------------------------------------ receipt
@@ -588,6 +591,8 @@ class Coordinator:
             ctx["economy"]["verdict"] += f"; kill drops: {kills_left} left this floor"
         elif kind == "floor_plan":
             ctx["allowed_curses"] = max_curses(self.cruelty, mercy_active(state))
+        elif kind == "item_choice" and ctx.get("candidates"):
+            ctx["candidates"] = with_effects(ctx["candidates"])
         return ctx, kills_left
 
     async def _run(self, msg: dict, send: Send) -> None:
@@ -952,17 +957,23 @@ class Coordinator:
         self.agent_flagged.clear()
         self.agent_inflight.clear()
 
-    def _open_deck(self, key: str, why: str | None) -> dict:
-        """An open deck as the agent sees it: what is left and what it was for. One flagged for a restack also
-        shows what it was written against (an item ranking's candidates, a room's shape), to rewrite it from."""
+    def _open_deck(self, key: str, why: str | None, state: dict) -> dict:
+        """An open deck as the agent sees it: what is left, what it was for, and how the player has changed
+        since it was written. One flagged for a restack also shows what it was written against (an item
+        ranking's candidates, a room's shape), to rewrite it from."""
         e = self.memory.issued[key]
         d = e["decision"]
         out = {"key": key, "kind": e["kind"], "left": list(e["left"]), "drawn": self.memory.drawn_total.get(key, 0),
                "intent": d.get("intent", ""), **({"scheme": d["scheme"]} if d.get("scheme") else {}),
                "age_s": round(time.monotonic() - e["at"])}
+        moved = state_diff(self.last_req[key].get("state") or {}, state)
+        if moved:
+            out["since_written"] = moved
         if why:
-            out.update(restack=why, context={k: v for k, v in self.last_req[key]["ctx"].items()
-                                             if k not in _OPEN_CTX_HIDDEN})
+            ctx = {k: v for k, v in self.last_req[key]["ctx"].items() if k not in _OPEN_CTX_HIDDEN}
+            if ctx.get("candidates"):
+                ctx["candidates"] = with_effects(ctx["candidates"])
+            out.update(restack=why, context=ctx)
         return out
 
     async def _agent_turn(self, asks: list[dict], flags: dict[str, str], send: Send) -> None:
@@ -985,7 +996,10 @@ class Coordinator:
             if kind == "drops":                   # written to last several rooms, not just the one asked about
                 ctx["wanted"] = AGENT_DROPS_DEPTH
             p = {"key": key, "rid": int(m["id"]), "kind": kind, "state": st, "ctx": ctx, "asked_ctx": asked_ctx,
-                 "deadline_ms": m.get("deadline_ms", 4000)}
+                 "deadline_ms": m.get("deadline_ms", 4000),
+                 # A deck the game draws from while the turn runs can be used up before a keep_deck lands.
+                 "had_deck": self.memory.previous(key) is not None,
+                 "drawn_at_turn": self.memory.drawn_total.get(key, 0)}
             if kills_left == 0:
                 spent.append(p)
             else:
@@ -998,14 +1012,16 @@ class Coordinator:
                               asked_ctx=p["asked_ctx"], digest=digest, raw=raw, call=None, usage=None, ms=_ms(t0),
                               local=True, rec={"key": p["key"], "req_id": p["rid"],
                                                "request": {"state": p["state"], "ctx": p["ctx"]}})
-        # The open decks it may restack: none being decided elsewhere or waiting for a request of their own.
+        # The open decks it may restack: this floor's, none being decided elsewhere or waiting for a request of
+        # their own. A deck from an earlier floor can't be drawn any more.
         me = asyncio.current_task()
         busy = set(self.agent_queue) | {k for k, (_r, t) in self._deciding() if t is not me and not t.done()}
+        here = floor_sig(state or {})
         open_keys = [k for k, e in reversed(list(self.memory.issued.items()))
                      if k not in pending and k not in busy and k in self.last_req and e["left"]
-                     and e["kind"] in AGENT_RESTACK_KINDS]
+                     and e["kind"] in AGENT_RESTACK_KINDS
+                     and floor_sig(self.last_req[k].get("state") or {}) in (here, None)]
         open_keys.sort(key=lambda k: k not in flags)    # flagged first, then newest
-        open_keys = open_keys[:AGENT_OPEN_DECKS]
         if not pending and not any(k in flags for k in open_keys):
             return                                # the flagged decks were used up or asked for meanwhile
         trigger = "; ".join([f'{k} asked ({p["asked_ctx"].get("reason") or "no reason given"})'
@@ -1013,7 +1029,7 @@ class Coordinator:
                             + [f"{k} needs a restack ({w})" for k, w in flags.items() if k in open_keys])
         turn = {"trigger": trigger,
                 "pending": [{"key": k, "kind": p["kind"], "context": _turn_ctx(p["ctx"])} for k, p in pending.items()],
-                "open_decks": [self._open_deck(k, flags.get(k)) for k in open_keys],
+                "open_decks": [self._open_deck(k, flags.get(k), state) for k in open_keys],
                 "state": state, "economy": self.memory.economy.view(None),
                 "memory": {k: v for k, v in digest.items() if k != "your_open_decks"}}
         deadline = max(MIN_DEADLINE_S, min(MAX_DEADLINE_S, max(float(p["deadline_ms"]) for p in pending.values()) / 1000)) \
@@ -1111,6 +1127,20 @@ class Coordinator:
                 res["retry_ms"] = int(e.retry_in * 1000)
             await self._send_quietly(send, res)
 
+    async def _keep(self, kind: str, key: str, rid: int, prev: dict, why: str, turn_seq: int, ms: int,
+                    send: Send) -> None:
+        """The same deck answers request `rid`: what is left of it, and how many draws that already accounts for."""
+        self.memory.reissue(key, rid)
+        seq = self.receipt_seq.get(key, self.used_seq.get(key))
+        if seq is not None:
+            self.answer_seq[(key, rid)] = seq
+        self.stats[kind]["reused"] += 1
+        self.stats["agent"]["keep"] += 1
+        self._record("agent", "kept", key=key, req_id=rid, turn=turn_seq, result=why)
+        log.info("%-11s %-14s kept by the agent (%s)", kind, key, why or "no reason given")
+        await send({"t": "res", "session": self.session, "id": rid, "key": key, "kind": kind, "ok": True, "ms": ms,
+                    "decision": prev, "drawn_base": self.memory.drawn_total.get(key, 0)})
+
     async def _agent_call(self, c: dict, pending: dict[str, dict], open_keys: set[str], answered: set[str],
                           state: dict, digest: dict, campaign: str, turn_seq: int, ms: int, late: bool,
                           send: Send) -> str | None:
@@ -1138,18 +1168,19 @@ class Coordinator:
                 return "keep_deck is for pending requests (an open deck is kept by leaving it alone)"
             prev = self.memory.previous(key)
             if not prev:
+                if p["had_deck"] and self.memory.drawn_total.get(key, 0) > p["drawn_at_turn"]:
+                    # Used up while the turn ran: the keep was right, there is just nothing left to send. The
+                    # game re-asks if it still needs the key.
+                    a["keep"] += 1
+                    self._record("agent", "kept", key=key, req_id=rid, turn=turn_seq,
+                                 result="used up while the turn ran: " + str(args.get("why") or ""))
+                    log.info("%-11s %-14s kept by the agent, already used up", kind, key)
+                    await self._send_quietly(send, {"t": "res", "session": self.session, "id": rid, "key": key,
+                                                    "kind": kind, "ok": False, "reason": "used_up"})
+                    answered.add(key)
+                    return None
                 return "there is no deck to keep"
-            # The same deck answers this request: what is left of it, and how many draws that already accounts for.
-            self.memory.reissue(key, rid)
-            seq = self.receipt_seq.get(key, self.used_seq.get(key))
-            if seq is not None:
-                self.answer_seq[(key, rid)] = seq
-            self.stats[kind]["reused"] += 1
-            a["keep"] += 1
-            self._record("agent", "kept", key=key, req_id=rid, turn=turn_seq, result=str(args.get("why") or ""))
-            log.info("%-11s %-14s kept by the agent (%s)", kind, key, args.get("why") or "no reason given")
-            await send({"t": "res", "session": self.session, "id": rid, "key": key, "kind": kind, "ok": True, "ms": ms,
-                        "decision": prev, "drawn_base": self.memory.drawn_total.get(key, 0)})
+            await self._keep(kind, key, rid, prev, str(args.get("why") or ""), turn_seq, ms, send)
             answered.add(key)
             return None
         if tool == SHUFFLE:
@@ -1172,6 +1203,17 @@ class Coordinator:
             decision, budget = self._clamp(kind, key, raw, st, ctx)
         except Exception as e:                    # noqa: BLE001 - one bad call doesn't sink the turn
             return f"its answer couldn't be made legal ({type(e).__name__}: {e})"
+        prev = self.memory.previous(key)
+        if prev and _same_deck(prev, decision):
+            # Restacked to what it already holds: a keep, so the game isn't sent the same deck again.
+            a["unchanged"] += 1
+            if push:
+                self._record("agent", "unchanged", key=key, turn=turn_seq, result=f"{tool}: the same deck")
+                log.info("%-11s %-14s restacked to the same deck: left as it is", kind, key)
+            else:
+                await self._keep(kind, key, rid, prev, f"{tool}: the same deck", turn_seq, ms, send)
+            answered.add(key)
+            return None
         a[action] += 1
         if push:
             self.push_id -= 1
@@ -1184,8 +1226,36 @@ class Coordinator:
         return None
 
 
+_DECK_TEXT = ("intent", "taunt", "scheme", "guardrails")
+
+
+def _same_deck(prev: dict, decision: dict) -> bool:
+    """Two answers that do the same thing in the game (their notes and taunt aside)."""
+    def body(d: dict) -> dict:
+        return {k: v for k, v in _compact(d).items() if k not in _DECK_TEXT}
+    return body(prev) == body(decision)
+
+
 # What an open deck's stored ctx shows the agent: not the live deck (`left` has that), nor the economy (the turn's).
 _OPEN_CTX_HIDDEN = ("deck_left", "drawn_so_far", "economy", "your_previous_answer", "owed", "reason")
+
+
+_DIFF_FIELDS = (("resources", "coins"), ("resources", "bombs"), ("resources", "keys"), ("hp", "red"),
+                ("hp", "max_red"), ("hp", "soul"))
+
+
+def state_diff(old: dict, new: dict) -> str:
+    """How the player moved between two snapshots, only what changed: "coins 0->4, hp.red 6->3, +Libra (q1)"."""
+    po, pn = old.get("player") or {}, new.get("player") or {}
+    bits = []
+    for group, field in _DIFF_FIELDS:
+        a, b = (po.get(group) or {}).get(field), (pn.get(group) or {}).get(field)
+        if a is not None and b is not None and a != b:
+            bits.append(f"{field if group == 'resources' else group + '.' + field} {a}->{b}")
+    items_o, items_n = po.get("items"), pn.get("items")
+    if isinstance(items_o, list) and isinstance(items_n, list):
+        bits += [f"+{i}" for i in items_n if i not in items_o] + [f"-{i}" for i in items_o if i not in items_n]
+    return ", ".join(bits)
 
 
 def _turn_ctx(ctx: dict) -> dict:
@@ -1212,10 +1282,17 @@ def _ms(t0: float) -> int:
     return int((time.perf_counter() - t0) * 1000)
 
 
+# The roll audit's owner for a pickup the game spawned again as the player walked back into its room: no roll.
+RESTORED = "restored"
+
+
 def coverage_table(coverage: Counter) -> list[tuple[str, str, int, int]]:
-    """The roll audit per hook and cause: (hook, cause, controlled, uncontrolled), most uncontrolled first."""
+    """The roll audit per hook and cause: (hook, cause, controlled, uncontrolled), most uncontrolled first.
+    Restored pickups aren't rolls and are left out (restored_count has them)."""
     by: dict[tuple[str, str], Counter] = defaultdict(Counter)
     for (hook, cause, owner), n in coverage.items():
+        if owner == RESTORED:
+            continue
         by[(hook, cause)]["uncontrolled" if owner == "uncontrolled" else "controlled"] += n
     rows = [(h, c, n["controlled"], n["uncontrolled"]) for (h, c), n in by.items()]
     return sorted(rows, key=lambda r: (-r[3], -r[2], r[0], r[1]))
@@ -1228,7 +1305,15 @@ def coverage_lines(coverage: Counter) -> list[str]:
         return []
     out = [f"rolls {'hook/cause':<34} {'controlled':>10} {'uncontrolled':>12}"]
     out += [f"      {h + '/' + c:<34} {ctl:>10} {free:>12}" for h, c, ctl, free in rows]
+    restored = restored_count(coverage)
+    if restored:
+        out.append(f"      {'(not rolls) restored on re-entry':<34} {restored:>10}")
     return out
+
+
+def restored_count(coverage: Counter) -> int:
+    """Pickups the game spawned again as the player walked back into their room."""
+    return sum(n for (_h, _c, owner), n in coverage.items() if owner == RESTORED)
 
 
 def _summary_msg(session: str | None, summary: dict) -> dict:

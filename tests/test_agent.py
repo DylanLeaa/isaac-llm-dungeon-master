@@ -360,3 +360,80 @@ def test_claude_code_agent_carries_every_tool_in_its_prompt():
     from claude_code import _AGENT_SCHEMA, _AGENT_TOOLS_TEXT
     assert all(name in _AGENT_TOOLS_TEXT for name in AGENT_TOOLS)
     assert _AGENT_SCHEMA["properties"]["calls"]["items"]["properties"]["tool"]["enum"] == list(AGENT_TOOLS)
+
+
+def test_a_restack_to_the_same_deck_is_a_keep_and_an_open_one_is_not_pushed_again():
+    agent = ScriptedAgent([[stack("room_clear", "clear:1:85", **clear("bomb")),
+                            stack("room_clear", "clear:1:86", **clear("penny"))],
+                           [stack("room_clear", "clear:1:85", **clear("bomb")),        # pending: the same deck
+                            stack("room_clear", "clear:1:86", **clear("penny"))]])     # open: the same deck
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent)
+    sent = run(coord, [req(1, "clear:1:85", "room_clear"), req(2, "clear:1:86", "room_clear"), 0.3,
+                       req(3, "clear:1:85", "room_clear")])
+    res = {m["id"]: m for m in results(sent)}
+    assert res[3]["ok"] and res[3]["decision"]["rewards"] == [{"reward": "bomb", "count": 1}]
+    assert not any(m.get("push") for m in results(sent)), "the open deck isn't sent again unchanged"
+    a = coord.stats["agent"]
+    assert a["unchanged"] == 2 and a["keep"] == 1 and a["stack"] == 2 and a["rejected"] == 0
+    assert coord.memory.issued["clear:1:85"]["rid"] == 3 and coord.stats["room_clear"]["ok"] == 2
+
+
+def test_a_keep_for_a_deck_used_up_while_the_turn_ran_counts_as_kept():
+    agent = ScriptedAgent([[stack("room_clear", "clear:1:85", **clear("bomb"))],
+                           [{"tool": "keep_deck", "args": {"key": "clear:1:85", "why": "still fits"}}]], delay=0.3)
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent)
+    sent = run(coord, [req(1, "clear:1:85", "room_clear"), 0.5, req(2, "clear:1:85", "room_clear"), 0.2,
+                       {"t": "drawn", "key": "clear:1:85", "id": 1, "outcome": {"applied": True}}], settle=0.5)
+    res = {m["id"]: m for m in results(sent)}
+    assert res[2] == {"t": "res", "session": None, "id": 2, "key": "clear:1:85", "kind": "room_clear",
+                      "ok": False, "reason": "used_up"}
+    a = coord.stats["agent"]
+    assert a["keep"] == 1 and a["rejected"] == 0 and a["skipped"] == 0
+
+
+def test_open_decks_are_this_floors_with_no_cap_and_say_how_the_player_moved():
+    floor2 = {"stage": 2, "stage_type": 0, "name": "Basement II", "room_types": {"default": 10}}
+    def answer(turn):                             # 8 keys to a turn: every turn answers what it holds
+        return [stack("room_clear", p["key"], **clear()) for p in turn["pending"]]
+    agent = ScriptedAgent([answer] * 8)
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent)
+
+    def at(rid, key, level, coins=0, items=()):
+        m = req(rid, key, "room_clear")
+        m["state"] = {**m["state"], "level": level}
+        m["state"]["player"] = {**m["state"]["player"], "resources": {"keys": 1, "bombs": 1, "coins": coins},
+                                "items": list(items)}
+        return m
+
+    run(coord, [at(100 + i, f"clear:1:{i}", FLOOR) for i in range(20)] + [0.3]
+        + [at(200 + i, f"clear:2:{i}", floor2) for i in range(20)] + [0.3]
+        + [at(300, "clear:2:99", floor2, coins=4, items=["Libra (q1)"])])
+    opened = next(t for t in agent.seen if t["pending"][0]["key"] == "clear:2:99")["open_decks"]
+    assert {d["key"] for d in opened} == {f"clear:2:{i}" for i in range(20)}, "every deck, none from floor 1"
+    assert opened[0]["since_written"] == "coins 0->4, +Libra (q1)"
+
+
+def test_state_diff_names_only_what_moved():
+    old = {"player": {"resources": {"coins": 0, "keys": 1}, "hp": {"red": 6, "soul": 0}, "items": ["Gemini (q1)"]}}
+    new = {"player": {"resources": {"coins": 4, "keys": 1}, "hp": {"red": 3, "soul": 0}, "items": ["Libra (q1)"]}}
+    assert server.state_diff(old, new) == "coins 0->4, hp.red 6->3, +Libra (q1), -Gemini (q1)"
+    assert server.state_diff(old, old) == ""
+
+
+def test_item_candidates_carry_what_each_item_does():
+    agent = ScriptedAgent([[stack("item_choice", "items:1:0", order=[304])]])
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent)
+    run(coord, [req(1, "items:1:0", "item_choice",
+                    {"candidates": [{"id": 304, "name": "Libra", "quality": 1}, {"id": 99999, "name": "Modded"}]})])
+    cands = agent.seen[0]["pending"][0]["context"]["candidates"]
+    assert cands[0]["effect"].startswith("Gives 6 Coins, 6 Bombs, and 6 Keys")
+    assert "effect" not in cands[1], "an item the table doesn't know is shown as it came"
+
+
+def test_restored_pickups_are_kept_apart_from_the_roll_audit():
+    from collections import Counter
+    cov = Counter({("spawn", "room_restore", "restored"): 5, ("spawn", "unknown", "uncontrolled"): 2,
+                   ("spawn", "enemy_death", "drops"): 3})
+    assert server.coverage_table(cov) == [("spawn", "unknown", 0, 2), ("spawn", "enemy_death", 3, 0)]
+    assert server.restored_count(cov) == 5
+    assert "restored on re-entry" in server.coverage_lines(cov)[-1]

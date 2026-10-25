@@ -39,6 +39,8 @@
 --   * a layout pickup fires MC_PRE_ROOM_ENTITY_SPAWN and then MC_PRE_ENTITY_SPAWN on the same frame, with
 --     no spawner and the same variant: matched here and counted once, as room_entity.
 --   * a boss room's pedestal spawns as clean_award, variant 100: its item is the get_collectible roll.
+--   * walking back into a room spawns its leftover pickups again, with no spawner, as it loads: counted
+--     with cause room_restore and owner "restored" (causes.lua), apart from the rolls.
 local Rolls = {}
 
 local game = Game()
@@ -137,6 +139,8 @@ local function preSpawn(etype, variant, subtype, pos, _vel, spawner, seed)
     verdict = c.fn(info)
     if verdict then owner = c.name; break end
   end
+  -- A pickup restored on walking back in is no roll: counted apart, as "restored", never as uncontrolled.
+  if not owner and info.cause == "room_restore" then owner = "restored" end
   -- A pedestal no stream claimed (a boss's, a room's): where it stands isn't random, and its item is the
   -- MC_PRE_GET_COLLECTIBLE roll, counted there.
   if owner or variant ~= PickupVariant.PICKUP_COLLECTIBLE then Rolls.count("spawn", info.cause, owner) end

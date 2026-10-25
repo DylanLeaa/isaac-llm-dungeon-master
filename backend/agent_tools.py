@@ -56,7 +56,8 @@ AGENT_TOOLS: dict[str, dict[str, Any]] = {
     KEEP: {
         "name": KEEP,
         "description": "Answer a pending request with its deck as it stands: nothing meaningful changed. Only "
-                       "for keys in `pending` that already have a deck (context.your_previous_answer).",
+                       "for keys in `pending` that already have a deck (context.your_previous_answer). Never for "
+                       "a restock (its reason starts \"restock\": the deck is running out): restack it instead.",
         "input_schema": {
             "type": "object",
             "properties": {

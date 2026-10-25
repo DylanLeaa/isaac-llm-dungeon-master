@@ -257,3 +257,26 @@ def test_tinted_rock_loot():
     assert out["tinted_rock_loot"] == [] and any("tinted rock" in n for n in out["guardrails"])
     diffs = clamp_diff("room_layout", raw, out)
     assert "tinted rock loot troll_bomb -> none" in diffs, diffs
+
+
+def test_what_the_player_gains_outside_the_decks_counts_against_the_budget():
+    from economy import Economy
+
+    def snap(coins, keys=0, red=6):
+        return {"level": {"stage": 1, "stage_type": 0, "room_types": {"default": 10}},
+                "player": {"resources": {"coins": coins, "keys": keys, "bombs": 0}, "hp": {"red": red, "soul": 0}}}
+
+    econ = Economy()
+    econ.cruelty = 6
+    econ.observe(snap(0))
+    econ.draw("drops:1", {"reward": "penny", "count": 1})     # the DM's penny...
+    econ.observe(snap(1))                                    # ...picked up: not outside
+    econ.observe(snap(7, keys=6))                            # Libra: +6 coins, +6 keys
+    econ.observe(snap(2, keys=5, red=4))                     # spent and hurt: no gain
+    assert econ.outside("coins") == 6 and econ.outside("keys") == 6 and econ.outside("hearts") == 0
+    assert econ.given("coins") == 7 and econ.delivered["coins"] == 1
+    view = econ.view(None)
+    assert view["coins"]["delivered"] == 1 and view["coins"]["outside"] == 6
+    assert "keys: 6 given (6 of it from outside your decks)" in view["verdict"]
+    econ.observe({**snap(2, keys=5), "level": {"stage": 2, "stage_type": 0, "room_types": {"default": 10}}})
+    assert econ.outside("keys") == 0, "a new floor starts its own count"

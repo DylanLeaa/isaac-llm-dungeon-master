@@ -18,6 +18,14 @@ local function spawn(...)
   return e
 end
 
+-- The same for turning a pickup into another: its spawn and selection callbacks are ours, not the game's.
+local function morph(p, ...)
+  Apply.spawning = true
+  local ok, e = pcall(p.Morph, p, ...)
+  Apply.spawning = false
+  if not ok then error(e, 0) end
+end
+
 local function E(tbl, name)
   local t = _G[tbl]
   return t and t[name]
@@ -229,7 +237,7 @@ local function layoutPickups(mode, rng, late)
   elseif MORPH[mode] then
     local _, variant, subtype = resolve(MORPH[mode])
     if variant then
-      for _, p in ipairs(list) do p:Morph(EntityType.ENTITY_PICKUP, variant, subtype, true) end
+      for _, p in ipairs(list) do morph(p, EntityType.ENTITY_PICKUP, variant, subtype, true) end
       return tally("-", names) .. " -> " .. count("+", #list, MORPH[mode]) .. " (layout pickups)"
     end
   elseif mode == "troll_bombs" then

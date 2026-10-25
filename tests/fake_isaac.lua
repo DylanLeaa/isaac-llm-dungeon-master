@@ -201,6 +201,7 @@ function room:RemoveGridEntity(i) W.removedGrid[#W.removedGrid + 1] = i; W.grid[
 function room:GetGridPosition(i) return Vector(i * 40 % 520, math.floor(i / 13) * 40) end
 function room:GetType() return W.rooms[W.cur].Data.Type end
 function room:IsFirstVisit() return W.rooms[W.cur].VisitedCount == 1 end
+function room:GetFrameCount() return W.roomAge or 1000 end   -- frames since the room loaded
 function room:IsClear()
   for _, e in ipairs(W.enemies) do if e.HitPoints > 0 then return false end end
   return true

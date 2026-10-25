@@ -16,8 +16,11 @@ from http_retry import raise_for_status
 from memory import DECK_FIELD
 from prompts import system_prompt
 
-# A turn can write several decks (a floor start: item rankings, cards, trinkets, pills), up to ~1900 tokens each.
-AGENT_MAX_TOKENS = 8192
+# A turn can write several decks (a floor start: item rankings, cards, trinkets, pills), up to ~1900 tokens each,
+# and medium reasoning comes out of the same allowance.
+AGENT_MAX_TOKENS = 52000
+# One turn runs every deck at once and has to check the open ones against the state (as CLAUDE_CODE_AGENT_EFFORT).
+AGENT_REASONING_EFFORT = "medium"
 
 
 def build_turn_message(turn: dict) -> str:
@@ -43,11 +46,15 @@ def tool_calls(msg: dict) -> tuple[list[dict], list[str]]:
 
 class OpenRouterAgent(OpenRouterDM):
     """The DM in agent mode, through OpenRouter's (or Google AI Studio's) OpenAI-compatible endpoint. Same
-    client, retries, cooldown and thinking handling as OpenRouterDM; its own system prompt and tools."""
+    client, retries, cooldown and fallbacks as OpenRouterDM; its own system prompt and tools, and it thinks
+    (AGENT_REASONING_EFFORT) where the single decisions don't."""
 
-    def __init__(self, cruelty: int, max_tokens: int = AGENT_MAX_TOKENS, **kw) -> None:
+    def __init__(self, cruelty: int, max_tokens: int = AGENT_MAX_TOKENS,
+                 effort: str = AGENT_REASONING_EFFORT, **kw) -> None:
         self.tool_choice: str = "required"        # dropped to "auto" if the provider won't take it
         super().__init__(cruelty, max_tokens=max_tokens, **kw)
+        self.reasoning = {"effort": effort}       # OpenRouter; a model with no reasoning ignores it
+        self.effort = effort                      # Google; dropped if the model has no thinking setting
 
     def _build_system(self) -> None:
         content = [{"type": "text", "text": system_prompt(self.cruelty, agent=True),
@@ -114,4 +121,4 @@ class MockAgent:
         return calls, {"model": "mock", "finish": "tool_calls"}
 
 
-__all__ = ["AGENT_MAX_TOKENS", "MockAgent", "OpenRouterAgent", "build_turn_message", "tool_calls"]
+__all__ = ["AGENT_MAX_TOKENS", "AGENT_REASONING_EFFORT", "MockAgent", "OpenRouterAgent", "build_turn_message", "tool_calls"]

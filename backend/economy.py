@@ -8,6 +8,10 @@ it keeps, per floor:
   delivered   what the game actually handed out (the mod's `drawn` messages)
   committed   per deck key: outcomes written but not drawn yet. A re-ask of a key replaces its own row.
   bought      what machines paid back for a payment: an exchange, it never counts against the target
+  outside     what the player gained that no deck explains (an item's pickup grant like Libra's, Piggy
+              Bank's pennies, a shop purchase, the game's own boss hearts): every rise in what Isaac holds,
+              less what the DM delivered and machines paid. Counted as given, so the budget matches his
+              pockets. A lower bound: a spend and a gain between two snapshots cancel out.
   contingent  per key: chest contents and tinted-rock loot (charged only once opened or bombed), and
               machine schedules (shown to other calls, never reserved)
 clamp() trims an answer against the budget (Budget) and the Coordinator commits it in the same
@@ -30,6 +34,7 @@ FLOOR_TRIMMED = ("keys", "bombs", "coins", "hearts", "cards", "pills", "trinkets
 RUN_TRIMMED = ("luck",)
 GIFT, CONTINGENT, EXCHANGE = "gift", "contingent", "exchange"
 UNITS_NOTE = "coins in cents, hearts in half hearts, the rest by count (a golden key/bomb is 3)"
+OUTSIDE_COUNTED = ("keys", "bombs", "coins", "hearts")    # what a snapshot shows Isaac holding
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -107,6 +112,17 @@ def floor_sig(state: dict) -> tuple | None:
     return (level.get("stage"), level.get("stage_type"))
 
 
+def held(state: dict) -> dict[str, float] | None:
+    """What the player holds in each OUTSIDE_COUNTED family, in budget units; None without a player."""
+    p = (state or {}).get("player")
+    if not isinstance(p, dict) or not isinstance(p.get("resources"), dict):
+        return None
+    r, hp = p["resources"], p.get("hp") if isinstance(p.get("hp"), dict) else {}
+    return {"coins": _num(r.get("coins")), "keys": _num(r.get("keys")) + 3 * bool(r.get("golden_key")),
+            "bombs": _num(r.get("bombs")) + 3 * bool(r.get("golden_bomb")),
+            "hearts": _num(hp.get("red")) + _num(hp.get("soul")) + 2 * _num(hp.get("eternal"))}
+
+
 def normal_rooms(state: dict) -> int:
     """Rooms on the floor that fight and drop like a normal room."""
     level = state.get("level") or {}
@@ -137,14 +153,18 @@ class Economy:
     def _clear_floor(self) -> None:
         self.delivered: Counter = Counter()
         self.bought: Counter = Counter()
+        self.gained: Counter = Counter()          # every rise in what the player holds, this floor
+        self.held: dict[str, float] | None = None  # what the last snapshot showed (None: the floor's first)
         self.committed: dict[str, Counter] = {}
         self.contingent: dict[str, Counter] = {}
 
     # ------------------------------------------------------------ floors
     def observe(self, state: dict) -> bool:
-        """Every request's snapshot: a floor not seen before starts a new ledger. True if it did."""
+        """Every request's snapshot: a floor not seen before starts a new ledger. True if it did. Every
+        snapshot also counts what the player gained since the last one (see `outside`)."""
         sig = floor_sig(state or {})
         if sig is None or sig == self.sig or sig in self.seen:
+            self._held(state)
             return False
         if self.sig is not None:
             self.last_floor = self.report_floor()
@@ -155,7 +175,23 @@ class Economy:
         self._clear_floor()
         self.modes = {}
         self.version += 1
+        self._held(state)
         return True
+
+    def _held(self, state: dict) -> None:
+        now = held(state)
+        if now is None:
+            return
+        if self.held is not None:
+            for f, v in now.items():
+                self.gained[f] += max(0.0, v - self.held.get(f, 0.0))
+        self.held = now
+
+    def outside(self, family: str) -> float:
+        """What the player gained this floor that the DM's decks don't account for."""
+        if family not in OUTSIDE_COUNTED:
+            return 0.0
+        return max(0.0, self.gained[family] - self.delivered[family] - self.bought[family])
 
     def set_words(self, sig: tuple | None, words: dict[str, str]) -> None:
         """The floor brief's ECONOMY block for floor `sig` (starve | lean | vanilla | generous | flood)."""
@@ -185,7 +221,9 @@ class Economy:
         return self.target(family) + self.slack(family)
 
     def given(self, family: str) -> float:
-        return self.run_delivered[family] if family in RUN_TRIMMED else self.delivered[family]
+        if family in RUN_TRIMMED:
+            return self.run_delivered[family]
+        return self.delivered[family] + self.outside(family)
 
     def elsewhere(self, family: str, key: str | None) -> float:
         return sum(row.get(family, 0) for k, row in self.committed.items() if k != key)
@@ -267,10 +305,12 @@ class Economy:
             if f == "power":
                 out[f] = {"vanilla": round(self.vanilla(f), 1), "given": round(self.delivered[f], 1)}
                 continue
-            given, other, cap = self.given(f), self.elsewhere(f, key), self.cap(f)
+            given, other, cap, outside = self.given(f), self.elsewhere(f, key), self.cap(f), self.outside(f)
             remaining = max(0.0, cap - given - other)
-            e: dict[str, Any] = {"target": round(self.target(f), 1), "delivered": _tidy(given),
+            e: dict[str, Any] = {"target": round(self.target(f), 1), "delivered": _tidy(given - outside),
                                  "committed_elsewhere": _tidy(other), "remaining": round(remaining, 1)}
+            if outside:
+                e["outside"] = _tidy(outside)
             promised = {k: _tidy(row[f]) for k, row in self.committed.items() if k != key and row.get(f, 0) > 0}
             if promised:
                 e["promised_by"] = promised
@@ -283,7 +323,7 @@ class Economy:
                 e["per"] = "run"
             out[f] = e
             if f in FLOOR_TRIMMED + RUN_TRIMMED:
-                verdict.append(_verdict(f, given, other, promised, cap, remaining, self.word(f)))
+                verdict.append(_verdict(f, given, other, promised, cap, remaining, self.word(f), outside))
         out["units"] = UNITS_NOTE
         out["verdict"] = "; ".join(verdict) or "nothing given or promised yet"
         return out
@@ -291,7 +331,8 @@ class Economy:
     def report_floor(self) -> dict:
         """This floor against vanilla, for the digest and the next floor's brief."""
         return {f: {"vanilla": round(self.vanilla(f), 1), "target": round(self.target(f), 1),
-                    "delivered": _tidy(self.delivered[f]), **({"bought": _tidy(self.bought[f])} if self.bought[f] else {})}
+                    "delivered": _tidy(self.delivered[f]), **({"bought": _tidy(self.bought[f])} if self.bought[f] else {}),
+                    **({"outside": _tidy(self.outside(f))} if self.outside(f) else {})}
                 for f in FAMILIES if f != "luck"}
 
     def report(self) -> dict:
@@ -304,8 +345,9 @@ def _tidy(v: float) -> float | int:
     return int(v) if float(v).is_integer() else round(v, 1)
 
 
-def _verdict(f: str, given: float, other: float, promised: dict, cap: float, remaining: float, word: str) -> str:
-    bits = [f"{f}: {_tidy(given)} given"]
+def _verdict(f: str, given: float, other: float, promised: dict, cap: float, remaining: float, word: str,
+             outside: float = 0.0) -> str:
+    bits = [f"{f}: {_tidy(given)} given" + (f" ({_tidy(outside)} of it from outside your decks)" if outside else "")]
     if other:
         top = max(promised, key=promised.get) if promised else "other decks"
         bits.append(f"{_tidy(other)} promised" + (f" by {top}" if len(promised) == 1 else " by other decks"))

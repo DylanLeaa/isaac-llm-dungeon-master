@@ -394,6 +394,31 @@ def run(tmp, game):
     assert len(drawn("drops:1")) == d1 + 1, "the kill drew from the new answer"
     print("15b1. empty deck: the kill's drop was cancelled, the game froze until the DM answered")
 
+    # --- a boss's death is a kill: it draws the drops deck and the game's boss hearts are cancelled ---
+    boss = W.makeEnemy(50, 320, 200)
+    boss["boss"] = True
+    W.enemies = lua.table_from([boss])
+    d2 = len(drawn("drops:1"))
+    W.kill(boss)
+    bheart = W.spawnPickup(PV.PICKUP_HEART, 0, 320, 200, boss)
+    assert bheart.removed, "the game's boss heart is cancelled"
+    tick()
+    wait(lambda: not Hold.holding("drops:1"), 8, "the drops answer for the boss kill")
+    tick(3)
+    assert len(drawn("drops:1")) == d2 + 1, "the boss kill drew one entry"
+    lines = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == "drops:1" for l in m["effect"]]
+    assert any(l.startswith("boss kill:") for l in lines), lines
+    W.enemies = lua.table_from([])
+    print("15b-boss. boss kill drew the drops deck; the game's boss heart was cancelled")
+
+    # --- walking back into a room: the pickups left in it spawn again, and that is no roll ---
+    W.rooms[W.cur].VisitedCount, W.roomAge = 2, 0
+    left = W.spawnPickup(PV.PICKUP_COIN, 1, 100, 100)
+    W.rooms[W.cur].VisitedCount, W.roomAge = 1, None
+    assert not left.removed, "a restored pickup is left alone"
+    W.pickups = lua.table_from([])
+    print("15b-restore. a pickup restored on re-entry stood, counted apart from the rolls")
+
     # --- a tinted rock holds what the room's layout planned, not the game's loot ---
     Rocks = modules["dm.streams.rocks"]
     Rocks.plan(85, "layout:1:85", lua.table_from(["key", "penny"]))
@@ -517,7 +542,9 @@ def run(tmp, game):
     assert not loose, loose
     assert tally.get(("room_entity", "coin", "layout"), 0) == 1, "a room's own pickups are counted as it loads"
     assert not [k for k in tally if k[0] == "pickup_selection"], "a cancelled spawn's selection is no roll"
-    assert tally.get(("npc_death", "-", "drops"), 0) == 4 and tally.get(("spawn", "enemy_death", "drops"), 0) == 4, tally
+    assert tally.get(("npc_death", "-", "drops"), 0) == 5 and tally.get(("spawn", "enemy_death", "drops"), 0) == 4, tally
+    assert tally.get(("spawn", "boss_death", "drops"), 0) == 1, tally
+    assert tally.get(("spawn", "room_restore", "restored"), 0) == 1, tally
     assert any(m.get("t") == "event" and m.get("name") == "rolls" and m["data"].get("samples") for m in sent(game)), \
         "LOG_SPAWNS samples go with the counts"
     print("15f. roll audit:", {f"{h}/{c}": n for (h, c, o), n in tally.items() if o != "uncontrolled"})
