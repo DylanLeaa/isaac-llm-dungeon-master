@@ -228,9 +228,15 @@ def test_protocol():
             m.send({"t": "ping", "id": 7})
             time.sleep(0.15)
             own = {k: v for k, v in m.file().items() if k != "dm"}
-            m.save_own({**own, "seed": "NEW"})
+            own = {**own, "seed": "NEW", "rev": (own.get("rev") or 0) + 1}
+            m.save_own(own)
             assert m.recv(lambda x: x["t"] == "pong")["id"] == 7, "a message lost to the mod's save comes back"
             f = m.file()
+            if f.get("rev") != own["rev"]:       # a write carried an older copy: the mod saves again (savefile.lua)
+                m.save_own(own)
+                m.send({"t": "ping", "id": 9})
+                m.recv(lambda x: x["t"] == "pong" and x["id"] == 9)
+                f = m.file()
             assert f["seed"] == "NEW" and f["pills"] == {"3": "x"} and f["cruelty"] == 9, "the mod's data is kept"
 
             # Acks: everything handled is dropped on the backend's next write.
