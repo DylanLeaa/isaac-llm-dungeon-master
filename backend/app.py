@@ -44,7 +44,7 @@ from server import Coordinator, Engine, build_dm, coverage_table, restored_count
 
 log = logging.getLogger("llmdm")
 
-DEFAULT_CRUELTY = 6           # until Settings says otherwise
+DEFAULT_CRUELTY = appdata.DEFAULTS["cruelty"]     # until Settings says otherwise
 # The mod pings every 2 s, but only while the game renders: a floor's stage transition (a chapter's
 # nightmare most of all) goes quiet for a while. This long without a message and the game is gone.
 GAME_TIMEOUT_S = 15.0
