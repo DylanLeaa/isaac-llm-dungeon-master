@@ -40,7 +40,6 @@ D.Curses   = include("dm.streams.curses")
 local STREAMS = { D.Shop, D.Layout, D.Rocks, D.Drops, D.Clear, D.Items, D.Payouts, D.Cards, D.Trinkets, D.Pills, D.Curses }
 
 Taunt.enabled = cfg.SHOW_TAUNTS
-Apply.init(Taunt)
 EffectHud.init(cfg, Apply)
 Causes.init()
 Rolls.init(cfg, Bridge, Apply, Causes)

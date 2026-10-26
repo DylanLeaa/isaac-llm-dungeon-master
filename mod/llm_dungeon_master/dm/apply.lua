@@ -5,7 +5,6 @@
 local Apply = {}
 
 local game = Game()
-local Taunt -- set by Apply.init
 local ZERO = Vector(0, 0)
 
 -- True while the mod itself is spawning: rolls.lua never treats those as the game's spawn rolls.
@@ -205,7 +204,6 @@ function Apply.roomClear(decision, pos)
     end
     if n > 0 then effect[#effect + 1] = count("+", n, r.reward) .. " dropped" end
   end
-  Taunt.show(decision.taunt)
   if #effect == 0 then effect[1] = "nothing dropped" end
   return effect
 end
@@ -359,7 +357,6 @@ function Apply.roomLayout(decision, late)
   for _, name in ipairs(decision.bonus_pickups or {}) do
     if Apply.spawnReward(name, randomFreePos(100)) then effect[#effect + 1] = count("+", 1, name) .. " placed" end
   end
-  Taunt.show(decision.taunt)
   if #effect == 0 then effect[1] = "no change" end
   return effect
 end
@@ -415,6 +412,5 @@ function Apply.cursesNow(decision)
   return Apply.curseEffect(cur, want)
 end
 
-function Apply.init(taunt) Taunt = taunt end
 
 return Apply
