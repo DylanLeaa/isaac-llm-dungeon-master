@@ -325,6 +325,25 @@ def test_a_turn_writes_a_drops_deck_to_last_several_rooms():
     assert len(results(sent)[0]["decision"]["outcomes"]) == 12
 
 
+def test_the_turns_economy_carries_the_floors_kill_drop_cap():
+    agent = ScriptedAgent([[stack("room_clear", "clear:1:85", **clear())]])
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent)
+    run(coord, [req(1, "clear:1:85", "room_clear")])
+    econ = agent.seen[0]["economy"]
+    assert set(econ["kill_drops"]) == {"cap", "left"} and "kill drops:" in econ["verdict"]
+
+
+def test_a_shop_deck_is_stacked_from_its_goods_and_shown_open_by_them():
+    agent = ScriptedAgent([[stack("shop", "shop:1", goods=["bomb", "key", "golden_key", "pill"])],
+                           [stack("room_clear", "clear:1:85", **clear())]])
+    coord = Coordinator(NoDM(), cruelty=6, agent=agent)
+    sent = run(coord, [req(1, "shop:1", "shop", {"wanted": 3, "reason": "floor start"}), 0.3,
+                       req(2, "clear:1:85", "room_clear")])
+    shop = next(m for m in results(sent) if m["key"] == "shop:1")
+    assert shop["ok"] and shop["decision"]["goods"] == ["bomb", "key", "pill"]   # not for sale: golden_key
+    assert next(d for d in agent.seen[1]["open_decks"] if d["key"] == "shop:1")["left"] == ["bomb", "key", "pill"]
+
+
 def test_the_game_is_told_when_agent_mode_is_on():
     dm, agent = NoDM(), ScriptedAgent([])
     coord = Coordinator(dm, cruelty=6, agent=agent)

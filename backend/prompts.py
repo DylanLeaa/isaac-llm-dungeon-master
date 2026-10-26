@@ -1,8 +1,8 @@
 """System prompt for the trolling Dungeon Master."""
-from catalog import (CARDS, CHAMPION_COLORS, CURSES, ENEMIES, LAYOUT_PICKUP_MODES, PILLS, REWARDS,
+from catalog import (CARDS, CHAMPION_COLORS, CURSES, ENEMIES, LAYOUT_PICKUP_MODES, PILLS, REWARDS, SHOP_GOODS,
                      VANILLA_PICKUPS_PER_CLEAR)
 from isaac_knowledge import ISAAC_KNOWLEDGE
-from schemas import extra_enemies_per_room, max_curses, traps_per_floor
+from schemas import champion_cap, extra_enemies_per_room, max_curses, traps_per_floor
 
 
 def _bullets(d: dict, fmt) -> str:
@@ -13,6 +13,7 @@ def _menus() -> str:
     """Everything the DM can pick from. Shared by the executor and the planners."""
     enemies = _bullets(ENEMIES, lambda k, v: f"- {k}: {v['name']} (threat {v['threat']}) - {v['note']}")
     rewards = _bullets(REWARDS, lambda k, v: f"- {k}: {v}")
+    goods = _bullets(SHOP_GOODS, lambda k, v: f"- {k}: {v}")
     modes = _bullets(LAYOUT_PICKUP_MODES, lambda k, v: f"- {k}: {v}")
     curses = _bullets(CURSES, lambda k, v: f"- {k}: {v}")
     champions = _bullets(CHAMPION_COLORS, lambda k, v: f"- {k}: {v[1]}")
@@ -23,6 +24,9 @@ def _menus() -> str:
 
 REWARD MENU (room_clear.rewards / drops.outcomes / rocks.outcomes / bonus_pickups / payout_plan.schedule)
 {rewards}
+
+SHOP GOODS (shop.goods, usual price)
+{goods}
 
 LAYOUT PICKUP MODES (room_layout.layout_pickups)
 {modes}
@@ -76,7 +80,7 @@ whole table at once. Each turn's message has:
 - `state`, `economy` (the whole floor's budget, every deck counted) and `memory`.
 
 You are woken rarely, so write ahead. At a floor's start the game asks for every room's layout and
-room-clear reward, every item pool, and the floor's card, trinket and drops decks: write each for the
+room-clear reward, every item pool, the shop's wares and the floor's card, trinket and drops decks: write each for the
 room or floor as you see it now (a room-clear reward asked at floor start comes before its fight).
 A drops deck's context.wanted can run to 16: write that many and it lasts several rooms. A request
 for a deck you already wrote only reaches you when a quick check found the player's state moved
@@ -138,6 +142,13 @@ HOW TO TROLL WELL
   room's own ask rewrites whatever of it is left.
 - Machines and chests: payout_plan decides every use of a beggar/machine ahead of time. A schedule
   of "penny, nothing, nothing, key" is a story; use the item pool ('item') sparingly.
+- Rooms: every unvisited room gets a layout, special rooms too. context.room_contents is what its
+  layout file places: no plain rocks means no tinted rock, no free pickups means layout_pickups
+  has nothing to change, no enemies means no fight and no clear reward. A secret room's pickups
+  are yours to keep, swap or remove like any other room's.
+- Shop: the shop deck is what its pickup slots sell, one entry per slot. It is bought, not given:
+  a key for sale on a key-starved floor is a choice the player pays for, and what they buy counts
+  against the floor's economy once it is in their pockets.
 - Cards, trinkets, pills: a `card`/`trinket` reward hands out the next one in your cards or trinkets
   deck, so the decks and the drops work together. context.owed lists draws the game is frozen on
   right now: cover each one first. Pill colours are permanent once swallowed, so a colour
@@ -159,9 +170,11 @@ HOW TO TROLL WELL
 - Taunts for item_choice, cards, trinkets, pills, drops and payout_plan are shown later, after the
   state has changed. Never put counts, "so far" tallies or current coins/keys/bombs/hearts in them.
 
+{_limits(cruelty)}
+
 RULES THE ENGINE ENFORCES (don't fight them)
-- Extra-enemy, champion, curse and troll-bomb budgets scale with cruelty and are cut when
-  the player is nearly dead. Over-budget choices are silently downgraded.
+- The limits above are cut when the player is nearly dead too. Over-budget choices are
+  silently downgraded, so never build a plan on them.
 - If the player is soft-locked on keys/bombs for too long the engine adds one. Plan around it.
 - Every deck is held to the floor's economy (context.economy): past the budget, an outcome
   becomes "nothing", and the guardrails say which deck took the last one. Machines have a house
@@ -211,14 +224,18 @@ keeps those.
 
 
 _LEVERS = """WHAT THE DUNGEON MASTER CONTROLS (a fast executor model makes each call, seconds before it happens)
-- room_layout: per unvisited normal room - extra enemies, champion chance/colour, tinted rocks
-  added (only as many as the room has plain rocks; what was really placed is reported back) or
-  hidden, what happens to the layout's own pickups, up to 2 bait pickups.
+- room_layout: per unvisited room, normal and special (treasure, shop, secret, curse, boss...) -
+  extra enemies, champion chance/colour, tinted rocks added (only as many as the room has plain
+  rocks; what was really placed is reported back) or hidden, what happens to the layout's own
+  pickups (a secret room's pickups too), up to 2 bait pickups.
 - rocks: what the next tinted rocks hold, one entry per rock, floor-wide, whichever room they are
   broken in. The game's own loot is cancelled.
-- room_clear: the room-clear drop (normal, miniboss, curse rooms; a bonus on top in boss rooms).
+- room_clear: the room-clear drop in any room that fights (a treasure or secret room with enemies
+  too; a bonus on top in boss rooms).
 - item_choice: ranks real candidates from each item pool (treasure, shop, boss, devil, angel,
   secret, chests, beggars...) - which pedestal item the player gets.
+- shop: what the shop sells in its pickup slots (keys, bombs, hearts, batteries, cards, pills,
+  sacks), one per slot. The game sets the prices.
 - cards / trinkets: the next cards/runes and trinkets handed out, from any source.
 - pills: what each pill colour does (permanent for the run once swallowed).
 - drops: what each kill (and each poop, fire or urn broken) drops, room by room. The game's own
@@ -243,7 +260,8 @@ def _limits(cruelty: int) -> str:
 - Traps (troll bombs, sticky nickels, mimic and spiked chests): {f"at most {traps} per floor" if traps
   else "none at all (they need cruelty 4+)"}.
 - Curses the DM adds: {f"at most {curses} per floor" if curses else "none (they need cruelty 3+)"}.
-- Extra enemies: {f"at most {extras} per room" if extras else "none"}.{"" if cruelty >= 3 else '''
+- Extra enemies: {f"at most {extras} per room" if extras else "none"}.
+- Champions: a champion_chance of at most {round(100 * champion_cap(cruelty))}%.{"" if cruelty >= 3 else '''
 - Tinted rocks can't be hidden or left empty (both need cruelty 3+).'''}
 - Kill drops (kills and breakables together): {kills:.2f} x the floor's normal rooms, for the
   whole floor. After that every kill drops nothing.

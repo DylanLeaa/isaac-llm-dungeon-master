@@ -1172,7 +1172,7 @@ class App:
         ttk.Scale(box, from_=0, to=10, orient="horizontal", variable=self.cruelty_var, length=320,
                   command=self._show_cruelty).pack(anchor="w", pady=(4, 0))
         ttk.Label(box, text="How hard the Dungeon Master trolls you, from generous (0) to merciless (10). "
-                            "Applies mid-run once saved.",
+                            "A run keeps the cruelty it started with: a change applies from the next run.",
                   foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
         self._show_cruelty()
 
@@ -1229,7 +1229,7 @@ class App:
         band = "generous" if c <= 2 else "mischievous" if c <= 5 else "cruel" if c <= 8 else "merciless"
         self.cruelty_label.configure(text=f"{c}/10 ({band})")
         if hasattr(self, "settings_msg") and c != self._cruelty():
-            self.settings_msg.configure(text="Press Save and apply to use it.", foreground=MUTED)
+            self.settings_msg.configure(text="Press Save and apply to use it from the next run.", foreground=MUTED)
 
     def _claude_status(self) -> None:
         self._show_models()                 # Claude Code's models come and go with the switch

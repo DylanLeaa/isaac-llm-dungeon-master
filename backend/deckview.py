@@ -7,7 +7,7 @@ the mod's decks.lua does it:
     skips that many from its front)
   - a card is drawn where it fits (its category); an item ranking or
     a trinket deck draws its first entry the player doesn't own, discarding the ones before it
-  - drops, a floor's tinted rocks and payouts draw from the front; pills are sticky (a draw doesn't use an
+  - drops, a floor's tinted rocks, payouts and shop wares draw from the front; pills are sticky (a draw doesn't use an
     entry up), a room's clear and
     layout and a floor's curses are used whole, once
 """
@@ -22,8 +22,8 @@ WHOLE = ("room_clear", "room_layout", "floor_plan")
 STICKY = ("pills",)
 # How the next draw is found: "front" takes the first entry, "match" the first entry matching the draw
 # (others stay), "upto" the first matching one, discarding those before it (the player owned them).
-DRAW = {"drops": "front", "rocks": "front", "payout_plan": "front", "cards": "match", "item_choice": "upto", "trinkets": "upto"}
-ORDER = ("payout_plan", "drops", "room_clear", "item_choice", "cards", "trinkets", "pills", "rocks",
+DRAW = {"drops": "front", "rocks": "front", "payout_plan": "front", "shop": "front", "cards": "match", "item_choice": "upto", "trinkets": "upto"}
+ORDER = ("payout_plan", "drops", "room_clear", "item_choice", "shop", "cards", "trinkets", "pills", "rocks",
          "room_layout", "floor_plan")
 
 
@@ -226,6 +226,8 @@ def _entries(kind: str, d: dict, ctx: dict, names: dict) -> list[tuple[Any, str]
         return [((r.get("reward"), int(r.get("count") or 1)), _reward(r)) for r in rows if isinstance(r, dict)]
     if kind == "cards":
         return [(c.get("key"), _words(c.get("key"))) for c in d.get("cards") or [] if isinstance(c, dict)]
+    if kind == "shop":
+        return [(g, _words(g)) for g in d.get("goods") or []]
     if kind == "item_choice":
         return [(_int(i), names.get(("item", _int(i)), f"item {i}")) for i in d.get("order") or []]
     if kind == "trinkets":
@@ -248,6 +250,8 @@ def _token(kind: str, outcome: Any) -> Any:
         return outcome.get("reward"), int(outcome.get("count") or 1)
     if kind == "cards":
         return outcome.get("card")
+    if kind == "shop":
+        return outcome.get("good")
     if kind == "item_choice":
         return _int(outcome.get("item"))
     if kind == "trinkets":
@@ -269,6 +273,8 @@ def _drawn_slot(kind: str, rec: dict, names: dict) -> Slot:
         label = names.get(("trinket", _int(o["trinket"]))) or str(o.get("name") or f'trinket {o["trinket"]}')
     elif o.get("card"):
         label = _words(o["card"])
+    elif o.get("good"):
+        label = _words(o["good"])
     elif o.get("pill") is not None:
         label = f'{names.get(("pill", _int(o["pill"])), "colour " + str(o["pill"]))} = {_words(o.get("effect"))}'
     else:
@@ -312,6 +318,8 @@ def _title(kind: str, key: str, ctx: dict) -> str:
         return f"Room {where} dressing{room}"
     if kind == "rocks":
         return "Tinted rocks"
+    if kind == "shop":
+        return "Shop wares"
     if kind == "item_choice":
         what = _words(ctx.get("room_type") or "")
         return f"{what[:1].upper()}{what[1:]} items (pool {ctx.get('pool', where)})" if what else f"Item pool {where}"

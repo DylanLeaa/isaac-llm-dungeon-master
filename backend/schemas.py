@@ -14,12 +14,13 @@ import re
 from typing import Any
 
 from catalog import (BOMBS, CARDS, CHAMPION_COLORS, COINS, CURSES, ENEMIES, HEARTS, KEYS,
-                     LAYOUT_PICKUP_MODES, PAYMENT, PAYOUT_OUTCOMES, PILLS, REWARDS, ROCK_OUTCOMES, SHOP_VALUE, TRAPS,
-                     TREASURE_DISTANCE, VANILLA_PICKUPS_PER_CLEAR)
+                     LAYOUT_PICKUP_MODES, PAYMENT, PAYOUT_OUTCOMES, PILLS, REWARDS, ROCK_OUTCOMES, SHOP_GOODS,
+                     SHOP_VALUE, TRAPS, TREASURE_DISTANCE, VANILLA_PICKUPS_PER_CLEAR)
 from economy import Budget, normal_rooms
 
 KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "cards", "trinkets", "pills", "drops",
-         "payout_plan", "rocks")
+         "payout_plan", "rocks", "shop")
+MAX_SHOP = 8              # a shop's pickup slots (an upgraded shop has more)
 _DECK = ("context.wanted is how many entries to write; context.deck_left is what is still unused, and your "
          "answer replaces it; context.drawn_so_far is what was already handed out. ")
 
@@ -33,7 +34,10 @@ _INTENT = {"type": "string", "maxLength": 120,
 TOOLS: dict[str, dict[str, Any]] = {
     "room_layout": {
         "name": "decide_room_layout",
-        "description": "Decide how an unvisited room is dressed before the player walks in.",
+        "description": "Decide how an unvisited room (normal or special) is dressed before the player walks in. "
+                       "context.room_contents is what its layout file places, when the game can tell: "
+                       "plain_rocks (all tinted_rocks can convert), pickups by kind ('random': the game picks "
+                       "as the room loads; layout_pickups decides all of them), pedestals, shop_slots, enemies.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -223,6 +227,27 @@ TOOLS: dict[str, dict[str, Any]] = {
             "required": ["intent", "outcomes", "taunt"],
         },
     },
+    "shop": {
+        "name": "decide_shop",
+        "description": "Write what the floor's shop sells in its pickup slots, one entry per slot, in the order "
+                       "the game stocks them (a slot the game makes a pedestal item takes no entry: its item is "
+                       "your shop item ranking). The game sets the prices. Asked at floor start; "
+                       "context.shop_contents is the shop's layout file when the game can tell (shop_slots "
+                       "counts its pedestal slots too). " + _DECK + "Nothing here is a gift: the player pays "
+                       "for it, and what they buy counts against the floor's economy as it lands in their "
+                       "pockets. A card or pill sold is the next one in your cards deck or its colour's effect.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intent": _INTENT,
+                "goods": {"type": "array", "maxItems": MAX_SHOP,
+                          "items": {"type": "string", "enum": list(SHOP_GOODS)},
+                          "description": "One per pickup slot, in stocking order."},
+                "taunt": _TAUNT, "scheme": _SCHEME,
+            },
+            "required": ["intent", "goods", "taunt"],
+        },
+    },
     "payout_plan": {
         "name": "decide_payout_plan",
         "description": "Fix what ONE beggar/machine/bum or ONE chest pays out, decided when it appears. "
@@ -299,6 +324,11 @@ def traps_per_floor(cruelty: int) -> int:
     return 0 if cruelty < 4 else 1 + cruelty // 4
 
 
+def champion_cap(cruelty: int) -> float:
+    """The highest champion_chance a room may have."""
+    return min(0.6, 0.06 * cruelty)
+
+
 def extra_enemies_per_room(cruelty: int) -> int:
     return round(cruelty / 3.3)                         # 0..3
 
@@ -342,7 +372,7 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
         return n
 
     if kind == "room_layout":
-        cap = min(0.6, 0.06 * cruelty)
+        cap = champion_cap(cruelty)
         if mercy:
             cap = min(cap, 0.10)
         out["champion_chance"] = round(max(0.0, min(cap, float(raw.get("champion_chance") or 0))), 3)
@@ -554,6 +584,9 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
     elif kind == "pills":
         out["pills"] = _clamp_pills(raw.get("pills") or [], ctx, cruelty, notes)
 
+    elif kind == "shop":
+        out["goods"] = [g for g in raw.get("goods") or [] if g in SHOP_GOODS][:_wanted(ctx, 5, MAX_SHOP)]
+
     else:
         raise ValueError(f"unknown decision kind {kind!r}")
 
@@ -727,6 +760,8 @@ def clamp_diff(kind: str, raw: Any, out: Any) -> list[str]:
         check("cards", listed(raw.get("cards")), listed(c["key"] for c in out.get("cards") or []))
     elif kind == "trinkets":
         check("trinkets", listed(raw.get("trinkets")), listed(out.get("trinkets")))
+    elif kind == "shop":
+        check("goods", listed(raw.get("goods")), listed(out.get("goods")))
     elif kind == "pills":
         asked ={str(p.get("color")): p.get("effect") for p in raw.get("pills") or [] if isinstance(p, dict)}
         got = {str(p["color"]): p["effect"] for p in out.get("pills") or []}

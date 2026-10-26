@@ -12,6 +12,7 @@ return {
   CONTROL_FLOOR       = true,
   CONTROL_CONSUMABLES = true,   -- which cards/trinkets drop, what each pill colour does (three decks)
   CONTROL_PAYOUTS     = true,   -- what each beggar / machine use and each chest pays out (a fixed schedule)
+  CONTROL_SHOP        = true,   -- what the shop sells in its pickup slots (its pedestals are CONTROL_ITEMS)
   CONTROL_DROPS       = true,   -- the drops deck: what each kill drops (the game's own drop is cancelled)
   DROPS_NATURAL       = true,   -- ...and each poop, fire, urn or skull broken
                                 -- (the rocks deck, what the floor's tinted rocks hold, is switched with CONTROL_DROPS)
@@ -49,6 +50,7 @@ return {
   -- Deck sizes: how many entries a deck is kept stocked with, ahead of the game's draws.
   CARDS_DEPTH = 2,
   TRINKETS_DEPTH = 2,
+  SHOP_DEPTH = 6,          -- shop wares asked for when the shop's layout file can't say how many slots it has
   DROPS_SPARE = 2,         -- drops entries asked beyond the room's enemies (splitters, poops)
   ROCKS_DECK = 6,          -- tinted rock outcomes the DM writes ahead for the floor
   DROPS_RESERVE = 3,       -- drops entries kept between fights: the next room's first kills draw from

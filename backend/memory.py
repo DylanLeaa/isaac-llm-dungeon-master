@@ -20,16 +20,16 @@ from economy import Economy, deck_outcomes, outcome_units
 WHOLE = ("room_clear", "room_layout", "floor_plan")
 KIND_OF_PREFIX = {"clear": "room_clear", "layout": "room_layout", "items": "item_choice", "curses": "floor_plan",
                   "cards": "cards", "trinkets": "trinkets", "pills": "pills", "drops": "drops",
-                  "payout": "payout_plan", "rocks": "rocks"}
+                  "payout": "payout_plan", "rocks": "rocks", "shop": "shop"}
 FAMILY_SETS = (("keys", KEYS), ("bombs", BOMBS), ("coins", COINS), ("hearts", HEARTS))
 # The list each deck kind draws from.
 DECK_FIELD = {"drops": "outcomes", "rocks": "outcomes", "payout_plan": "schedule", "cards": "cards", "trinkets": "trinkets",
-              "item_choice": "order"}
+              "item_choice": "order", "shop": "goods"}
 OPEN_DECKS_SHOWN = 8
 # How an effect line is introduced in recent_events, by the kind of deck it came from.
 EFFECT_LABEL = {"room_layout": "room dressed", "room_clear": "clear", "item_choice": "pedestal", "drops": "drop",
                 "payout_plan": "machine/chest", "cards": "card", "trinkets": "trinket", "pills": "pill",
-                "floor_plan": "floor", "rocks": "tinted rock"}
+                "floor_plan": "floor", "rocks": "tinted rock", "shop": "shop"}
 
 
 def kind_of(key: str) -> str:
@@ -240,7 +240,7 @@ def _label(kind: str, outcome: Any) -> str:
     if isinstance(outcome.get("reward"), str):
         n = int(outcome.get("count") or 1)
         return outcome["reward"] if outcome["reward"] == "nothing" else f'{n}x {outcome["reward"]}'
-    for k in ("card", "trinket", "item"):
+    for k in ("card", "trinket", "item", "good"):
         if outcome.get(k) is not None:
             return str(outcome[k])
     if outcome.get("pill") is not None:
@@ -273,6 +273,8 @@ def _left(kind: str, d: dict) -> list[str]:
         return [f'{p["color"]}={p["effect"]}' for p in d.get("pills", [])]
     if kind == "item_choice":
         return [str(i) for i in d.get("order", [])]
+    if kind == "shop":
+        return list(d.get("goods", []))
     if kind == "floor_plan":
         return ["curses " + (",".join(d.get("add_curses", [])) or "none")]
     return []

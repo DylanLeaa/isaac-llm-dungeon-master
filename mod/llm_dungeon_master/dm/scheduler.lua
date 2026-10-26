@@ -41,7 +41,7 @@ local function checkLevelChange()
   levelSig = sig
   floorNo = floorNo + 1
   for _, prefix in ipairs(FLOOR_PREFIXES) do D.Bridge.forget(prefix .. ":" .. (floorNo - 1) .. ":") end
-  for _, prefix in ipairs({ "cards", "trinkets", "pills", "drops", "rocks" }) do D.Bridge.forget(prefix .. ":" .. (floorNo - 1)) end
+  for _, prefix in ipairs({ "cards", "trinkets", "pills", "drops", "rocks", "shop" }) do D.Bridge.forget(prefix .. ":" .. (floorNo - 1)) end
   D.Decks.onNewFloor()
   D.Causes.reset()
   each("onNewFloor", floorNo)

@@ -281,3 +281,11 @@ def test_what_the_player_gains_outside_the_decks_counts_against_the_budget():
     assert "keys: 6 given (6 of it from outside your decks)" in view["verdict"]
     econ.observe({**snap(2, keys=5), "level": {"stage": 2, "stage_type": 0, "room_types": {"default": 10}}})
     assert econ.outside("keys") == 0, "a new floor starts its own count"
+
+
+def test_shop_sells_only_shop_goods_one_per_slot_asked():
+    raw = {"goods": ["key", "troll_bomb", "soul_heart", "golden_key", "bomb", "card", "pill"], "taunt": "Buy."}
+    out = clamp("shop", raw, st(), {"wanted": 4}, cruelty=6, counters={})
+    assert out["goods"] == ["key", "soul_heart", "bomb", "card"]
+    assert clamp_diff("shop", raw, out) == [
+        "goods key, troll_bomb, soul_heart, golden_key, bomb, card, pill -> key, soul_heart, bomb, card"]

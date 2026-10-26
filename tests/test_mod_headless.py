@@ -542,6 +542,36 @@ def run(tmp, game):
     W.pickups = lua.table_from([])
     print("15e. grab bag paid its scheduled contents")
 
+    # --- special rooms: the shop's wares are the DM's; an off-map room with nothing random isn't held for ---
+    W.enemies = lua.table_from([])
+    slot = [g.EntityType.ENTITY_PICKUP, g.PickupVariant.PICKUP_SHOPITEM, 0]
+    def room(idx, rtype, spawns):
+        return lua.table_from({"SafeGridIndex": idx, "GridIndex": idx, "VisitedCount": 0, "AwardSeed": 1,
+                               "Data": lua.table_from({"Type": rtype, "Shape": 1, "Difficulty": 1,
+                                                       "Spawns": W.spawnList(lua.table_from(spawns))})})
+    W.rooms[72] = room(72, g.RoomType.ROOM_SHOP, [lua.table_from(slot)] * 3)
+    W.adj[72] = lua.table_from([])
+    wait(lambda: Bridge.peek("shop:1"), 6, "the shop's wares, asked while the shop is still ahead")
+    ask = reqs("shop:1")[-1]["ctx"]
+    assert ask["reason"] == "floor start" and ask["wanted"] == 3 and ask["shop_contents"]["shop_slots"] == 3, ask
+    goods = list(to_py(Bridge.peek("shop:1").decision)["goods"])
+    W.roomEntities[72] = lua.table_from([lua.table_from([*slot, 40 + i]) for i in range(3)])
+    W.shopPick = g.PickupVariant.PICKUP_LIL_BATTERY            # what the game would have stocked
+    W.enter(72)
+    stocked = [(W.roomSpawned[i].Variant, W.roomSpawned[i].SubType) for i in range(1, 4)]
+    assert stocked == [tuple(modules["dm.apply"].pickupFor(name)) for name in goods], (stocked, goods)
+    assert [m["outcome"]["good"] for m in drawn("shop:1")] == goods
+    wait(lambda: not Hold.active(), 8, "the shop room's own layout (a special room is dressed too)")
+    assert drawn("layout:1:72"), "the shop room was dressed"
+    assert reqs("layout:1:72")[0]["ctx"]["room_contents"]["shop_slots"] == 3, "asked with what its room file places"
+    W.rooms[-6] = room(-6, g.RoomType.ROOM_BLACK_MARKET, [lua.table_from(slot)])
+    W.adj[-6] = lua.table_from([])
+    W.roomEntities[-6] = lua.table_from([lua.table_from([*slot, 50])])
+    W.enter(-6)
+    tick(3)
+    assert not Hold.active() and not reqs("layout:1:-6"), "an off-map room with no free pickups isn't held for"
+    print(f"15e2. shop stocked with the DM's wares {goods}; shop room dressed; black market left alone")
+
     # --- the roll audit: nothing this walk covers went to vanilla ---
     rolls0 = rolls_sent()
     wait(lambda: rolls_sent() > rolls0, 6, "the roll counts")
@@ -556,7 +586,11 @@ def run(tmp, game):
         k[0] in covered or (k[0] == "spawn" and k[1] in ("enemy_death", "chest_open", "slot_payout", "rock_break")))}
     assert not loose, loose
     assert tally.get(("room_entity", "coin", "layout"), 0) == 1, "a room's own pickups are counted as it loads"
-    assert not [k for k in tally if k[0] == "pickup_selection"], "a cancelled spawn's selection is no roll"
+    # A cancelled spawn's selection is no roll; a shop slot's is the shop deck's; the black market's is no stream's.
+    assert {k: n for k, n in tally.items() if k[0] == "pickup_selection"} == {
+        ("pickup_selection", "lil_battery", "shop"): 3, ("pickup_selection", "lil_battery", "uncontrolled"): 1}, tally
+    assert tally.get(("room_entity", "shopitem", "shop"), 0) == 3, tally
+    assert tally.get(("room_entity", "shopitem", "uncontrolled"), 0) == 1, "a pickup no stream claims is uncontrolled"
     assert tally.get(("npc_death", "-", "drops"), 0) == 5 and tally.get(("spawn", "enemy_death", "drops"), 0) == 4, tally
     assert tally.get(("spawn", "boss_death", "drops"), 0) == 1, tally
     assert tally.get(("spawn", "room_restore", "restored"), 0) == 1, tally
@@ -584,6 +618,7 @@ def run(tmp, game):
 
     # --- floor 2: a loading screen again, held until the brief and the start room's neighbours are in ---
     W.stage = 2
+    W.rooms[72], W.rooms[-6] = None, None          # this floor's shop and black market aren't on the next
     for idx in (84, 85, 71, 86):
         W.rooms[idx].VisitedCount = 0
     W.enemies = lua.table_from([])
@@ -597,17 +632,17 @@ def run(tmp, game):
     Loading.handle(lua.table_from({"status": "ready", "floor": 1}))           # a stale ready from floor 1
     tick()
     assert Loading.active(), "a ready for another floor doesn't end this floor's wait"
-    # Only the start room's neighbours gate the screen: room 85's layout and treasure room 71's pool.
+    # Only the start room's neighbours gate the screen: room 85's layout, treasure room 71's layout and pool.
     # The boss pool (room 86 isn't next door) and the card/trinket decks go in the background.
     gated = sorted(Sched.floorReadyKeys().values())
-    assert gated == ["items:2:0", "layout:2:85"], gated
+    assert gated == ["items:2:0", "layout:2:71", "layout:2:85"], gated
     asks = [m["ctx"]["reason"] for m in sent(game) if m.get("t") == "req" and m.get("key") == "items:2:0"]
     assert asks == ["player is next to this room"], f"the gated pool is asked as next door (not floor start): {asks}"
     assert Bridge.isPending("items:2:2") or Bridge.settled("items:2:2"), "boss pool still asked, in the background"
     wait(lambda: Bridge.isPending("cards:2") or Bridge.settled("cards:2"), 2, "the cards deck asked, in the background")
     wait(lambda: not Loading.active(), 8, "floor 2's plans and the start room's neighbours")
-    opening = [k for k in ("layout:2:85", "items:2:0") if Bridge.settled(k)]
-    assert opening == ["layout:2:85", "items:2:0"], opening
+    opening = [k for k in ("layout:2:85", "layout:2:71", "items:2:0") if Bridge.settled(k)]
+    assert opening == ["layout:2:85", "layout:2:71", "items:2:0"], opening
     prepares = [m for m in sent(game) if m.get("t") == "prepare"]
     assert prepares[-1]["floor"] == 2 and prepares[-1]["state"]["level"]["stage"] == 2
     # Empty slots are spelled out, so a planner can't fill them from the character's usual loadout.
@@ -622,7 +657,7 @@ def run(tmp, game):
         ("layout:2:", "items:2:", "cards:2", "trinkets:2", "pills:2", "drops:2"))]
     assert not early, f"floor 2 decisions made before its brief: {early}"
     print("17. floor 2: loading screen held until its brief and the start room's neighbours were in"
-          " (layout:2:85, items:2:0); boss pool and decks in the background; none made before the brief")
+          " (layout:2:85, layout:2:71, items:2:0); boss pool and decks in the background; none made before the brief")
 
     # --- the next floor is generated before its plan lands: its curses change once it does ---
     W.enter(86)

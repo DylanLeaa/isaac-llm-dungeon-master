@@ -1,11 +1,13 @@
--- layout:<f>:<room>  How an unvisited normal room is dressed (on its first MC_POST_NEW_ROOM).
+-- layout:<f>:<room>  How an unvisited room is dressed (on its first MC_POST_NEW_ROOM): normal and special rooms.
 --
--- A deck of one, keyed by the room, written for its shape, enemies and difficulty. Asked the moment the
--- player enters a room next to it (the soonest they could walk in is about a second away), and rewritten
--- if their state changes while they linger (MAX_LAYOUT_SENDS a room). Not in when they walk in: the game
--- is held and the room dressed late. (What its tinted rocks hold is the floor's rocks deck, rocks.lua.) In agent
--- mode every room on the floor is asked at floor start instead, so the agent dresses the floor in a few turns; asking
--- again from next door then only reaches the agent if the re-ask gate finds the player's state has moved.
+-- A deck of one, keyed by the room, written for its type, shape, difficulty and what its layout file places
+-- (rocks, free pickups, enemies). Asked the moment the player enters a room next to it (the soonest they could
+-- walk in is about a second away), and rewritten if their state changes while they linger (MAX_LAYOUT_SENDS a
+-- room). Not in when they walk in: the game is held and the room dressed late. (What its tinted rocks hold is
+-- the floor's rocks deck, rocks.lua.) In agent mode every room on the floor is asked at floor start instead, so
+-- the agent dresses the floor in a few turns; asking again from next door then only reaches the agent if the
+-- re-ask gate finds the player's state has moved. A room off the floor's map (devil, angel, crawlspace) can't be
+-- asked ahead: it is only held for when its layout file places free pickups, the rolls it would leave vanilla.
 local Layout = {}
 
 local game = Game()
@@ -15,7 +17,18 @@ local roomKeys = {}       -- key -> idx: the neighbours asked about from this ro
 local floorAsked = -1     -- the floor whose every room was asked at its start (agent mode)
 
 local function curIdx() return game:GetLevel():GetCurrentRoomDesc().SafeGridIndex end
-local function eligible(t) return t == RoomType.ROOM_DEFAULT end
+local function eligible(t) return t ~= nil and t ~= RoomType.ROOM_NULL end
+local function startIdx() return game:GetLevel():GetStartingRoomIndex() end
+
+--- Will the room being entered be dressed? Not the floor's start room, nor an off-map room with no free
+--- pickups and no deck already in.
+local function dressed(desc)
+  if not (cfg.CONTROL_ROOM_LAYOUT and desc and desc.Data and eligible(desc.Data.Type)) then return false end
+  if desc.SafeGridIndex == startIdx() then return false end
+  if desc.SafeGridIndex >= 0 or Decks.left("layout", desc.SafeGridIndex) > 0 then return true end
+  local free = State.freePickups(State.roomContents(desc))
+  return free == nil or free > 0
+end
 
 local function apply(idx, d, late)
   local key = Decks.get("layout", idx).key
@@ -34,7 +47,7 @@ function Layout.init(deps)
       local desc = level:GetRoomByIdx(st.arg)
       if not (desc and desc.Data) then return false end
       return { room_type = State.roomTypeName(desc.Data.Type), room_shape = desc.Data.Shape,
-               room_difficulty = desc.Data.Difficulty,
+               room_difficulty = desc.Data.Difficulty, room_contents = State.roomContents(desc),
                distance_from_start = State.gridDistance(level:GetStartingRoomIndex(), desc.SafeGridIndex),
                first_room_of_floor = desc.SafeGridIndex == level:GetStartingRoomIndex(),
                player_is_next_door = reason ~= "floor start" and curIdx() ~= st.arg }
@@ -57,6 +70,11 @@ function Layout.init(deps)
     outcome = function(d) return { applied = true, layout_pickups = d.layout_pickups } end,
     enabled = function() return cfg.CONTROL_ROOM_LAYOUT end,
   })
+  -- The pickups a room's layout file places are this deck's when it dresses the room (keep, remove, morph).
+  Rolls.claimRoomEntities("layout", function()
+    local desc = game:GetLevel():GetCurrentRoomDesc()
+    return dressed(desc) and (Bridge.ready() or Decks.left("layout", desc.SafeGridIndex) > 0)
+  end)
 end
 
 local function prefetch(reason)
@@ -77,18 +95,20 @@ function Layout.onNewRoom(room)
     if d then
       apply(idx, d, 0)
       Rolls.count("room_layout", State.roomTypeName(room.type), "layout")
-    elseif Bridge.ready() and eligible(room.type) and idx ~= game:GetLevel():GetStartingRoomIndex() then
-      Decks.owe("layout", idx, { cause = "room_enter" }, function(late)
-        if not late then return end
-        if curIdx() ~= idx then
-          return Bridge.effect(Decks.get("layout", idx).key, { "not applied: the player left the room" })
-        end
-        apply(idx, late, game:GetFrameCount() - entered)
-      end)
-      Decks.holdNow("layout", idx)
-      Rolls.count("room_layout", State.roomTypeName(room.type), "layout")
-    elseif eligible(room.type) and idx ~= game:GetLevel():GetStartingRoomIndex() then
-      Rolls.count("room_layout", State.roomTypeName(room.type), nil)    -- no backend: the game's own
+    elseif dressed(game:GetLevel():GetCurrentRoomDesc()) then
+      if Bridge.ready() then
+        Decks.owe("layout", idx, { cause = "room_enter" }, function(late)
+          if not late then return end
+          if curIdx() ~= idx then
+            return Bridge.effect(Decks.get("layout", idx).key, { "not applied: the player left the room" })
+          end
+          apply(idx, late, game:GetFrameCount() - entered)
+        end)
+        Decks.holdNow("layout", idx)
+        Rolls.count("room_layout", State.roomTypeName(room.type), "layout")
+      else
+        Rolls.count("room_layout", State.roomTypeName(room.type), nil)    -- no backend: the game's own
+      end
     end
   end
   -- 2. Ask about every unvisited room the player could walk into next.

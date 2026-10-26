@@ -91,9 +91,29 @@ def test_cruelty_is_set_by_the_app_not_the_game():
     asyncio.run(coord.handle({"t": "settings", "cruelty": 2}, send))
     assert coord.cruelty == 6
     coord.set_cruelty(2)
-    assert coord.cruelty == 2 and dm.cruelty == 2 and coord.memory.economy.cruelty == 2
+    assert coord.cruelty == 6 and dm.cruelty == 6, "a run keeps the cruelty it started with"
+    asyncio.run(coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R", "cruelty": 9}, send))
+    assert coord.cruelty == 6, "...a reconnect is still the same run"
+    asyncio.run(coord.handle({"t": "hello", "proto": PROTO, "session": "S2", "run": "R2", "new_run": True}, send))
+    assert coord.cruelty == 2 and dm.cruelty == 2 and coord.memory.economy.cruelty == 2, "the next run takes it"
     coord.set_cruelty(42)
-    assert coord.cruelty == 10
+    assert coord.next_cruelty == 10 and coord.cruelty == 2
+
+
+def test_a_continued_run_keeps_the_cruelty_it_started_with(tmp_path):
+    from receipt import Receipt
+
+    async def send(msg):
+        pass
+
+    first = Coordinator(ScriptedDM([]), cruelty=3, receipt=Receipt(tmp_path))
+    asyncio.run(first.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R", "new_run": True}, send))
+    # The backend restarted with other Settings; the game continues the same run.
+    again = Coordinator(ScriptedDM([]), cruelty=9, receipt=Receipt(tmp_path))
+    asyncio.run(again.handle({"t": "hello", "proto": PROTO, "session": "S2", "run": "R"}, send))
+    assert again.cruelty == 3 and again.next_cruelty == 9
+    asyncio.run(again.handle({"t": "hello", "proto": PROTO, "session": "S3", "run": "R3", "new_run": True}, send))
+    assert again.cruelty == 9
 
 
 def test_clean_text_cuts_on_word_boundary():
@@ -562,7 +582,8 @@ def test_reconfigure_swaps_models_mid_run_and_keeps_the_run():
 
     path = asyncio.run(go())
     assert len(old_dm.seen) == 1 and len(new_dm.seen) == 1        # the second decision went to the new DM
-    assert new_dm.cruelties == [8]                                 # told the cruelty from Settings
+    assert new_dm.cruelties == [6] and coord.next_cruelty == 8     # the run keeps its cruelty; Settings' waits
+    assert coord.cruelty == 6 and coord.memory.economy.cruelty == 6
     assert "NARRATIVE for Isaac" in new_dm.campaigns[0] and "BRIEF for Basement I" in new_dm.campaigns[0]
     assert coord.late_grace_s == 1.5 and coord.gate is None
     assert coord.receipt.path == path and coord.memory.run_id == "R1"

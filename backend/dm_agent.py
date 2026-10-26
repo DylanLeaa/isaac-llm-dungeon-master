@@ -276,4 +276,8 @@ class MockDM:
             return {"intent": "mock: a tease, then a gift", "taunt": "",
                     "outcomes": [{"reward": r.choice(["nothing", "penny", "key", "soul_heart"]), "count": 1}
                                  for _ in range(n)]}
+        if kind == "shop":
+            n = max(1, int(ctx.get("wanted") or 4))
+            return {"intent": "mock: everything but what they need", "taunt": "Browse all you like.",
+                    "goods": [r.choice(["bomb", "red_heart", "battery", "pill"]) for _ in range(n)]}
         raise ValueError(kind)

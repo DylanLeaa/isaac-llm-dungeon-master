@@ -21,10 +21,12 @@ local Rolls  = include("dm.rolls")
 local Causes = include("dm.causes")
 local Decks  = include("dm.decks")
 
--- The streams, in the order their hooks run: a room is dressed before its drops are asked for, and
--- a tinted rock is the rocks deck's before the drops deck can take it as a breakable.
+-- The streams, in the order their hooks run: the shop claims its slots before the layout claims the rest of
+-- the room's pickups, a room is dressed before its drops are asked for, and a tinted rock is the rocks deck's
+-- before the drops deck can take it as a breakable.
 local D = { cfg = cfg, Bridge = Bridge, State = State, Apply = Apply, Taunt = Taunt, Loading = Loading,
             Rolls = Rolls, Causes = Causes, Decks = Decks, Sched = Sched }
+D.Shop     = include("dm.streams.shop")
 D.Layout   = include("dm.streams.layout")
 D.Rocks    = include("dm.streams.rocks")
 D.Drops    = include("dm.streams.drops")
@@ -35,7 +37,7 @@ D.Cards    = include("dm.streams.cards")
 D.Trinkets = include("dm.streams.trinkets")
 D.Pills    = include("dm.streams.pills")
 D.Curses   = include("dm.streams.curses")
-local STREAMS = { D.Layout, D.Rocks, D.Drops, D.Clear, D.Items, D.Payouts, D.Cards, D.Trinkets, D.Pills, D.Curses }
+local STREAMS = { D.Shop, D.Layout, D.Rocks, D.Drops, D.Clear, D.Items, D.Payouts, D.Cards, D.Trinkets, D.Pills, D.Curses }
 
 Taunt.enabled = cfg.SHOW_TAUNTS
 Apply.init(Taunt)

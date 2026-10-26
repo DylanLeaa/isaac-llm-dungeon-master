@@ -124,3 +124,13 @@ def test_a_floor_that_is_over_never_draws_its_leftovers():
     assert beggar.title == "Beggar ·1234"
     assert beggar.spent and beggar.status == "1 never drawn" and beggar.left[0].state == "unused"
     assert deck(floors, "curses:1").left[0].state == "waiting"   # the new floor may still wait on it
+
+
+def test_shop_wares_draw_from_the_front_slot_by_slot():
+    run = Run()
+    shop = run.answer("shop", "shop:1", {"goods": ["bomb", "red_heart", "pill"]}, ts=10)
+    run.draw("shop:1", "shop", {"good": "bomb"}, ts=11, ref=shop, cause="shop_slot")
+    d = deck(deckview.build(run.r), "shop:1")
+    assert d.title == "Shop wares" and d.status == "2 left"
+    assert labels(d.drawn) == [("bomb", "drawn")]
+    assert labels(d.left) == [("red heart", "next"), ("pill", "queued")]

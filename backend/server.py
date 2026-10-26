@@ -68,7 +68,7 @@ AGENT_ROCKS_DEPTH = 6           # a turn's tinted rock deck: the floor's next ro
 # Open decks a turn may restack unasked. Not pills (a colour may have been swallowed since it was written) nor
 # payouts (a machine's schedule is a story: it is only ever extended, when the game asks).
 AGENT_RESTACK_KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "cards", "trinkets", "drops",
-                       "rocks")
+                       "rocks", "shop")
 # Re-asks of a deck the agent already wrote that never changed what the game did (run E989E1E1: 0 of 79): the
 # player nearing its room, a state-change refresh, the boss's curse re-check. The deck answers them as it stands,
 # with no gate and no turn; a deck that has really gone stale is flagged (_flag) and still goes to the agent.
@@ -197,7 +197,8 @@ class Coordinator:
         self.last_req: dict[str, dict] = {}       # key -> what the issued answer was written against
         self.epitaph_wanted = epitaph
         self.epitaph = epitaph and hasattr(dm, "epitaph")
-        self.cruelty = cruelty
+        self.cruelty = cruelty                    # this run's: taken up as it starts, fixed until it ends
+        self.next_cruelty = cruelty               # the Settings value: the next run starts with it
         self.memory = RunMemory()
         self.session: str | None = None
         self.mismatched = None                    # the last session whose hello had the wrong protocol
@@ -319,6 +320,11 @@ class Coordinator:
                 self.receipt.start_run(msg.get("run"), fresh=bool(msg.get("new_run")))
                 if not msg.get("new_run"):        # a continue: its plans are in its receipt, don't rewrite them
                     self.campaign.restore(*self.receipt.saved_plans())
+                # The run's cruelty: a continue keeps the one it started with, a new run takes Settings' now.
+                saved = None if msg.get("new_run") else self.receipt.saved_cruelty
+                self._use_cruelty(self.next_cruelty if saved is None else saved)
+                if saved is None:
+                    self.receipt.note_cruelty(self.cruelty)
                 self.receipt_seq.clear()
                 self.used_seq.clear()
                 self.answer_seq.clear()
@@ -373,8 +379,20 @@ class Coordinator:
             await send({"t": "pong", "session": self.session, "id": msg.get("id")})
 
     def set_cruelty(self, value: int) -> None:
-        """From the app's Settings; takes effect for the next decision."""
+        """From the app's Settings. A run keeps the cruelty it started with (its plans and budgets were made
+        for it): a change waits for the next run. Before any run it applies now."""
         cruelty = max(0, min(10, int(value)))
+        changed, self.next_cruelty = cruelty != self.next_cruelty, cruelty
+        if self.memory.run_id is None:
+            self._use_cruelty(cruelty)
+            return
+        if changed:
+            log.info("cruelty %d from the next run (this run stays at %d)", cruelty, self.cruelty)
+            self._record("cruelty", "next run", result=f"{cruelty} from the next run; this one stays at {self.cruelty}")
+        self._use_cruelty(self.cruelty)           # models Settings just swapped in decide at the run's cruelty too
+
+    def _use_cruelty(self, cruelty: int) -> None:
+        """The cruelty every decision, plan and budget is made with from now on."""
         if cruelty != self.cruelty:
             log.info("cruelty %d -> %d", self.cruelty, cruelty)
             self._record("cruelty", "set", result=f"{self.cruelty} -> {cruelty}")
@@ -580,18 +598,25 @@ class Coordinator:
         brief = narrative if narrative == "cancelled" else await self.campaign.brief_waiter(floor_signature(state))
         return brief, _ms(tb)
 
+    def _economy(self, key: str | None, state: dict) -> dict:
+        """ctx.economy for a request about `key` (None: a whole agent turn): the floor's budgets, plus the cap
+        clamp() holds kill and break drops to, so no deck promises past it."""
+        econ = self.memory.economy.view(key)
+        left = kill_drops_left(state, self.cruelty, self.memory.counters)
+        econ["kill_drops"] = {"cap": kill_drop_cap(state, self.cruelty), "left": left}
+        econ["verdict"] += f"; kill drops: {left} left this floor"
+        return econ
+
     def _request_ctx(self, kind: str, key: str, state: dict, ctx: dict) -> tuple[dict, int | None]:
         """The ctx the model sees for a request about `key`: the answer it replaces, the economy, and the
         kind's own limits. Also the kill drops left (drops only, else None)."""
         prev = self.memory.previous(key)
         if prev:                                  # a re-ask replaces this answer; show it so the model restates it
             ctx = {**ctx, "your_previous_answer": _compact(prev)}
-        ctx = {**ctx, "economy": self.memory.economy.view(key)}
+        ctx = {**ctx, "economy": self._economy(key, state)}
         kills_left = None
-        if kind == "drops":                       # the cap clamp() holds kill drops to, so intents don't promise past it
-            kills_left = kill_drops_left(state, self.cruelty, self.memory.counters)
-            ctx["economy"]["kill_drops"] = {"cap": kill_drop_cap(state, self.cruelty), "left": kills_left}
-            ctx["economy"]["verdict"] += f"; kill drops: {kills_left} left this floor"
+        if kind == "drops":
+            kills_left = ctx["economy"]["kill_drops"]["left"]
         elif kind == "floor_plan":
             ctx["allowed_curses"] = max_curses(self.cruelty, mercy_active(state))
         elif kind == "item_choice" and ctx.get("candidates"):
@@ -1035,7 +1060,7 @@ class Coordinator:
         turn = {"trigger": trigger,
                 "pending": [{"key": k, "kind": p["kind"], "context": _turn_ctx(p["ctx"])} for k, p in pending.items()],
                 "open_decks": [self._open_deck(k, flags.get(k), state) for k in open_keys],
-                "state": state, "economy": self.memory.economy.view(None),
+                "state": state, "economy": self._economy(None, state or {}),
                 "memory": {k: v for k, v in digest.items() if k != "your_open_decks"}}
         deadline = max(MIN_DEADLINE_S, min(MAX_DEADLINE_S, max(float(p["deadline_ms"]) for p in pending.values()) / 1000)) \
             if pending else MAX_DEADLINE_S
@@ -1265,12 +1290,8 @@ def state_diff(old: dict, new: dict) -> str:
 
 
 def _turn_ctx(ctx: dict) -> dict:
-    """A pending request's ctx in a turn: the economy is the turn's, once; its kill drops note stays."""
-    out = {k: v for k, v in ctx.items() if k != "economy"}
-    kill_drops = (ctx.get("economy") or {}).get("kill_drops")
-    if kill_drops:
-        out["kill_drops"] = kill_drops
-    return out
+    """A pending request's ctx in a turn: the economy (kill drops included) is the turn's, once."""
+    return {k: v for k, v in ctx.items() if k != "economy"}
 
 
 async def _close_later(models: list, after_s: float = 60.0) -> None:

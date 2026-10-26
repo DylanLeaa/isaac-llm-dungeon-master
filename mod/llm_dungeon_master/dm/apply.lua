@@ -115,6 +115,22 @@ local function resolve(name)
   return "pickup", variant, subtype or 0
 end
 
+--- The pickup a reward name is: variant, subtype (subtype 0 = the game picks, e.g. which card); nil if it
+--- isn't a pickup on this version.
+function Apply.pickupFor(name)
+  local kind, variant, subtype = resolve(name)
+  if kind ~= "pickup" then return nil end
+  return variant, subtype
+end
+
+--- Turn a pickup into reward `name`, keeping its price (a shop slot stays for sale). True if it did.
+function Apply.morphPickup(p, name)
+  local variant, subtype = Apply.pickupFor(name)
+  if not variant then return false end
+  morph(p, EntityType.ENTITY_PICKUP, variant, subtype, true)
+  return true
+end
+
 local function farFromPlayer(pos, minDist)
   local p = Isaac.GetPlayer(0)
   return p.Position:Distance(pos) >= minDist
