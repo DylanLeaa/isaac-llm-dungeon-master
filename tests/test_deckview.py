@@ -86,7 +86,9 @@ def test_an_item_ranking_discards_what_the_player_owned():
 
 def test_whole_and_sticky_decks():
     run = Run()
-    layout = run.answer("room_layout", "layout:1:85", {"tinted_rock_loot": ["soul_heart", "nothing"]}, ts=10)
+    layout = run.answer("room_layout", "layout:1:85", {"tinted_rocks": 1}, ts=10)
+    rocks = run.answer("rocks", "rocks:1", {"outcomes": [{"reward": "soul_heart", "count": 1}, {"reward": "nothing"},
+                                                         {"reward": "small_rock"}]}, ts=10.5)
     clear = run.answer("room_clear", "clear:1:85", {"rewards": [{"reward": "key", "count": 1}]}, ts=11)
     pills = run.answer("pills", "pills:1", {"pills": [{"color": 3, "effect": "bad_trip"},
                                                       {"color": 4, "effect": "health_up"}]},
@@ -95,7 +97,7 @@ def test_whole_and_sticky_decks():
     run.draw("layout:1:85", "room_layout", {"applied": True}, ts=13, ref=layout, cause="room_enter")
     run.draw("clear:1:85", "room_clear", {"rewards": [{"reward": "key", "count": 1}]}, ts=14, ref=clear)
     run.draw("pills:1", "pills", {"pill": 3, "effect": "bad_trip"}, ts=15, ref=pills, cause="swallowed")
-    run.draw("rock:1:85", "rock", {"rewards": [{"reward": "soul_heart", "count": 1}]}, ts=16, cause="rock_break")
+    run.draw("rocks:1", "rocks", {"reward": "soul_heart", "count": 1}, ts=16, ref=rocks, cause="rock_break")
 
     floors = deckview.build(run.r)
     clear_deck = deck(floors, "clear:1:85")
@@ -103,9 +105,10 @@ def test_whole_and_sticky_decks():
     p = deck(floors, "pills:1")
     assert labels(p.left) == [("blue blue = bad trip", "locked"), ("colour 4 = health up", "set")]
     assert p.status == "1 of 2 colours locked" and not p.spent
-    rock = deck(floors, "rock:1:85")
-    assert rock.title == "Room 85 tinted rocks" and rock.left[0].label == "soul heart, nothing"
-    assert rock.status == "paid 1x"
+    rock = deck(floors, "rocks:1")
+    assert rock.title == "Tinted rocks" and rock.status == "2 left"
+    assert labels(rock.drawn) == [("1x soul heart", "drawn")]
+    assert labels(rock.left) == [("nothing", "next"), ("1x small rock", "queued")], "a rock uses one entry up"
     assert floors[0].decks[-1].spent                # spent decks sort last
 
 
@@ -121,3 +124,13 @@ def test_a_floor_that_is_over_never_draws_its_leftovers():
     assert beggar.title == "Beggar ·1234"
     assert beggar.spent and beggar.status == "1 never drawn" and beggar.left[0].state == "unused"
     assert deck(floors, "curses:1").left[0].state == "waiting"   # the new floor may still wait on it
+
+
+def test_shop_wares_draw_from_the_front_slot_by_slot():
+    run = Run()
+    shop = run.answer("shop", "shop:1", {"goods": ["bomb", "red_heart", "pill"]}, ts=10)
+    run.draw("shop:1", "shop", {"good": "bomb"}, ts=11, ref=shop, cause="shop_slot")
+    d = deck(deckview.build(run.r), "shop:1")
+    assert d.title == "Shop wares" and d.status == "2 left"
+    assert labels(d.drawn) == [("bomb", "drawn")]
+    assert labels(d.left) == [("red heart", "next"), ("pill", "queued")]

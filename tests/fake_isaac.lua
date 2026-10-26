@@ -13,6 +13,7 @@ RoomType = enum({ "ROOM_NULL", "ROOM_DEFAULT", "ROOM_SHOP", "ROOM_ERROR", "ROOM_
   "ROOM_MINIBOSS", "ROOM_SECRET", "ROOM_SUPERSECRET", "ROOM_ARCADE", "ROOM_CURSE", "ROOM_CHALLENGE",
   "ROOM_LIBRARY", "ROOM_SACRIFICE", "ROOM_DEVIL", "ROOM_ANGEL" })
 RoomType.ROOM_PLANETARIUM = 24
+RoomType.ROOM_BLACK_MARKET = 22
 ItemPoolType = enum({ "POOL_TREASURE", "POOL_SHOP", "POOL_BOSS", "POOL_DEVIL", "POOL_ANGEL", "POOL_SECRET",
   "POOL_LIBRARY", "POOL_SHELL_GAME", "POOL_GOLDEN_CHEST", "POOL_RED_CHEST", "POOL_BEGGAR", "POOL_DEMON_BEGGAR",
   "POOL_CURSE" })
@@ -30,7 +31,7 @@ ItemType = { ITEM_PASSIVE = 1, ITEM_ACTIVE = 3 }
 PickupVariant = { PICKUP_OLDCHEST = 55, PICKUP_WOODENCHEST = 56, PICKUP_MOMSCHEST = 390, PICKUP_HEART = 10, PICKUP_COIN = 20, PICKUP_KEY = 30, PICKUP_BOMB = 40, PICKUP_CHEST = 50, PICKUP_BOMBCHEST = 51,
   PICKUP_SPIKEDCHEST = 52, PICKUP_ETERNALCHEST = 53, PICKUP_MIMICCHEST = 54, PICKUP_MEGACHEST = 57, PICKUP_HAUNTEDCHEST = 58, PICKUP_LOCKEDCHEST = 60, PICKUP_GRAB_BAG = 69,
   PICKUP_PILL = 70, PICKUP_LIL_BATTERY = 90, PICKUP_COLLECTIBLE = 100, PICKUP_TAROTCARD = 300,
-  PICKUP_TRINKET = 350, PICKUP_REDCHEST = 360 }
+  PICKUP_SHOPITEM = 150, PICKUP_TRINKET = 350, PICKUP_REDCHEST = 360 }
 CoinSubType = { COIN_PENNY = 1, COIN_NICKEL = 2, COIN_DIME = 3, COIN_DOUBLEPACK = 4, COIN_LUCKYPENNY = 5, COIN_STICKYNICKEL = 6 }
 KeySubType = { KEY_NORMAL = 1, KEY_GOLDEN = 2, KEY_DOUBLEPACK = 3, KEY_CHARGED = 4 }
 BombSubType = { BOMB_NORMAL = 1, BOMB_DOUBLEPACK = 2, BOMB_TROLL = 3, BOMB_GOLDEN = 4 }
@@ -201,6 +202,7 @@ function room:RemoveGridEntity(i) W.removedGrid[#W.removedGrid + 1] = i; W.grid[
 function room:GetGridPosition(i) return Vector(i * 40 % 520, math.floor(i / 13) * 40) end
 function room:GetType() return W.rooms[W.cur].Data.Type end
 function room:IsFirstVisit() return W.rooms[W.cur].VisitedCount == 1 end
+function room:GetFrameCount() return W.roomAge or 1000 end   -- frames since the room loaded
 function room:IsClear()
   for _, e in ipairs(W.enemies) do if e.HitPoints > 0 then return false end end
   return true
@@ -357,8 +359,8 @@ function W.spawnPickup(v, s, x, y, spawner)
   end
   local p = W.makePickup(EntityType.ENTITY_PICKUP, v, s, x, y)
   p.InitSeed, p.SpawnerEntity = seed, spawner
-  if v == 0 then                                 -- a random pickup: its variant is chosen as it initialises
-    p.Variant, p.SubType = W.randomPickup or PickupVariant.PICKUP_COIN, 1
+  if v == 0 or v == PickupVariant.PICKUP_SHOPITEM then   -- a random pickup or a shop slot: chosen as it initialises
+    p.Variant, p.SubType = (v == 0 and W.randomPickup or W.shopPick) or PickupVariant.PICKUP_COIN, 1
     local sel = W.fire(ModCallbacks.MC_POST_PICKUP_SELECTION, p, p.Variant, p.SubType)
     if type(sel) == "table" then p.Variant, p.SubType = sel[1], sel[2] end
     v, s = p.Variant, p.SubType
@@ -380,13 +382,26 @@ function W.kill(npc)
   W.fire(ModCallbacks.MC_POST_NPC_DEATH, npc)
 end
 
+--- A room file's spawns, as its RoomConfig exposes them (Data.Spawns): list = {{type, variant, subtype}, ...}.
+function W.spawnList(list)
+  return { Size = #list, Get = function(_, i)
+    local e = list[i + 1]
+    return { PickEntry = function() return { Type = e[1], Variant = e[2], Subtype = e[3] } end }
+  end }
+end
+
 W.roomEntities = {}       -- idx -> {{type, variant, subtype, grid}}: what the room's layout spawns as it loads
+W.roomSpawned = {}        -- the pickups the last room entered spawned from its layout
 function W.enter(idx)
   W.cur = idx
+  W.roomSpawned = {}
   W.rooms[idx].VisitedCount = W.rooms[idx].VisitedCount + 1
   if W.rooms[idx].VisitedCount == 1 then
     for _, e in ipairs(W.roomEntities[idx] or {}) do
       W.fire(ModCallbacks.MC_PRE_ROOM_ENTITY_SPAWN, e[1], e[2], e[3], e[4], 777)
+      if e[1] == EntityType.ENTITY_PICKUP then      -- ...then the pickup itself, the same frame
+        W.roomSpawned[#W.roomSpawned + 1] = W.spawnPickup(e[2], e[3])
+      end
     end
   end
   W.fire(ModCallbacks.MC_POST_NEW_ROOM)

@@ -26,6 +26,49 @@ local function round(x, n)
   return math.floor(x * m + 0.5) / m
 end
 
+local pickupNames = {}
+for k, v in pairs(PickupVariant or {}) do pickupNames[v] = k:gsub("^PICKUP_", ""):lower() end
+local ROOM_FILE_ROCK = 1000          -- a plain rock in a room file (grid entities there are 1000 + their kind)
+
+--- What a room's layout file places, readable before the room is entered: plain rocks (all tinted_rocks can
+--- convert; the game may tint a few itself), free pickups by kind ("random": the game picks as the room
+--- loads), pedestals, shop slots and enemies. A spawn with several weighted options counts as its first.
+--- nil where this build doesn't expose a room's spawns.
+function State.roomContents(desc)
+  local ok, out = pcall(function()
+    local spawns = desc.Data.Spawns
+    local c = { plain_rocks = 0, enemies = 0, pedestals = 0, shop_slots = 0, pickups = {} }
+    for i = 0, spawns.Size - 1 do
+      local e = spawns:Get(i):PickEntry(0)
+      local t, v = e.Type, e.Variant
+      if t == ROOM_FILE_ROCK then
+        c.plain_rocks = c.plain_rocks + 1
+      elseif t == EntityType.ENTITY_PICKUP then
+        if v == PickupVariant.PICKUP_COLLECTIBLE then
+          c.pedestals = c.pedestals + 1
+        elseif v == PickupVariant.PICKUP_SHOPITEM then
+          c.shop_slots = c.shop_slots + 1
+        else
+          local name = v == 0 and "random" or (pickupNames[v] or tostring(v))
+          c.pickups[name] = (c.pickups[name] or 0) + 1
+        end
+      elseif t >= 10 and t < 1000 and t ~= EntityType.ENTITY_FIREPLACE then
+        c.enemies = c.enemies + 1
+      end
+    end
+    return c
+  end)
+  return ok and out or nil
+end
+
+--- Free pickups in a room's layout file (what layout_pickups can change); nil if unknown.
+function State.freePickups(contents)
+  if not contents then return nil end
+  local n = 0
+  for _, k in pairs(contents.pickups) do n = n + k end
+  return n
+end
+
 local function prettyItemName(raw)
   if type(raw) ~= "string" or raw == "" then return "?" end
   if raw:sub(1, 1) ~= "#" then return raw end

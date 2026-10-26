@@ -75,29 +75,45 @@ def test_fallback_event_is_counted_not_remembered():
     assert not coord.memory.events
 
 
-def test_cruelty_follows_hello_and_settings():
+def test_cruelty_is_set_by_the_app_not_the_game():
     class DM(ScriptedDM):
         def set_cruelty(self, cruelty):
             self.cruelty = cruelty
 
     dm = DM([])
     coord = Coordinator(dm, cruelty=6)
-    sent = []
 
     async def send(msg):
-        sent.append(msg)
+        pass
 
-    def handle(msg):
-        asyncio.run(coord.handle(msg, send))
-        return coord.cruelty
+    asyncio.run(coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R", "cruelty": 9}, send))
+    assert coord.cruelty == 6, "the game's cruelty is ignored"
+    asyncio.run(coord.handle({"t": "settings", "cruelty": 2}, send))
+    assert coord.cruelty == 6
+    coord.set_cruelty(2)
+    assert coord.cruelty == 6 and dm.cruelty == 6, "a run keeps the cruelty it started with"
+    asyncio.run(coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R", "cruelty": 9}, send))
+    assert coord.cruelty == 6, "...a reconnect is still the same run"
+    asyncio.run(coord.handle({"t": "hello", "proto": PROTO, "session": "S2", "run": "R2", "new_run": True}, send))
+    assert coord.cruelty == 2 and dm.cruelty == 2 and coord.memory.economy.cruelty == 2, "the next run takes it"
+    coord.set_cruelty(42)
+    assert coord.next_cruelty == 10 and coord.cruelty == 2
 
-    assert handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R", "cruelty": 9}) == 9 and dm.cruelty == 9
-    assert handle({"t": "settings", "cruelty": 2}) == 2 and dm.cruelty == 2
-    assert [m for m in sent if m["t"] == "settings_ok"][-1] == {"t": "settings_ok", "session": "S", "cruelty": 2}
-    assert handle({"t": "settings"}) == 6 and dm.cruelty == 6        # menu's "backend default"
-    assert handle({"t": "settings", "cruelty": 42}) == 10
-    assert handle({"t": "settings", "cruelty": "lots"}) == 10        # garbage is ignored
-    assert handle({"t": "hello", "proto": PROTO, "session": "S2", "run": "R"}) == 6  # reconnect without override
+
+def test_a_continued_run_keeps_the_cruelty_it_started_with(tmp_path):
+    from receipt import Receipt
+
+    async def send(msg):
+        pass
+
+    first = Coordinator(ScriptedDM([]), cruelty=3, receipt=Receipt(tmp_path))
+    asyncio.run(first.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R", "new_run": True}, send))
+    # The backend restarted with other Settings; the game continues the same run.
+    again = Coordinator(ScriptedDM([]), cruelty=9, receipt=Receipt(tmp_path))
+    asyncio.run(again.handle({"t": "hello", "proto": PROTO, "session": "S2", "run": "R"}, send))
+    assert again.cruelty == 3 and again.next_cruelty == 9
+    asyncio.run(again.handle({"t": "hello", "proto": PROTO, "session": "S3", "run": "R3", "new_run": True}, send))
+    assert again.cruelty == 9
 
 
 def test_clean_text_cuts_on_word_boundary():
@@ -554,19 +570,20 @@ def test_reconfigure_swaps_models_mid_run_and_keeps_the_run():
         sent.append(msg)
 
     async def go():
-        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True,
-                            "cruelty": 8}, send)
+        await coord.handle({"t": "hello", "proto": PROTO, "session": "S", "run": "R1", "new_run": True}, send)
         await coord.handle(floor_req(1, 1, "Basement I"), send)
         await asyncio.sleep(0.05)
         path = coord.receipt.path
-        coord.reconfigure(Engine(new_dm, ScriptedPlanner(), None, concurrency=2, late_grace=1.5, label="new"))
+        coord.reconfigure(Engine(new_dm, ScriptedPlanner(), None, concurrency=2, late_grace=1.5, label="new",
+                                 cruelty=8))
         await coord.handle(floor_req(2, 1, "Basement I"), send)
         await asyncio.sleep(0.05)
         return path
 
     path = asyncio.run(go())
     assert len(old_dm.seen) == 1 and len(new_dm.seen) == 1        # the second decision went to the new DM
-    assert new_dm.cruelties == [8]                                 # told the run's cruelty, not the default
+    assert new_dm.cruelties == [6] and coord.next_cruelty == 8     # the run keeps its cruelty; Settings' waits
+    assert coord.cruelty == 6 and coord.memory.economy.cruelty == 6
     assert "NARRATIVE for Isaac" in new_dm.campaigns[0] and "BRIEF for Basement I" in new_dm.campaigns[0]
     assert coord.late_grace_s == 1.5 and coord.gate is None
     assert coord.receipt.path == path and coord.memory.run_id == "R1"
@@ -600,7 +617,10 @@ def test_drawn_counts_what_was_handed_out_and_marks_the_answer_applied(tmp_path)
                        {"t": "drawn", "key": "drops:1", "id": 1, "outcome": {"reward": "bomb", "count": 1},
                         "cause": "enemy_death"},
                        {"t": "drawn", "key": "clear:1:85", "id": 2,
-                        "outcome": {"rewards": [{"reward": "key", "count": 1}]}}])
+                        "outcome": {"rewards": [{"reward": "key", "count": 1}]}},
+                       {"t": "effect", "key": "drops:1", "effect": ["kill: +1 bomb (instead of the game's 1 penny)"]},
+                       {"t": "effect", "key": "layout:1:85", "effect": ["no layout pickups to change (keep)",
+                                                                       "+0 tinted rocks (not enough rocks)"]}])
     c = coord.memory.counters
     assert c["clears"] == 1 and c["clears_since_key"] == 0
     assert c["clears_since_bomb"] == 0, "a bomb from a kill since the last clear counts for the drought"
@@ -608,7 +628,8 @@ def test_drawn_counts_what_was_handed_out_and_marks_the_answer_applied(tmp_path)
     assert coord.stats["drops"]["applied"] == 1 and coord.stats["room_clear"]["applied"] == 1, "once per answer"
     assert coord.memory.economy.delivered["keys"] == 1 and coord.memory.economy.delivered["bombs"] == 1
     assert list(coord.memory.schemes) == ["s1"]
-    assert any(e == "kill dropped: 1x bomb" for e in coord.memory.events)
+    assert "drop: kill: +1 bomb (instead of the game's 1 penny)" in coord.memory.events,         "an effect line is the DM's memory of what happened"
+    assert "room dressed: +0 tinted rocks (not enough rocks)" in coord.memory.events, "no-ops are left out"
     assert coord.receipt.drawn == [("drops", {"reward": "nothing"}), ("drops", {"reward": "bomb", "count": 1}),
                                    ("room_clear", {"rewards": [{"reward": "key", "count": 1}]})]
     assert sorted(coord.receipt.status.values()).count("applied") == 2

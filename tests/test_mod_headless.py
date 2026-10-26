@@ -92,12 +92,6 @@ def run(tmp, game):
         return modules[name]
 
     g.include = include
-    # Minimal Mod Config Menu: records what the mod registers.
-    mcm = lua.execute("""
-        local M = { OptionType = { TEXT = 1, SPACE = 2, NUMBER = 3, TITLE = 9 }, settings = {} }
-        function M.AddSetting(cat, sub, s) M.settings[#M.settings + 1] = { cat = cat, sub = sub, s = s } end
-        return M""")
-    g.ModConfigMenu = mcm
     lua.execute(open(MOD / "main.lua").read())
     Bridge, Sched, Decks = modules["dm.bridge"], modules["dm.scheduler"], modules["dm.decks"]
     MC = g.ModCallbacks
@@ -151,19 +145,6 @@ def run(tmp, game):
     assert any(m.get("t") == "prepare" for m in sent(game))
     print("   loading screen held input until the narrative was in, then released it")
 
-    # --- DM Settings menu: cruelty slider, applied live and saved -----------------
-    menu = [mcm.settings[i] for i in range(1, len(mcm.settings) + 1)]
-    general = [e for e in menu if e.sub == "General"]
-    assert len(general) == 1, "DM Settings registered once (again on game start is a no-op)"
-    entry = general[0]
-    assert entry.cat == "DM Settings" and entry.s.CurrentSetting() == -1
-    assert entry.s.Display() == "Cruelty: backend default"
-    entry.s.OnChange(3)
-    tick(3)
-    settings = [m for m in sent(game) if m.get("t") == "settings"]
-    assert settings and settings[-1]["cruelty"] == 3, "cruelty change should reach the backend"
-    assert entry.s.Display() == "Cruelty: 3/10 (mischievous)" and json.loads(W.saved)["cruelty"] == 3
-    print("   DM Settings -> cruelty 3 sent to backend and saved")
     wait(lambda: Bridge.peek("layout:1:85") and Bridge.peek("items:1:0"), 6, "neighbour prefetch")
     print("2. prefetched before the player moved: layout for room 85, treasure pool ranking")
 
@@ -244,7 +225,7 @@ def run(tmp, game):
     print(f"8. pill colour 5 -> {pill5['effect']} (effect {effect}), horse pill -> {horse}; saved: {W.saved}")
     assert effect == g.PillEffect[pill5["enum"]] and horse == effect
     assert '"5"' in W.saved
-    assert json.loads(W.saved)["cruelty"] == 3, "pill save must not wipe the DM Settings"
+    assert "pills" in json.loads(W.saved), "pill save keeps the mod's data"
     assert W.fire(MC.MC_GET_PILL_EFFECT, 3, 9) is None             # no plan for colour 9: vanilla
     W.fire(MC.MC_USE_PILL, 3)
     assert W.fire(MC.MC_GET_PILL_EFFECT, 3, 9) is None             # ...and it stays vanilla's
@@ -413,25 +394,65 @@ def run(tmp, game):
     assert len(drawn("drops:1")) == d1 + 1, "the kill drew from the new answer"
     print("15b1. empty deck: the kill's drop was cancelled, the game froze until the DM answered")
 
-    # --- a tinted rock holds what the room's layout planned, not the game's loot ---
-    Rocks = modules["dm.streams.rocks"]
-    Rocks.plan(85, "layout:1:85", lua.table_from(["key", "penny"]))
+    # --- a boss's death is a kill: it draws the drops deck and the game's boss hearts are cancelled ---
+    boss = W.makeEnemy(50, 320, 200)
+    boss["boss"] = True
+    W.enemies = lua.table_from([boss])
+    d2 = len(drawn("drops:1"))
+    W.kill(boss)
+    bheart = W.spawnPickup(PV.PICKUP_HEART, 0, 320, 200, boss)
+    assert bheart.removed, "the game's boss heart is cancelled"
+    tick()
+    wait(lambda: not Hold.holding("drops:1"), 8, "the drops answer for the boss kill")
+    tick(3)
+    assert len(drawn("drops:1")) == d2 + 1, "the boss kill drew one entry"
+    lines = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == "drops:1" for l in m["effect"]]
+    assert any(l.startswith("boss kill:") for l in lines), lines
+    W.enemies = lua.table_from([])
+    print("15b-boss. boss kill drew the drops deck; the game's boss heart was cancelled")
+
+    # --- walking back into a room: the pickups left in it spawn again, and that is no roll ---
+    W.rooms[W.cur].VisitedCount, W.roomAge = 2, 0
+    left = W.spawnPickup(PV.PICKUP_COIN, 1, 100, 100)
+    W.rooms[W.cur].VisitedCount, W.roomAge = 1, None
+    assert not left.removed, "a restored pickup is left alone"
+    W.pickups = lua.table_from([])
+    print("15b-restore. a pickup restored on re-entry stood, counted apart from the rolls")
+
+    # --- a tinted rock holds the floor's next rocks-deck entry, not the game's loot, whichever room it is in ---
     tick()                                         # grid 22 (at 360,40) is seen standing
-    n0 = len(W.spawned)
+    n0, r0 = len(W.spawned), len(drawn("rocks:1"))
     W.gridState[22] = 2                            # bombed: the game drops its soul heart
     vanilla = W.spawnPickup(PV.PICKUP_HEART, g.HeartSubType.HEART_SOUL, 360, 40)
-    assert vanilla.removed, "the game's loot from a planned rock is cancelled"
+    assert vanilla.removed, "the game's loot from a tinted rock is cancelled"
     tick(3)
-    paid = [s.v for s in list(W.spawned.values())[n0:]]
-    assert paid == [PV.PICKUP_KEY, PV.PICKUP_COIN], paid
+    if Hold.holding("rocks:1"):                    # the deck was not stocked yet: the game freezes for the DM
+        wait(lambda: not Hold.holding("rocks:1"), 8, "the rocks answer for the empty-deck rock")
     tick(10)
-    assert len(W.spawned) == n0 + 2, "a rock pays once"
-    reff = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == "layout:1:85" for l in m["effect"]]
-    assert "tinted rock bombed: +1 key, +1 penny (instead of the game's 1 soul heart)" in reff, reff
-    assert drawn("rock:1:85")[-1]["outcome"]["rewards"] == [{"reward": "key", "count": 1},
-                                                           {"reward": "penny", "count": 1}]
+    assert len(drawn("rocks:1")) == r0 + 1, "the rock drew one entry from the floor's deck"
+    reff = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == "rocks:1" for l in m["effect"]]
+    assert reff and reff[-1].startswith("tinted rock bombed:") and "(instead of the game's soul_heart)" in reff[-1], reff
+    paid = [s.v for s in list(W.spawned.values())[n0:]]
+    assert len(paid) <= 2, "a rock pays once"
     W.gridState[22] = None
-    print("15b2. tinted rock paid the DM's loot instead of the game's:", reff[-1])
+    print("15b2. tinted rock paid the floor's rocks deck instead of the game's loot:", reff[-1])
+
+    # --- the deck used up: the next rock's loot is cancelled and the game freezes until the DM answers ---
+    for _ in range(20):
+        if Decks.draw("rocks", 1, lua.table_from({"cause": "rock_break"}))[0] is None:
+            break
+    tick()                                         # the rock is seen standing again
+    r1 = len(drawn("rocks:1"))
+    W.gridState[22] = 2
+    vanilla = W.spawnPickup(PV.PICKUP_HEART, g.HeartSubType.HEART_SOUL, 360, 40)
+    assert vanilla.removed, "the game's loot is cancelled even with the rocks deck empty"
+    tick()
+    assert Hold.holding("rocks:1"), "the game freezes for the rocks deck"
+    wait(lambda: not Hold.holding("rocks:1"), 8, "the rocks answer for the empty-deck rock")
+    tick(10)
+    assert len(drawn("rocks:1")) == r1 + 1, "the rock drew from the new answer"
+    W.gridState[22] = None
+    print("15b3. empty rocks deck: the rock's loot was cancelled, the game froze until the DM answered")
 
     # --- a beggar follows its payout schedule (key, nothing, penny); the game's own payout is cancelled ---
     beggar = W.makePickup(g.EntityType.ENTITY_SLOT, 4, 0, 330, 300)
@@ -521,6 +542,36 @@ def run(tmp, game):
     W.pickups = lua.table_from([])
     print("15e. grab bag paid its scheduled contents")
 
+    # --- special rooms: the shop's wares are the DM's; an off-map room with nothing random isn't held for ---
+    W.enemies = lua.table_from([])
+    slot = [g.EntityType.ENTITY_PICKUP, g.PickupVariant.PICKUP_SHOPITEM, 0]
+    def room(idx, rtype, spawns):
+        return lua.table_from({"SafeGridIndex": idx, "GridIndex": idx, "VisitedCount": 0, "AwardSeed": 1,
+                               "Data": lua.table_from({"Type": rtype, "Shape": 1, "Difficulty": 1,
+                                                       "Spawns": W.spawnList(lua.table_from(spawns))})})
+    W.rooms[72] = room(72, g.RoomType.ROOM_SHOP, [lua.table_from(slot)] * 3)
+    W.adj[72] = lua.table_from([])
+    wait(lambda: Bridge.peek("shop:1"), 6, "the shop's wares, asked while the shop is still ahead")
+    ask = reqs("shop:1")[-1]["ctx"]
+    assert ask["reason"] == "floor start" and ask["wanted"] == 3 and ask["shop_contents"]["shop_slots"] == 3, ask
+    goods = list(to_py(Bridge.peek("shop:1").decision)["goods"])
+    W.roomEntities[72] = lua.table_from([lua.table_from([*slot, 40 + i]) for i in range(3)])
+    W.shopPick = g.PickupVariant.PICKUP_LIL_BATTERY            # what the game would have stocked
+    W.enter(72)
+    stocked = [(W.roomSpawned[i].Variant, W.roomSpawned[i].SubType) for i in range(1, 4)]
+    assert stocked == [tuple(modules["dm.apply"].pickupFor(name)) for name in goods], (stocked, goods)
+    assert [m["outcome"]["good"] for m in drawn("shop:1")] == goods
+    wait(lambda: not Hold.active(), 8, "the shop room's own layout (a special room is dressed too)")
+    assert drawn("layout:1:72"), "the shop room was dressed"
+    assert reqs("layout:1:72")[0]["ctx"]["room_contents"]["shop_slots"] == 3, "asked with what its room file places"
+    W.rooms[-6] = room(-6, g.RoomType.ROOM_BLACK_MARKET, [lua.table_from(slot)])
+    W.adj[-6] = lua.table_from([])
+    W.roomEntities[-6] = lua.table_from([lua.table_from([*slot, 50])])
+    W.enter(-6)
+    tick(3)
+    assert not Hold.active() and not reqs("layout:1:-6"), "an off-map room with no free pickups isn't held for"
+    print(f"15e2. shop stocked with the DM's wares {goods}; shop room dressed; black market left alone")
+
     # --- the roll audit: nothing this walk covers went to vanilla ---
     rolls0 = rolls_sent()
     wait(lambda: rolls_sent() > rolls0, 6, "the roll counts")
@@ -535,14 +586,19 @@ def run(tmp, game):
         k[0] in covered or (k[0] == "spawn" and k[1] in ("enemy_death", "chest_open", "slot_payout", "rock_break")))}
     assert not loose, loose
     assert tally.get(("room_entity", "coin", "layout"), 0) == 1, "a room's own pickups are counted as it loads"
-    assert not [k for k in tally if k[0] == "pickup_selection"], "a cancelled spawn's selection is no roll"
-    assert tally.get(("npc_death", "-", "drops"), 0) == 4 and tally.get(("spawn", "enemy_death", "drops"), 0) == 4, tally
+    # A cancelled spawn's selection is no roll; a shop slot's is the shop deck's; the black market's is no stream's.
+    assert {k: n for k, n in tally.items() if k[0] == "pickup_selection"} == {
+        ("pickup_selection", "lil_battery", "shop"): 3, ("pickup_selection", "lil_battery", "uncontrolled"): 1}, tally
+    assert tally.get(("room_entity", "shopitem", "shop"), 0) == 3, tally
+    assert tally.get(("room_entity", "shopitem", "uncontrolled"), 0) == 1, "a pickup no stream claims is uncontrolled"
+    assert tally.get(("npc_death", "-", "drops"), 0) == 5 and tally.get(("spawn", "enemy_death", "drops"), 0) == 4, tally
+    assert tally.get(("spawn", "boss_death", "drops"), 0) == 1, tally
+    assert tally.get(("spawn", "room_restore", "restored"), 0) == 1, tally
     assert any(m.get("t") == "event" and m.get("name") == "rolls" and m["data"].get("samples") for m in sent(game)), \
         "LOG_SPAWNS samples go with the counts"
     print("15f. roll audit:", {f"{h}/{c}": n for (h, c, o), n in tally.items() if o != "uncontrolled"})
 
-    # --- the receipt: on disk for the app, no longer in the game's menu ----------------
-    assert not [e for e in menu if e.sub == "Receipt"], "the receipt lives in the app, not the menu"
+    # --- the receipt: on disk for the app ----------------
     files = list((Path(tmp) / "receipts").glob("*.jsonl"))
     assert len(files) == 1, files
     recs = [json.loads(l) for l in files[0].read_text().splitlines()]
@@ -554,7 +610,6 @@ def run(tmp, game):
     assert any(line.startswith("item offered: ") for line in effects), effects
     icons = {W.drawn[i].file for i in range(1, len(W.drawn) + 1)}
     assert any(f.startswith("gfx/005.") for f in icons), "used decisions show in the corner, as pickup icons"
-    assert any(r.get("what") == "cruelty" and r.get("result") == "6 -> 3" for r in recs)
     audits = [r for r in recs if r.get("what") == "rolls"]
     assert audits and any(r.get("samples") for r in audits), "the roll audit is in the receipt"
     assert any(r["type"] == "drawn" and r["key"] == "drops:1" for r in recs), "every draw is in the receipt"
@@ -563,6 +618,7 @@ def run(tmp, game):
 
     # --- floor 2: a loading screen again, held until the brief and the start room's neighbours are in ---
     W.stage = 2
+    W.rooms[72], W.rooms[-6] = None, None          # this floor's shop and black market aren't on the next
     for idx in (84, 85, 71, 86):
         W.rooms[idx].VisitedCount = 0
     W.enemies = lua.table_from([])
@@ -576,17 +632,17 @@ def run(tmp, game):
     Loading.handle(lua.table_from({"status": "ready", "floor": 1}))           # a stale ready from floor 1
     tick()
     assert Loading.active(), "a ready for another floor doesn't end this floor's wait"
-    # Only the start room's neighbours gate the screen: room 85's layout and treasure room 71's pool.
+    # Only the start room's neighbours gate the screen: room 85's layout, treasure room 71's layout and pool.
     # The boss pool (room 86 isn't next door) and the card/trinket decks go in the background.
     gated = sorted(Sched.floorReadyKeys().values())
-    assert gated == ["items:2:0", "layout:2:85"], gated
+    assert gated == ["items:2:0", "layout:2:71", "layout:2:85"], gated
     asks = [m["ctx"]["reason"] for m in sent(game) if m.get("t") == "req" and m.get("key") == "items:2:0"]
     assert asks == ["player is next to this room"], f"the gated pool is asked as next door (not floor start): {asks}"
     assert Bridge.isPending("items:2:2") or Bridge.settled("items:2:2"), "boss pool still asked, in the background"
     wait(lambda: Bridge.isPending("cards:2") or Bridge.settled("cards:2"), 2, "the cards deck asked, in the background")
     wait(lambda: not Loading.active(), 8, "floor 2's plans and the start room's neighbours")
-    opening = [k for k in ("layout:2:85", "items:2:0") if Bridge.settled(k)]
-    assert opening == ["layout:2:85", "items:2:0"], opening
+    opening = [k for k in ("layout:2:85", "layout:2:71", "items:2:0") if Bridge.settled(k)]
+    assert opening == ["layout:2:85", "layout:2:71", "items:2:0"], opening
     prepares = [m for m in sent(game) if m.get("t") == "prepare"]
     assert prepares[-1]["floor"] == 2 and prepares[-1]["state"]["level"]["stage"] == 2
     # Empty slots are spelled out, so a planner can't fill them from the character's usual loadout.
@@ -601,7 +657,7 @@ def run(tmp, game):
         ("layout:2:", "items:2:", "cards:2", "trinkets:2", "pills:2", "drops:2"))]
     assert not early, f"floor 2 decisions made before its brief: {early}"
     print("17. floor 2: loading screen held until its brief and the start room's neighbours were in"
-          " (layout:2:85, items:2:0); boss pool and decks in the background; none made before the brief")
+          " (layout:2:85, layout:2:71, items:2:0); boss pool and decks in the background; none made before the brief")
 
     # --- the next floor is generated before its plan lands: its curses change once it does ---
     W.enter(86)
@@ -618,21 +674,22 @@ def run(tmp, game):
     gaper = lua.table_from({"Entity": lua.table_from({"Type": g.EntityType.ENTITY_GAPER, "Variant": 0})})
     W.fire(MC.MC_ENTITY_TAKE_DMG, g.Isaac.GetPlayer(0), 2, 0, gaper)
     W.fire(MC.MC_POST_GAME_END, True)
-    last_run = [e.s for e in menu if e.sub == "Last run"]
 
     def last():
-        return " | ".join(l for l in (s.Display() for s in last_run) if l)
+        run = json.loads(W.saved).get("last_run") or {}
+        rows = [f"{r[0]}: {r[1]}" for sec in run.get("sections", []) for r in sec.get("rows", [])]
+        return " | ".join([run.get("title") or "", *rows, run.get("epitaph") or ""])
 
     text = last()
-    assert text.startswith("HERE LIES ISAAC") and "Reached: Basement II" in text and "Last hit by: gaper" in text
-    assert "Rooms cleared: 4" in text and "Pills eaten: 2" in text and "tallying" in text, text
+    assert "Reached: Basement II" in text and "Last hit by: gaper" in text
+    assert "Rooms cleared: 4" in text and "Pills eaten: 2" in text, text
     death = [m for m in sent(game) if m.get("t") == "event" and m.get("name") == "death"]
     assert death and death[0]["data"]["run"] == "TEST 1234" and death[0]["data"]["rows"][0] == ["Reached", "Basement II"]
     wait(lambda: "Extra enemies" in last(), 5, "the DM's side of the stats")
     wait(lambda: "The dice were mine" in last(), 5, "the DM's epitaph")
     tick(3)                                   # the overlay draws without errors
     assert "The dice were mine" in json.loads(W.saved)["last_run"]["epitaph"], "kept for the next session"
-    print("19. death -> DM Settings > Last run:\n      " + last().replace(" | ", "\n      "))
+    print("19. death -> kept in the save file:\n      " + last().replace(" | ", "\n      "))
 
     errors = [p for p in printed if "error" in p.lower()]
     assert not errors, errors

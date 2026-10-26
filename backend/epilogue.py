@@ -74,7 +74,7 @@ def _drawn_rewards(outcome: Any) -> list[dict]:
 
 # Kinds whose pickups count from what was drawn, when the receipt has draws (PROTO 2): a deck may be
 # only partly used, and draws carry what mercy changed at the last moment.
-DRAWN_KINDS = ("room_clear", "drops", "payout_plan", "rock")
+DRAWN_KINDS = ("room_clear", "drops", "payout_plan", "rocks")
 
 
 def dm_side(applied: list[tuple[str, dict]], totals: dict, pills: Any,

@@ -235,25 +235,57 @@ def test_payout_schedule_rules():
     assert empty == [{"reward": "nothing", "count": 1}]           # an empty chest: one joke, cruel runs only
 
 
-def test_tinted_rock_loot():
-    base = {"champion_chance": 0, "extra_enemies": [], "tinted_rocks": 1, "layout_pickups": "keep", "taunt": ""}
+def test_rocks_deck():
+    def rocks(asked, cruelty=6, state=None, counters=None, ctx=None):
+        raw = {"outcomes": asked, "taunt": ""}
+        return clamp("rocks", raw, state or st(), ctx or {}, cruelty, counters or {})["outcomes"]
 
-    def loot(asked, cruelty=6, state=None, counters=None):
-        return clamp("room_layout", {**base, "tinted_rock_loot": asked}, state or st(), {}, cruelty,
-                     counters or {})["tinted_rock_loot"]
+    out = rocks([{"reward": "golden_key", "count": 2}, {"reward": "nope"}, "junk", {"reward": "penny", "count": 2}])
+    assert out == [{"reward": "golden_key", "count": 1}, {"reward": "nothing", "count": 1},
+                   {"reward": "nothing", "count": 1}, {"reward": "penny", "count": 2}], "one entry per rock"
+    assert len(rocks([{"reward": "penny"}] * 12)) == 6, "context.wanted (default 6) caps the deck"
+    assert len(rocks([{"reward": "penny"}] * 12, ctx={"wanted": 8})) == 8
+    assert rocks([{"reward": "nothing"}]) == [{"reward": "nothing", "count": 1}]
+    # an empty rock needs cruelty 3 and a player in no danger; otherwise it is the game's own gift
+    assert rocks([{"reward": "nothing"}], cruelty=2) == [{"reward": "soul_heart", "count": 1}]
+    assert rocks([{"reward": "nothing"}], state=st(hp_red=1)) == [{"reward": "soul_heart", "count": 1}]
+    assert [r["reward"] for r in rocks([{"reward": "troll_bomb"}] * 3, counters={"troll_bombs_floor": 1})]         == ["troll_bomb", "nothing", "nothing"], "troll bombs spend the floor's trap budget"
+    assert rocks([{"reward": "troll_bomb"}], cruelty=2) == [{"reward": "soul_heart", "count": 1}]   # no traps below 4
+    assert rocks([{"reward": "troll_bomb"}], counters={"troll_bombs_floor": 9}) == [{"reward": "nothing", "count": 1}]
+    # the Small Rock: one a floor
+    assert [r["reward"] for r in rocks([{"reward": "small_rock"}] * 2)] == ["small_rock", "nothing"]
+    raw = {"outcomes": [{"reward": "troll_bomb"}], "taunt": ""}
+    out = clamp("rocks", raw, st(), {}, cruelty=4, counters={"troll_bombs_floor": 9})
+    assert any("tinted rock troll_bomb" in n for n in out["guardrails"])
+    assert clamp_diff("rocks", raw, out) == ["outcomes 1x troll_bomb -> 1x nothing"]
 
-    assert clamp("room_layout", base, st(), {}, cruelty=6, counters={})["tinted_rock_loot"] == []   # the game's own
-    assert loot(["golden_key", "nope", {"x": 1}, "penny", "dime"]) == ["golden_key", "penny"]
-    assert loot(["nothing"]) == ["nothing"]
-    assert loot(["penny", "nothing"]) == ["penny"], "nothing only stands alone"
-    assert loot(["nothing"], cruelty=2) == [] and loot(["nothing"], state=st(hp_red=1)) == []
-    assert loot(["troll_bomb", "troll_bomb"]) == ["troll_bomb"]
-    assert loot(["troll_bomb"], counters={"troll_bombs_floor": 9}) == []
-    assert loot(["troll_bomb"], cruelty=2) == []
-    # the room's own troll bomb spends the budget first: cruelty 4 -> 1 + 4//4 = 2, one already used
-    raw = {**base, "layout_pickups": "troll_bombs", "tinted_rock_loot": ["troll_bomb"]}
-    out = clamp("room_layout", raw, st(), {}, cruelty=4, counters={"troll_bombs_floor": 1})
-    assert out["layout_pickups"] == "troll_bombs"
-    assert out["tinted_rock_loot"] == [] and any("tinted rock" in n for n in out["guardrails"])
-    diffs = clamp_diff("room_layout", raw, out)
-    assert "tinted rock loot troll_bomb -> none" in diffs, diffs
+
+def test_what_the_player_gains_outside_the_decks_counts_against_the_budget():
+    from economy import Economy
+
+    def snap(coins, keys=0, red=6):
+        return {"level": {"stage": 1, "stage_type": 0, "room_types": {"default": 10}},
+                "player": {"resources": {"coins": coins, "keys": keys, "bombs": 0}, "hp": {"red": red, "soul": 0}}}
+
+    econ = Economy()
+    econ.cruelty = 6
+    econ.observe(snap(0))
+    econ.draw("drops:1", {"reward": "penny", "count": 1})     # the DM's penny...
+    econ.observe(snap(1))                                    # ...picked up: not outside
+    econ.observe(snap(7, keys=6))                            # Libra: +6 coins, +6 keys
+    econ.observe(snap(2, keys=5, red=4))                     # spent and hurt: no gain
+    assert econ.outside("coins") == 6 and econ.outside("keys") == 6 and econ.outside("hearts") == 0
+    assert econ.given("coins") == 7 and econ.delivered["coins"] == 1
+    view = econ.view(None)
+    assert view["coins"]["delivered"] == 1 and view["coins"]["outside"] == 6
+    assert "keys: 6 given (6 of it from outside your decks)" in view["verdict"]
+    econ.observe({**snap(2, keys=5), "level": {"stage": 2, "stage_type": 0, "room_types": {"default": 10}}})
+    assert econ.outside("keys") == 0, "a new floor starts its own count"
+
+
+def test_shop_sells_only_shop_goods_one_per_slot_asked():
+    raw = {"goods": ["key", "troll_bomb", "soul_heart", "golden_key", "bomb", "card", "pill"], "taunt": "Buy."}
+    out = clamp("shop", raw, st(), {"wanted": 4}, cruelty=6, counters={})
+    assert out["goods"] == ["key", "soul_heart", "bomb", "card"]
+    assert clamp_diff("shop", raw, out) == [
+        "goods key, troll_bomb, soul_heart, golden_key, bomb, card, pill -> key, soul_heart, bomb, card"]

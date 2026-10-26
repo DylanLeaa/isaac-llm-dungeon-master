@@ -14,13 +14,20 @@
 -- A result is a deck: each outcome the game draws from it is reported (`drawn`), so the backend
 -- counts what was actually handed out. The backend can push `stale` for keys whose unused entries
 -- another deck's spending made out of date (the floor's economy); decks.lua re-asks those.
+--
+-- In agent mode the backend can also push a deck nobody asked for (`res` with push = true): one turn
+-- restacks any open deck. It takes a local id newer than every request so far, so only a later request's
+-- answer replaces it, and its draws are reported under the backend's own id for it (`wire`). The backend says
+-- whether agent mode is on in its welcome (and `mode` when Settings switch it): the streams then ask for every
+-- room's layout and clear at floor start, so the agent writes the floor ahead in a few turns.
 local json = require("json")
 
 local Bridge = {}
 
 -- Must match PROTO in backend/bridge.py. Bump both when a message changes shape.
 -- 2: decks (`drawn` per draw, `abandon`, the backend's `stale` push), cards/trinkets/pills/drops kinds.
-local PROTO = 2
+-- 3: pushed decks (agent mode): `res` with push = true, its draws reported under the pushed id.
+local PROTO = 3
 local HELLO_MS = 2000
 local PING_MS = 2000      -- how often a connected bridge checks the backend is still there
 local LINK_TIMEOUT_MS = 6000
@@ -31,6 +38,7 @@ local session
 local welcomed = false
 local seen = false     -- the backend has welcomed us since the game started
 local outdated         -- the backend's protocol, when it isn't ours
+local agentMode = false -- the backend writes the floor ahead (agent mode)
 local nextId = 1
 local pending = {}     -- key -> {id, sentAt, kind, sends}
 local results = {}     -- key -> {id, kind, decision, at, ms}
@@ -43,7 +51,6 @@ local onSummary        -- optional callback(msg) for the backend's run_summary (
 local onReady          -- optional callback(msg) for the backend's "ready" (the run narrative is in)
 local onEffect         -- optional callback(lines) for every effect sent (the on-screen effect list)
 local onStale          -- optional callback(keys) for the backend's "stale" (decks to rewrite)
-local cruelty          -- nil = backend's --cruelty; set from config / the DM Settings menu
 
 local lineNo = 0       -- numbers our messages in the log
 local boot             -- the backend run whose messages we're reading
@@ -75,6 +82,9 @@ function Bridge.status()
 end
 
 function Bridge.ready() return welcomed end
+
+--- The backend is in agent mode: ask for the whole floor up front.
+function Bridge.agentMode() return welcomed and agentMode end
 
 --- The backend has answered since the game started (it may have gone since).
 function Bridge.seen() return seen end
@@ -143,14 +153,6 @@ function Bridge.request(kind, key, state, ctx, deadlineMs)
          state = state, ctx = ctx or {} })
   return id
 end
-
---- Change cruelty (0..10, nil = backend default). Sent now if connected, else with the next hello.
-function Bridge.setCruelty(v)
-  cruelty = v
-  if Bridge.ready() then send({ t = "settings", cruelty = v }) end
-end
-
-function Bridge.getCruelty() return cruelty end
 
 --- Where the backend's after-death stats go. Not filtered by session: they can arrive after the
 --- next run has started, so the handler matches them to the run they describe.
@@ -238,6 +240,7 @@ local function handle(msg)
       return
     end
     outdated, welcomed, seen = nil, true, true
+    agentMode = msg.agent == true
     -- The backend now knows this run; a later hello (the app restarted mid-run) is a continue.
     if runIdForHello then runIdForHello.new_run = false end
     pingAt, nextPing = nil, now() + PING_MS
@@ -257,11 +260,26 @@ local function handle(msg)
     if onSummary then onSummary(msg) end
     return
   end
+  if msg.t == "mode" then
+    if msg.session == session then agentMode = msg.agent == true end
+    return
+  end
   if msg.t == "stale" then
     if msg.session == session and onStale and type(msg.keys) == "table" then onStale(msg.keys) end
     return
   end
   if msg.t ~= "res" or msg.session ~= session then return end
+  if msg.push then
+    -- A deck nobody asked for: newer than anything asked so far. A request on its way is left alone; its
+    -- answer is older than this and won't replace it.
+    if msg.ok and type(msg.decision) == "table" then
+      local id = nextId
+      nextId = nextId + 1
+      results[msg.key] = { id = id, wire = msg.id, kind = msg.kind, decision = msg.decision, at = now(),
+                           ms = msg.ms, base = msg.drawn_base, pushed = true }
+    end
+    return
+  end
   local key, id = msg.key, msg.id
   local p = pending[key]
   if p and p.id == id then
@@ -317,7 +335,7 @@ function Bridge.update()
   end
   if not welcomed and t - lastHello > (outdated and 5 * HELLO_MS or HELLO_MS) then
     lastHello = t
-    local h = { t = "hello", session = session, proto = PROTO, cruelty = cruelty }
+    local h = { t = "hello", session = session, proto = PROTO }
     if runIdForHello then h.run, h.new_run = runIdForHello.run, runIdForHello.new_run end
     send(h)
   end

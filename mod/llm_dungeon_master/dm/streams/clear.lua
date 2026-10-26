@@ -6,14 +6,19 @@
 -- if the player gets hit or picks something up (or another deck spends its budget) while there's still
 -- time. In "replace" rooms the DM's drop is the drop; in "bonus" rooms (bosses) the game keeps its own
 -- award and the DM's comes on top. Not in when the room clears: the game's award is skipped and the game
--- waits for the DM's, dropped where the game's would have been.
+-- waits for the DM's, dropped where the game's would have been. Every room type's award is the DM's (a treasure
+-- or secret room with enemies too). In agent mode every fight room's award is asked at floor start too, before
+-- its fight: the late ask then only reaches the agent if the re-ask gate finds the fight changed things, and a
+-- room found already clear gives its award back to the floor's budget.
 local Clear = {}
 
 local game = Game()
 local D, cfg, Bridge, State, Apply, Decks, Rolls, Causes
 
 local MODE = {}         -- RoomType -> "replace" | "bonus"
+local FIGHTS = {}       -- RoomType -> true: rooms that fight, asked ahead where the room file can't say
 local probe = nil       -- this room's prefetch tracker
+local floorAsked = -1   -- the floor whose every fight room was asked at its start (agent mode)
 
 local function curIdx() return game:GetLevel():GetCurrentRoomDesc().SafeGridIndex end
 local function floorNo() return D.Sched.floor() end
@@ -45,9 +50,14 @@ end
 function Clear.init(deps)
   D, cfg, Bridge, State, Apply = deps, deps.cfg, deps.Bridge, deps.State, deps.Apply
   Decks, Rolls, Causes = deps.Decks, deps.Rolls, deps.Causes
-  for name, mode in pairs({ ROOM_DEFAULT = "replace", ROOM_MINIBOSS = "replace", ROOM_CURSE = "replace",
-                            ROOM_BOSS = "bonus" }) do
-    if RoomType[name] then MODE[RoomType[name]] = mode end
+  for name, t in pairs(RoomType) do
+    if name ~= "ROOM_NULL" then MODE[t] = "replace" end
+  end
+  for _, name in ipairs({ "ROOM_BOSS", "ROOM_BOSSRUSH" }) do    -- the game's own award (the boss item) stands
+    if RoomType[name] then MODE[RoomType[name]] = "bonus" end
+  end
+  for _, name in ipairs({ "ROOM_DEFAULT", "ROOM_MINIBOSS", "ROOM_CURSE", "ROOM_BOSS", "ROOM_CHALLENGE" }) do
+    if RoomType[name] then FIGHTS[RoomType[name]] = true end
   end
 
   Decks.define("clear", {
@@ -57,6 +67,13 @@ function Clear.init(deps)
     deck = false,
     context = function(st)
       local room = D.Sched.room()
+      if not room or st.arg ~= room.idx then       -- asked ahead, at floor start: its fight hasn't happened yet
+        local desc = game:GetLevel():GetRoomByIdx(st.arg)
+        if not (desc and desc.Data) then return false end
+        return { room_type = State.roomTypeName(desc.Data.Type), mode = MODE[desc.Data.Type],
+                 room_shape = desc.Data.Shape, room_difficulty = desc.Data.Difficulty, fight = "not started yet",
+                 room_contents = State.roomContents(desc) }
+      end
       local hp, n = alive()
       return { room_type = State.roomTypeName(room.type), mode = MODE[room.type],
                enemies_left = n, enemy_hp_left = math.floor(hp),
@@ -126,11 +143,38 @@ end
 function Clear.onNewRoom(room, prev)
   -- The last room's reward was asked for but never used (left mid-fight): it promises nothing now.
   if prev and probe and probe.sends > 0 and not prev.cleared then Decks.abandon("clear", prev.idx) end
+  -- Asked at floor start for a room with no fight after all: nothing will draw it.
+  local ahead = room.wasClear and Decks.find(Decks.spec("clear").key(room.idx))
+  if ahead and #ahead.drawn == 0 then Decks.abandon("clear", room.idx) end
   probe = { hpSamples = {}, startHp = nil, sends = 0, lastProbe = 0 }
+end
+
+--- Will this room fight? Its layout file says (enemies in it); a build that can't read it goes by room type.
+local function fights(desc)
+  local c = State.roomContents(desc)
+  if c then return c.enemies > 0 end
+  return FIGHTS[desc.Data.Type] == true
+end
+
+--- Agent mode: every unvisited fight room on the floor, once.
+local function askFloor()
+  local level = game:GetLevel()
+  local rooms, start = level:GetRooms(), level:GetStartingRoomIndex()
+  for i = 0, rooms.Size - 1 do
+    local d = rooms:Get(i)
+    if d and d.Data and d.VisitedCount == 0 and MODE[d.Data.Type] and d.SafeGridIndex ~= start and fights(d) then
+      local st = Decks.get("clear", d.SafeGridIndex)
+      if st.sends == 0 and not Bridge.isPending(st.key) then Decks.request("clear", d.SafeGridIndex, "floor start") end
+    end
+  end
 end
 
 --- Every frame: ask when the fight is nearly over, rewrite if the player's state moved while there's time.
 function Clear.update(room)
+  if cfg.CONTROL_ROOM_CLEAR and Bridge.agentMode() and floorAsked ~= floorNo() then
+    floorAsked = floorNo()
+    askFloor()
+  end
   local r = game:GetRoom()
   if not (cfg.CONTROL_ROOM_CLEAR and Clear.eligible(room.type) and not room.wasClear and not r:IsClear()) then return end
   local t = Isaac.GetTime()
@@ -163,6 +207,6 @@ function Clear.update(room)
   end
 end
 
-function Clear.resetRun() probe = nil end
+function Clear.resetRun() probe, floorAsked = nil, -1 end
 
 return Clear

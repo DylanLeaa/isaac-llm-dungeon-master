@@ -271,4 +271,13 @@ class MockDM:
             outcomes = [{"reward": "nothing"} for _ in range(n)]
             outcomes[min(1, n - 1)] = {"reward": r.choice(["penny", "half_heart", "key", "bomb"]), "count": 1}
             return {"intent": "mock: one kill pays", "outcomes": outcomes, "taunt": ""}
+        if kind == "rocks":
+            n = max(1, int(ctx.get("wanted") or 3))
+            return {"intent": "mock: a tease, then a gift", "taunt": "",
+                    "outcomes": [{"reward": r.choice(["nothing", "penny", "key", "soul_heart"]), "count": 1}
+                                 for _ in range(n)]}
+        if kind == "shop":
+            n = max(1, int(ctx.get("wanted") or 4))
+            return {"intent": "mock: everything but what they need", "taunt": "Browse all you like.",
+                    "goods": [r.choice(["bomb", "red_heart", "battery", "pill"]) for _ in range(n)]}
         raise ValueError(kind)

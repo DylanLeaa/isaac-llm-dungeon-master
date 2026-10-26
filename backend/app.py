@@ -3,7 +3,7 @@
 The same backend as server.py, with a window instead of a console:
   Current run   what the DM is doing this run: its bill, its work, every decision, its plans, its decks
   History       every past run's receipt
-  Settings      OpenRouter / Google AI Studio key or Claude Code, and the models, applied to the running DM straight away
+  Settings      OpenRouter / Google AI Studio key or Claude Code, the models and agent mode, applied to the running DM straight away
   Log           what the console used to show
 
 Settings live in %APPDATA%/LLM Dungeon Master/config.json, the backend's log next to them.
@@ -40,15 +40,16 @@ import modinstall
 import receipt as receipts
 from claude_code import find_claude
 from receipt import Receipt
-from server import Coordinator, Engine, build_dm, coverage_table
+from server import Coordinator, Engine, build_dm, coverage_table, restored_count
 
 log = logging.getLogger("llmdm")
 
-DEFAULT_CRUELTY = 6           # until the game's DM Settings menu says otherwise
+DEFAULT_CRUELTY = appdata.DEFAULTS["cruelty"]     # until Settings says otherwise
 # The mod pings every 2 s, but only while the game renders: a floor's stage transition (a chapter's
 # nightmare most of all) goes quiet for a while. This long without a message and the game is gone.
 GAME_TIMEOUT_S = 15.0
 LOG_LINES = 3000
+HISTORY_POLL_MS = 2000         # how often the History tab looks for new or grown receipts while it's shown
 KEYS_URL = "https://openrouter.ai/keys"
 from google_ai import KEYS_URL as GOOGLE_KEYS_URL
 # Text colours, set on the widget: a colour in a derived ttk style doesn't always survive the theme.
@@ -93,8 +94,8 @@ class DMThread:
 
     async def _main(self) -> None:
         e = self.engine
-        self.coord = Coordinator(e.dm, DEFAULT_CRUELTY, e.planner, max_concurrency=e.concurrency,
-                                 receipt=self.receipt, gate=e.gate, late_grace_s=e.late_grace)
+        self.coord = Coordinator(e.dm, e.cruelty, e.planner, max_concurrency=e.concurrency,
+                                 receipt=self.receipt, gate=e.gate, late_grace_s=e.late_grace, agent=e.agent)
         self.loop, self.task = asyncio.get_running_loop(), asyncio.current_task()
         self.ready.set()
         e.describe()
@@ -356,6 +357,15 @@ class RunView(ttk.Frame):
             self.deck_toggled.clear()
         self.refresh()
 
+    def reload(self, r: Receipt) -> None:
+        """Show a newer copy of the same run, keeping the picked row, the scroll and the decks opened."""
+        picked, top = self.tree.selection(), self.tree.yview()[0]
+        self.decks_run = r
+        self.show(r)
+        self.tree.yview_moveto(top)
+        if picked and self.tree.exists(picked[0]):
+            self.tree.selection_set(picked[0])
+
     def added(self, seq: int) -> None:
         self._insert(seq)
 
@@ -518,7 +528,7 @@ class RunView(ttk.Frame):
         at = time.strftime("%H:%M:%S", time.localtime(s.ts)) if s.ts else ""
         state = {"drawn": f"drawn {at}", "skipped": "discarded", "next": "▶ next", "queued": f"then (#{i + 1})",
                  "waiting": "waiting", "used": f"used {at}", "set": "set, not swallowed yet",
-                 "locked": f"swallowed {at}, locked", "loaded": "every tinted rock pays this",
+                 "locked": f"swallowed {at}, locked",
                  "unused": "never drawn"}.get(s.state, s.state)
         return state, s.cause
 
@@ -560,7 +570,9 @@ class RunView(ttk.Frame):
         cov = coverage_table(r.coverage)
         if cov:
             ctl, free = sum(c[2] for c in cov), sum(c[3] for c in cov)
+            restored = restored_count(r.coverage)
             sections.append(("ROLLS", [["controlled / vanilla", f"{ctl} / {free}"]] +
+                             ([["restored on re-entry", str(restored)]] if restored else []) +
                              [[f"{h} {c}", f"{a} / {b}"] for h, c, a, b in cov[:7]]))
         col = 0
         for name, sec_rows in sections:
@@ -595,6 +607,8 @@ class RunView(ttk.Frame):
 def engine_text(engine: Engine) -> str:
     """Who plays the DM, for the header: "DM: <model> via <backend>  |  planners: <model>"."""
     text = "DM: " + engine.label.split(" (")[0]
+    if engine.agent is not None:
+        text += " (agent mode)"
     if engine.planner:
         text += f"  |  planners: {engine.planner.narrative_model}"
     return text
@@ -623,7 +637,8 @@ class ModelPicker(tk.Toplevel):
     """Every model a role can use: filter, sort by any column (intelligence first), pick one.
     Claude Code's models, when it's on, are pinned to the top whatever the sort."""
 
-    COLUMNS = (("whitelisted", "Whitelisted", 85), ("name", "Model", 300), ("intelligence", "Intelligence", 95),
+    COLUMNS = (("whitelisted", "Whitelisted", 85), ("name", "Model", 300), ("backend", "Provider", 120),
+               ("intelligence", "Intelligence", 95),
                ("prompt", "Input $/M", 85), ("completion", "Output $/M", 90), ("cache_read", "Cached $/M", 90),
                ("turn_cost", "Turn cost", 85), ("latency", "Latency", 70))
     NUMERIC = ("intelligence", "prompt", "completion", "cache_read", "turn_cost", "latency")
@@ -755,7 +770,8 @@ class ModelPicker(tk.Toplevel):
         listed = "-" if m.whitelisted is None else "✓" if m.whitelisted else "✗"
         score = "-" if m.intelligence is None else f"{m.intelligence:g}"
         latency = "-" if m.latency is None else f"{m.latency:.1f}s"
-        return (listed, m.name, score, *prices, model_catalog.turn_price(m.turn_cost), latency)
+        provider = model_catalog.PROVIDERS.get(m.backend, m.backend)
+        return (listed, m.name, provider, score, *prices, model_catalog.turn_price(m.turn_cost), latency)
 
     def _show_selected(self) -> None:
         sel = self.tree.selection()
@@ -784,6 +800,7 @@ class App:
         self.current = Receipt(None, keep_full=True)
         self.dirty = False
         self.history_rows: dict[str, Path] = {}
+        self.history_shown: tuple | None = None       # (path, stamp) of the receipt the History view shows
         # The model pickers: OpenRouter's catalogue (cached, refreshed in the background) and the unsaved picks.
         self.catalog_raw = model_catalog.load_cache()
         self.catalog = model_catalog.parse(self.catalog_raw)
@@ -813,6 +830,7 @@ class App:
         self.refresh_history()
         self.root.after(200, self._drain)
         self.root.after(500, self._tick)
+        self.root.after(HISTORY_POLL_MS, self._poll_history)
 
     # ------------------------------------------------------------ look
     def _styles(self) -> None:
@@ -859,14 +877,15 @@ class App:
 
     # ------------------------------------------------------------ the DM
     def _engine(self, cfg: dict) -> Engine:
+        agent = bool(cfg.get("agent_mode"))
         if self.args.mock:
-            return build_dm("mock", "", cruelty=DEFAULT_CRUELTY)
+            return build_dm("mock", "", cruelty=self._cruelty(cfg), agent=agent)
         dm_backend, dm_model = model_catalog.resolve(cfg, "minor")
         planner_backend, planner_model = model_catalog.resolve(cfg, "major")
         return build_dm(dm_backend, appdata.api_key(cfg), google_key=appdata.google_key(cfg),
-                        cruelty=DEFAULT_CRUELTY, model=dm_model,
+                        cruelty=self._cruelty(cfg), model=dm_model,
                         planner_backend=planner_backend, narrative_model=planner_model, floor_model=planner_model,
-                        gate_model=model_catalog.resolve(cfg, "gate")[1])
+                        gate_model=model_catalog.resolve(cfg, "gate")[1], agent=agent)
 
     def start_dm(self, first: bool = False) -> None:
         try:
@@ -956,17 +975,15 @@ class App:
 
     # ------------------------------------------------------------ history
     def _history_tab(self) -> None:
-        tab = ttk.Frame(self.tabs)
+        tab = self.history_tab = ttk.Frame(self.tabs)
         self.tabs.add(tab, text="  History  ")
+        self.tabs.bind("<<NotebookTabChanged>>", lambda _e: self._poll_history(again=False), add="+")
         panes = ttk.PanedWindow(tab, orient="horizontal")
         panes.pack(fill="both", expand=True)
 
         left = ttk.Frame(panes, padding=(10, 10, 0, 10))
         buttons = ttk.Frame(left)
         buttons.pack(fill="x", pady=(0, 8))
-        ttk.Button(buttons, text="Refresh", command=self.refresh_history).pack(side="left")
-        ttk.Button(buttons, text="Open receipts folder",
-                   command=lambda: open_path(self.receipts_dir)).pack(side="left", padx=6)
         cols = (("started", "Started", 118), ("seed", "Seed", 84), ("outcome", "Outcome", 64),
                 ("entries", "Entries", 56), ("cost", "Cost", 56))
         self.history = ttk.Treeview(left, columns=[c[0] for c in cols], show="headings", selectmode="browse")
@@ -989,33 +1006,51 @@ class App:
         # The run view asks for more width than there is: without this the list gets squeezed.
         panes.bind("<Map>", lambda _e: panes.sashpos(0, 400), add="+")
 
+    def _poll_history(self, again: bool = True) -> None:
+        """Keep the History tab current while it's on screen: new runs, and the picked run as it grows."""
+        if str(self.tabs.select()) == str(self.history_tab):
+            self.refresh_history()
+        if again:
+            self.root.after(HISTORY_POLL_MS, self._poll_history)
+
     def refresh_history(self) -> None:
-        """List every receipt file, newest first. Each is read once per change (they're small)."""
-        selected = self.history.selection()
-        self.history.delete(*self.history.get_children())
-        self.history_rows.clear()
+        """List every receipt file, newest first, in place (the picked row and the scroll stay put).
+        Each is read once per change (they're small)."""
         try:
             files = sorted(self.receipts_dir.glob("*.jsonl"), reverse=True)
         except OSError:
             files = []
-        for path in files:
+        rows = {str(path): path for path in files}
+        gone = [iid for iid in self.history_rows if iid not in rows]
+        if gone:
+            self.history.delete(*gone)
+        self.history_rows = rows
+        for i, (iid, path) in enumerate(rows.items()):
             info = self._history_info(path)
-            iid = str(path)
-            self.history_rows[iid] = path
-            self.history.insert("", "end", iid=iid, tags=(info["outcome"],),
-                                values=(info["started"], info["seed"], info["outcome"] or "-",
-                                        info["entries"], f'${info["cost"]:.2f}'))
-        if selected and self.history.exists(selected[0]):
-            self.history.selection_set(selected[0])
+            values = (info["started"], info["seed"], info["outcome"] or "-", info["entries"], f'${info["cost"]:.2f}')
+            if self.history.exists(iid):
+                self.history.item(iid, values=values, tags=(info["outcome"],))
+                self.history.move(iid, "", i)
+            else:
+                self.history.insert("", i, iid=iid, values=values, tags=(info["outcome"],))
+        # The picked run is still being written (it's the one being played): show what's new.
+        sel = self.history.selection()
+        if sel and self.history_shown and self.history_shown[0] == sel[0] \
+                and self.history_shown[1] != self._stamp(rows[sel[0]]):
+            self._open_history(keep=True)
 
     _info_cache: dict[str, tuple[tuple, dict]] = {}
 
-    def _history_info(self, path: Path) -> dict:
+    @staticmethod
+    def _stamp(path: Path) -> tuple | None:
         try:
             st = path.stat()
-            stamp = (st.st_mtime_ns, st.st_size)
+            return st.st_mtime_ns, st.st_size
         except OSError:
-            stamp = None
+            return None
+
+    def _history_info(self, path: Path) -> dict:
+        stamp = self._stamp(path)
         cached = self._info_cache.get(str(path))
         if cached and cached[0] == stamp:
             return cached[1]
@@ -1027,10 +1062,16 @@ class App:
         self._info_cache[str(path)] = (stamp, info)
         return info
 
-    def _open_history(self) -> None:
+    def _open_history(self, keep: bool = False) -> None:
         sel = self.history.selection()
         if sel and sel[0] in self.history_rows:
-            self.history_view.show(receipts.load(self.history_rows[sel[0]]))
+            path = self.history_rows[sel[0]]
+            self.history_shown = (sel[0], self._stamp(path))
+            r = receipts.load(path)
+            if keep:
+                self.history_view.reload(r)
+            else:
+                self.history_view.show(r)
 
     # ------------------------------------------------------------ settings
     def _settings_tab(self) -> None:
@@ -1114,7 +1155,7 @@ class App:
         box = ttk.LabelFrame(tab, text=" Claude Code ", padding=(14, 10))
         box.pack(fill="x", pady=(14, 0))
         self.cc_var = tk.BooleanVar(value=bool(self.cfg.get("use_claude_code")))
-        ttk.Checkbutton(box, text="Enable Claude Code", variable=self.cc_var,
+        ttk.Checkbutton(box, text="Route billing through Claude Code", variable=self.cc_var,
                         style="Switch.TCheckbutton", command=self._claude_status).pack(anchor="w")
         ttk.Label(box, text="Enables routing through your own signed-in Claude Code, billed to your Claude plan.",
                   foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
@@ -1122,6 +1163,29 @@ class App:
         self.cc_status.pack(anchor="w", pady=(6, 0))
 
         self._claude_status()
+
+        box = ttk.LabelFrame(tab, text=" Cruelty ", padding=(14, 10))
+        box.pack(fill="x", pady=(14, 0))
+        self.cruelty_var = tk.IntVar(value=self._cruelty())
+        self.cruelty_label = ttk.Label(box, width=28)
+        self.cruelty_label.pack(anchor="w")
+        ttk.Scale(box, from_=0, to=10, orient="horizontal", variable=self.cruelty_var, length=320,
+                  command=self._show_cruelty).pack(anchor="w", pady=(4, 0))
+        ttk.Label(box, text="How hard the Dungeon Master trolls you, from generous (0) to merciless (10). "
+                            "A run keeps the cruelty it started with: a change applies from the next run.",
+                  foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
+        self._show_cruelty()
+
+        box = ttk.LabelFrame(tab, text=" Mode ", padding=(14, 10))
+        box.pack(fill="x", pady=(14, 0))
+        self.agent_var = tk.BooleanVar(value=bool(self.cfg.get("agent_mode")))
+        ttk.Checkbutton(box, text="Agent mode", variable=self.agent_var, style="Switch.TCheckbutton",
+                        command=lambda: self.settings_msg.configure(text="Press Save and apply to use it.",
+                                                                    foreground=MUTED)).pack(anchor="w")
+        ttk.Label(box, text="On: the DM writes the whole floor ahead in a few calls (every room, pool and deck), "
+                            "then is only called when\nthe re-ask gate finds a deck no longer fits, or one runs out. "
+                            "Off: one DM call per deck, as the game asks for it.\nBoth use the DM and gate models above.",
+                  foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
 
         row = ttk.Frame(tab)
         row.pack(fill="x", pady=(16, 0))
@@ -1153,6 +1217,19 @@ class App:
             ttk.Label(files, text=str(path) if path else "not found").grid(row=i, column=1, sticky="w", padx=12)
             if path:
                 ttk.Button(files, text="Open", command=lambda p=path: open_path(p)).grid(row=i, column=2, pady=2)
+
+    def _cruelty(self, cfg: dict | None = None) -> int:
+        try:
+            return max(0, min(10, int((cfg or self.cfg).get("cruelty", DEFAULT_CRUELTY))))
+        except (TypeError, ValueError):
+            return DEFAULT_CRUELTY
+
+    def _show_cruelty(self, _value=None) -> None:
+        c = round(float(self.cruelty_var.get()))
+        band = "generous" if c <= 2 else "mischievous" if c <= 5 else "cruel" if c <= 8 else "merciless"
+        self.cruelty_label.configure(text=f"{c}/10 ({band})")
+        if hasattr(self, "settings_msg") and c != self._cruelty():
+            self.settings_msg.configure(text="Press Save and apply to use it from the next run.", foreground=MUTED)
 
     def _claude_status(self) -> None:
         self._show_models()                 # Claude Code's models come and go with the switch
@@ -1258,7 +1335,8 @@ class App:
     def save_settings(self) -> None:
         cfg = {"openrouter_api_key": self.key_var.get().strip(),
                "google_api_key": self.google_key_var.get().strip(), "use_claude_code": self.cc_var.get(),
-               "spoiler_mode": self.spoiler_var.get(),
+               "spoiler_mode": self.spoiler_var.get(), "agent_mode": self.agent_var.get(),
+               "cruelty": round(float(self.cruelty_var.get())),
                **{f"{role}_model": pick for role, pick in self.model_picks.items()}}
         try:
             engine = self._engine(cfg)

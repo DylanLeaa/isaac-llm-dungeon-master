@@ -1,5 +1,4 @@
--- drops:<f>  What each kill drops, and each poop, fire, urn or skull broken (and a tinted rock no
--- layout planned).
+-- drops:<f>  What each kill drops, and each poop, fire, urn or skull broken.
 --
 -- The roll is the kill (MC_POST_NPC_DEATH) or the break (causes.lua): each one draws the deck's next
 -- entry, pays it where it happened, and the game's own drop from it is cancelled in MC_PRE_ENTITY_SPAWN.
@@ -9,7 +8,8 @@
 -- budget. A kill with the deck empty never falls back to the game's own drop: its drop is cancelled, the
 -- game freezes (decks.lua's IOU) until the answer lands, and the entry is paid then. Only if that freeze
 -- times out is the game's drop put back. A broken poop or urn with the deck empty waits for the game's
--- own loot to appear: most drop nothing, so only one that drops something is held. Bosses keep theirs.
+-- own loot to appear: most drop nothing, so only one that drops something is held. A boss's death is a kill
+-- like any other (each segment of one that splits draws its own entry); its pedestal is the items deck's.
 local Drops = {}
 
 local game = Game()
@@ -59,7 +59,7 @@ local function take(rec, cause, spawned)
   end
   -- Empty. A kill, or a break whose loot has appeared, is owed: the game's drop is cancelled and the game
   -- freezes until the deck answers. A break with no loot yet isn't a roll (retried when loot appears).
-  if cause == "enemy_death" or spawned then
+  if cause == "enemy_death" or cause == "boss_death" or spawned then
     rec.drawn = true
     rec.owner, rec.cancelled, rec.cause, rec.owed = "drops", {}, cause, true
     local owedOk = Decks.owe("drops", floorNo(), { cause = cause }, function(entry, gaveUp)
@@ -131,10 +131,10 @@ function Drops.init(deps)
     if d.breakable then
       return nil, take(d, "breakable") and "dm" or "vanilla"
     end
-    if d.boss or not qualifies(npc) then return nil, d.boss and "vanilla" or nil end
-    return nil, take(d, "enemy_death") and "dm" or "vanilla"
+    if not qualifies(npc) then return nil, nil end
+    return nil, take(d, d.boss and "boss_death" or "enemy_death") and "dm" or "vanilla"
   end)
-  -- ...or a break (a tinted rock only when no layout planned its loot: rocks.lua listens first).
+  -- ...or a break (a tinted rock is the rocks deck's: rocks.lua listens first).
   local function onBreak(b)
     if b.owner then return end
     take(b, "breakable")
@@ -146,12 +146,13 @@ function Drops.init(deps)
   -- The game's own drop from a kill or break the deck took: cancelled (its entry is paid instead).
   Rolls.claimSpawns("drops", function(info)
     local src = info.source
-    if not src or (info.cause ~= "enemy_death" and info.cause ~= "breakable" and info.cause ~= "rock_break") then
+    local kill = info.cause == "enemy_death" or info.cause == "boss_death"
+    if not src or (not kill and info.cause ~= "breakable" and info.cause ~= "rock_break") then
       return nil
     end
     if info.variant == PickupVariant.PICKUP_COLLECTIBLE then return nil end   -- an enemy's item (Krampus): never
-    if info.cause == "enemy_death" then
-      if not src.drawn then take(src, "enemy_death") end   -- spawned before its death callback
+    if kill then
+      if not src.drawn then take(src, info.cause) end      -- spawned before its death callback
     elseif not src.owner and not src.entry then
       take(src, "breakable", true)                         -- loot from a break whose draw found the deck empty
     end
@@ -166,7 +167,8 @@ local function line(rec)
   local what = e.reward == "nothing" and "nothing" or Apply.count("+", rec.paid or 0, e.reward)
   if e.reward ~= "nothing" and (rec.paid or 0) == 0 then what = "nothing (" .. e.reward .. " unavailable)" end
   local game_s = #rec.cancelled > 0 and (" (instead of the game's " .. table.concat(rec.cancelled, ", ") .. ")") or ""
-  return (rec.cause == "enemy_death" and "kill" or "break") .. ": " .. what .. game_s
+  local how = rec.cause == "boss_death" and "boss kill" or (rec.cause == "enemy_death" and "kill" or "break")
+  return how .. ": " .. what .. game_s
 end
 
 --- Every frame: pay the entries of kills and breaks drawn a frame ago.

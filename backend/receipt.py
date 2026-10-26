@@ -2,6 +2,7 @@
 
 Stored per run as JSON lines in receipts/<started>_run-<seed>.jsonl:
   {"type": "prompt", "hash": ..., "text": ...}       a system prompt, written once per file
+  {"type": "run", "cruelty": c}                      the cruelty the run started with (it keeps it to the end)
   {"type": "entry", "seq": n, ...}                   one engine action (request, LLM call, result)
   {"type": "update", "ref": n, "status": ...}        what later happened to it (applied / replaced)
   {"type": "effect", "ref": n, "effect": [...]}      what it actually did in the game, as the mod saw it
@@ -60,6 +61,7 @@ class Receipt:
         self.prompt_text: dict[str, str] = {}                 # hash -> system prompt (keep_full)
         self.saved_narrative: str | None = None                # the run's latest plans, for a continue
         self.saved_brief: tuple[tuple, str, str] | None = None # (floor signature, floor name, text)
+        self.saved_cruelty: int | None = None                  # the cruelty the run started with
         self.path: Path | None = None
         if self.dir is None or run_id is None:
             self._tell("run", {"run": run_id, "fresh": fresh, "path": None})
@@ -94,6 +96,8 @@ class Receipt:
                     self.prompt_text[rec.get("hash")] = rec.get("text")
             elif rec.get("type") == "entry":
                 self._ingest(rec)
+            elif rec.get("type") == "run" and isinstance(rec.get("cruelty"), int):
+                self.saved_cruelty = rec["cruelty"]
             elif rec.get("type") == "update":
                 self._apply_update(rec.get("ref"), rec.get("status"), rec.get("ts"))
             elif rec.get("type") == "effect":
@@ -115,6 +119,11 @@ class Receipt:
         self._ingest(entry)
         self._tell("entry", entry)
         return entry["seq"]
+
+    def note_cruelty(self, cruelty: int) -> None:
+        """The cruelty this run started with: a continue (even after a restart) keeps it."""
+        self.saved_cruelty = cruelty
+        self._write({"type": "run", "cruelty": cruelty, "ts": round(time.time(), 3)})
 
     def update(self, seq: int | None, status: str) -> bool:
         """A later outcome for entry `seq` (applied, replaced). False if there is no such entry."""
@@ -366,8 +375,6 @@ def summarize(kind: str, d: dict, ctx: dict) -> str:
             bits.append(f'champions {round(100 * d["champion_chance"])}% {d.get("champion_color", "")}'.strip())
         if d.get("tinted_rocks"):
             bits.append(f'{d["tinted_rocks"]} tinted rock(s)' + (" hidden" if d.get("hide_tinted_rocks") else ""))
-        if d.get("tinted_rock_loot"):
-            bits.append("tinted rocks hold " + ",".join(d["tinted_rock_loot"]))
         if d.get("layout_pickups") not in (None, "keep"):
             bits.append("pickups " + str(d["layout_pickups"]))
         if d.get("bonus_pickups"):
@@ -393,6 +400,12 @@ def summarize(kind: str, d: dict, ctx: dict) -> str:
         outs = d.get("outcomes", [])
         given = [f'{r["count"]}x {r["reward"]}' for r in outs if r.get("reward") != "nothing"]
         return f"{len(outs)} kills: " + (", ".join(given) or "nothing")
+    if kind == "shop":
+        return "shop sells " + (",".join(d.get("goods", [])) or "-")
+    if kind == "rocks":
+        outs = d.get("outcomes", [])
+        return f"{len(outs)} tinted rocks: " + (", ".join(f'{r["count"]}x {r["reward"]}' if r["reward"] != "nothing"
+                                                        else "nothing" for r in outs) or "-")
     return ""
 
 

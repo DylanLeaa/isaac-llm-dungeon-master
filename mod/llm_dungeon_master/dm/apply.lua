@@ -18,6 +18,14 @@ local function spawn(...)
   return e
 end
 
+-- The same for turning a pickup into another: its spawn and selection callbacks are ours, not the game's.
+local function morph(p, ...)
+  Apply.spawning = true
+  local ok, e = pcall(p.Morph, p, ...)
+  Apply.spawning = false
+  if not ok then error(e, 0) end
+end
+
 local function E(tbl, name)
   local t = _G[tbl]
   return t and t[name]
@@ -105,6 +113,22 @@ local function resolve(name)
   if not variant then return nil end
   local subtype = r[3] and E(r[3], r[4]) or 0
   return "pickup", variant, subtype or 0
+end
+
+--- The pickup a reward name is: variant, subtype (subtype 0 = the game picks, e.g. which card); nil if it
+--- isn't a pickup on this version.
+function Apply.pickupFor(name)
+  local kind, variant, subtype = resolve(name)
+  if kind ~= "pickup" then return nil end
+  return variant, subtype
+end
+
+--- Turn a pickup into reward `name`, keeping its price (a shop slot stays for sale). True if it did.
+function Apply.morphPickup(p, name)
+  local variant, subtype = Apply.pickupFor(name)
+  if not variant then return false end
+  morph(p, EntityType.ENTITY_PICKUP, variant, subtype, true)
+  return true
 end
 
 local function farFromPlayer(pos, minDist)
@@ -229,7 +253,7 @@ local function layoutPickups(mode, rng, late)
   elseif MORPH[mode] then
     local _, variant, subtype = resolve(MORPH[mode])
     if variant then
-      for _, p in ipairs(list) do p:Morph(EntityType.ENTITY_PICKUP, variant, subtype, true) end
+      for _, p in ipairs(list) do morph(p, EntityType.ENTITY_PICKUP, variant, subtype, true) end
       return tally("-", names) .. " -> " .. count("+", #list, MORPH[mode]) .. " (layout pickups)"
     end
   elseif mode == "troll_bombs" then

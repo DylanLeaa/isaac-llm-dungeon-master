@@ -5,10 +5,6 @@ return {
   POLL_MS = 30,
   LOG_CHUNK = 900,
 
-  -- nil = use the backend's --cruelty. 0 (generous) .. 10 (merciless).
-  -- Only the starting value: once changed in Mod Config Menu > DM Settings, the saved value wins.
-  CRUELTY = nil,
-
   -- What the DM controls. Anything switched off stays vanilla.
   CONTROL_ROOM_LAYOUT = true,
   CONTROL_ROOM_CLEAR  = true,
@@ -16,8 +12,10 @@ return {
   CONTROL_FLOOR       = true,
   CONTROL_CONSUMABLES = true,   -- which cards/trinkets drop, what each pill colour does (three decks)
   CONTROL_PAYOUTS     = true,   -- what each beggar / machine use and each chest pays out (a fixed schedule)
+  CONTROL_SHOP        = true,   -- what the shop sells in its pickup slots (its pedestals are CONTROL_ITEMS)
   CONTROL_DROPS       = true,   -- the drops deck: what each kill drops (the game's own drop is cancelled)
-  DROPS_NATURAL       = true,   -- ...and each poop, fire, urn or skull broken (and tinted rocks with no plan)
+  DROPS_NATURAL       = true,   -- ...and each poop, fire, urn or skull broken
+                                -- (the rocks deck, what the floor's tinted rocks hold, is switched with CONTROL_DROPS)
   -- How a cancelled spawn goes: false removes the pickup as it initialises (its card/trinket/item isn't
   -- drawn meanwhile); true replaces it with a puff of smoke in MC_PRE_ENTITY_SPAWN, so it never exists.
   -- Which one works for every source is the roll audit's question (see dm/rolls.lua).
@@ -52,17 +50,17 @@ return {
   -- Deck sizes: how many entries a deck is kept stocked with, ahead of the game's draws.
   CARDS_DEPTH = 2,
   TRINKETS_DEPTH = 2,
+  SHOP_DEPTH = 6,          -- shop wares asked for when the shop's layout file can't say how many slots it has
   DROPS_SPARE = 2,         -- drops entries asked beyond the room's enemies (splitters, poops)
+  ROCKS_DECK = 6,          -- tinted rock outcomes the DM writes ahead for the floor
   DROPS_RESERVE = 3,       -- drops entries kept between fights: the next room's first kills draw from
                            -- them while its own ask is on the way (0 = none)
   -- Requests per floor for each card / trinket / pill deck (restocks, new pill colours, rewrites).
   MAX_DECK_SENDS = 8,
+  MAX_ROCK_SENDS = 6,      -- rocks: the floor start ask, then restocks and rewrites
   MAX_DROPS_SENDS = 40,    -- drops: one ask per fighting room, plus restocks and rewrites
   -- payout_plan requests per machine (first ask + re-asks once its schedule runs low)
   MAX_PAYOUT_SENDS = 4,
-
-  -- Characters per line in Mod Config Menu > DM Settings > Last run. Lower it if lines get cut off.
-  MENU_WIDTH = 32,
 
   -- Every floor waits on a loading screen until the DM is ready for it: the run
   -- narrative (first floor), the floor brief, and answers for the rooms next to the start room.
@@ -84,7 +82,7 @@ return {
   -- corner for a few seconds.
   SHOW_EFFECTS = true,
   -- After-death stats (yours and the DM's, plus its epitaph) over the game-over screen; the map
-  -- button hides it. Always kept under Mod Config Menu > DM Settings > Last run.
+  -- button hides it.
   SHOW_DEATH_SCREEN = true,
   SHOW_DEBUG_HUD = true,   -- small latency / connection readout in the corner
 }

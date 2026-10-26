@@ -45,8 +45,17 @@ REWARDS = {
     "card": "the next card/rune in your cards deck",
     "trinket": "the next trinket in your trinkets deck", "battery": "lil battery",
 }
+# What a shop's pickup slot may sell (the shop deck), with the game's usual price for it.
+SHOP_GOODS = {
+    "key": "1 key (5c)", "bomb": "1 bomb (5c)", "red_heart": "full red heart (3c)",
+    "soul_heart": "soul heart (5c)", "battery": "lil battery (5c)", "grab_bag": "sack of random pickups (7c)",
+    "card": "the next card/rune in your cards deck (5c)",
+    "pill": "a pill: its colour's effect is whatever your pills deck assigned (5c)",
+}
 # Outcomes a payout_plan entry may use besides a reward: stiff the player, or hand out a pool item.
 PAYOUT_OUTCOMES = ("nothing", "item")
+# What a tinted rock may hold besides a reward: nothing, or the Small Rock item on a pedestal (if unlocked).
+ROCK_OUTCOMES = ("nothing", "small_rock")
 LOW_VALUE = {"penny", "half_heart", "pill"}
 LUCK = {"lucky_penny": 1}                   # permanent luck each reward gives
 CHESTS = {"chest", "locked_chest", "red_chest", "spiked_chest", "mimic_chest"}

@@ -272,6 +272,14 @@ function Causes.payingOut(pool)
 end
 
 -- ----------------------------------------------------------------- the game's own moments
+-- Walking back into a room, the game spawns again the pickups left lying in it (with no spawner, as the
+-- room loads): what was already rolled the first time, not a roll of its own.
+local function restoring()
+  local room = game:GetRoom()
+  local ok, first, age = pcall(function() return room:IsFirstVisit(), room:GetFrameCount() end)
+  return ok and first == false and type(age) == "number" and age <= 1
+end
+
 function Causes.noteAward() awardFrame = frame() end
 function Causes.notePlayerUse() useFrame = frame() end
 
@@ -279,9 +287,11 @@ function Causes.notePlayerUse() useFrame = frame() end
 ---   enemy_death / boss_death / breakable  source = the death record (a kill, a fire put out)
 ---   rock_break / breakable                 source = the break record (a tinted rock, a poop, an urn)
 ---   chest_open / slot_payout               source = the machine
+---   room_restore                           a pickup left in a room, spawned again as the player walks back in
 ---   clean_award, player, player_use, unknown
 function Causes.of(info)
   local f, pos, sp = frame(), info.pos, info.spawner
+  if not sp and restoring() then return "room_restore", nil end
   if sp then
     local t = sp.Type
     if t == EntityType.ENTITY_PLAYER or t == EntityType.ENTITY_FAMILIAR then return "player", nil end

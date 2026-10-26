@@ -189,3 +189,58 @@ def test_abandon_tells_the_backend_only_about_an_unused_answer():
     Decks.draw("cards", 2, t())
     Decks.abandon("cards", 2)
     assert list(Bridge.abandoned.values()) == ["cards:1"], "a deck already drawn from was used, not abandoned"
+
+
+def push(lua, Bridge, key, decision, wire, base):
+    """The backend restacked `key` unasked (agent mode): a result with a local id newer than any request."""
+    Bridge.unasked = (Bridge.unasked or 1000) + 1
+    Bridge.results[key] = lua.table_from({"id": Bridge.unasked, "wire": wire, "decision": decision, "base": base,
+                                          "pushed": True})
+
+
+def test_a_pushed_deck_replaces_the_tail_and_its_draws_carry_the_pushed_id():
+    lua, W, Decks, Bridge, State, Loading, Taunt, t, update = load(wants=[{"arg": 1, "n": 1}])
+    Bridge.answer("cards:1", cards(lua, "tower", "fool", "sun"))
+    Decks.draw("cards", 1, t())                    # tower: the backend has counted it...
+    Decks.draw("cards", 1, t())                    # ...but not fool, drawn while the push was on its way
+    push(lua, Bridge, "cards:1", cards(lua, "moon", "star", "world"), -1, 1)
+    c, _ = Decks.draw("cards", 1, t())
+    assert c.key == "star", "the push's first entry stands for the draw it hadn't seen"
+    assert Bridge.draws[len(Bridge.draws)].id == -1, "reported under the backend's id for the push"
+    update()
+    assert len(Bridge.sent) == 0, "written against the state as it is: no refresh"
+    State.hash = "h2"
+    update()
+    assert len(Bridge.sent) == 1 and Bridge.sent[1].ctx.reason.startswith("refresh"), "a later move still rewrites it"
+
+
+def test_the_bridge_gives_a_push_a_local_id_so_only_a_later_request_replaces_it():
+    lua = LuaRuntime(unpack_returned_tuples=True)
+    W = lua.execute((ROOT / "tests" / "fake_isaac.lua").read_text(encoding="utf-8"))
+    lua.execute("package.preload['json'] = function() return { encode = function() return '{}' end } end")
+    Bridge = lua.execute((MOD / "dm" / "bridge.lua").read_text(encoding="utf-8"))
+    inbox = lua.table_from({"boot": 1, "msgs": lua.table_from([])})
+    store = lua.eval("function(inbox) return { save = function() end, poll = function() return inbox end } end")(inbox)
+    Bridge.init(lua.table_from({"POLL_MS": 0}), store, "R")      # session "R-0": the fake clock starts at 0
+    msgs = []
+
+    def deliver(**msg):
+        msgs.append(lua.table_from({"session": "R-0", **msg}))
+        inbox.msgs = lua.table_from([lua.table_from([i + 1, m]) for i, m in enumerate(msgs)])
+        W.now += 100
+        Bridge.update()
+
+    deliver(t="welcome", proto=3)
+    assert Bridge.ready()
+    asked = Bridge.request("cards", "cards:1", lua.table_from({}), lua.table_from({}), 4000)
+    deliver(t="res", push=True, id=-1, key="cards:1", kind="cards", ok=True, drawn_base=0,
+            decision=lua.table_from({"intent": "pushed"}))
+    r = Bridge.peek("cards:1")
+    assert r.wire == -1 and r.pushed and r.id > asked and r.decision.intent == "pushed"
+    assert Bridge.isPending("cards:1"), "the request on its way is left alone"
+    deliver(t="res", id=asked, key="cards:1", kind="cards", ok=True, decision=lua.table_from({"intent": "older"}))
+    assert Bridge.peek("cards:1").decision.intent == "pushed", "asked before the push: older than it"
+    assert not Bridge.isPending("cards:1")
+    later = Bridge.request("cards", "cards:1", lua.table_from({}), lua.table_from({}), 4000)
+    deliver(t="res", id=later, key="cards:1", kind="cards", ok=True, decision=lua.table_from({"intent": "newer"}))
+    assert Bridge.peek("cards:1").decision.intent == "newer" and Bridge.peek("cards:1").wire is None

@@ -30,8 +30,9 @@
 --     MC_POST_PICKUP_INIT. The second is what the mod did before decks and is the default.
 --   * an item pool rolled before the pedestal spawns (a chest choosing its item first): payouts.lua
 --     suppresses those draws while a chest or beggar of that pool is paying out.
---   * room-entity IDs for rocks, tinted rocks and layout pickups in MC_PRE_ROOM_ENTITY_SPAWN: only
---     observed (counted) so far; layouts still change the room after it loads.
+--   * room-entity IDs for rocks, tinted rocks and layout pickups in MC_PRE_ROOM_ENTITY_SPAWN: a layout pickup
+--     belongs to the stream that claims it (claimRoomEntities: the shop's slots, a room the layout deck
+--     dresses), else it is uncontrolled. Layouts still change the room after it loads.
 -- What the first real run (2026-10-20, 4 floors) showed:
 --   * kill drops carry SpawnerEntity (the enemy); a boss's heart drop carries the boss; chest contents
 --     and breakable loot have none (causes.lua's "what just happened nearby" fallback found them).
@@ -39,12 +40,16 @@
 --   * a layout pickup fires MC_PRE_ROOM_ENTITY_SPAWN and then MC_PRE_ENTITY_SPAWN on the same frame, with
 --     no spawner and the same variant: matched here and counted once, as room_entity.
 --   * a boss room's pedestal spawns as clean_award, variant 100: its item is the get_collectible roll.
+--   * walking back into a room spawns its leftover pickups again, with no spawner, as it loads: counted
+--     with cause room_restore and owner "restored" (causes.lua), apart from the rolls.
 local Rolls = {}
 
 local game = Game()
 local cfg, Bridge, Apply, Causes
 
 local claimers = {}       -- ordered {name, fn(info) -> "cancel" | "keep" | nil}: who owns a spawn roll
+local roomClaimers = {}   -- ordered {name, fn(variant, subtype) -> bool}: who owns a pickup the room's layout places
+local selectors = {}      -- owner -> fn(pickup, variant, subtype): what a random pickup it owns resolves to
 local handlers = {}       -- hook -> {owner, fn}: who owns an identity roll
 local pending = {}        -- spawns being cancelled, until their pickup initialises: {seed, frame, variant, ...}
 local nexts = {}          -- one-shot claims on the next pickup of a variant this frame (an IOU's pickup)
@@ -72,6 +77,14 @@ end
 --- A stream that may own spawn rolls: fn(info) returns "cancel" (the game's spawn is cancelled and the
 --- stream pays its own), "keep" (the stream owns it and lets it stand) or nil (not its roll).
 function Rolls.claimSpawns(name, fn) claimers[#claimers + 1] = { name = name, fn = fn } end
+
+--- A stream that may own the pickups a room's layout file places (MC_PRE_ROOM_ENTITY_SPAWN, the room loading):
+--- fn(variant, subtype) returns true to own it. First claim wins; nobody's is uncontrolled.
+function Rolls.claimRoomEntities(name, fn) roomClaimers[#roomClaimers + 1] = { name = name, fn = fn } end
+
+--- What a random pickup `owner` owns resolves to (MC_POST_PICKUP_SELECTION): fn(pickup, variant, subtype)
+--- returns (the callback's return: {variant, subtype} or nil, who to count it for: an owner or nil).
+function Rolls.onSelection(owner, fn) selectors[owner] = fn end
 
 --- The one owner of an identity roll: fn(...) returns (what the callback returns, status), where status
 --- is "dm" (decided by the DM, now or once its answer lands), "vanilla" (left to the game: counted
@@ -137,6 +150,8 @@ local function preSpawn(etype, variant, subtype, pos, _vel, spawner, seed)
     verdict = c.fn(info)
     if verdict then owner = c.name; break end
   end
+  -- A pickup restored on walking back in is no roll: counted apart, as "restored", never as uncontrolled.
+  if not owner and info.cause == "room_restore" then owner = "restored" end
   -- A pedestal no stream claimed (a boss's, a room's): where it stands isn't random, and its item is the
   -- MC_PRE_GET_COLLECTIBLE roll, counted there.
   if owner or variant ~= PickupVariant.PICKUP_COLLECTIBLE then Rolls.count("spawn", info.cause, owner) end
@@ -221,12 +236,17 @@ function Rolls.register(mod, safe)
     if Apply.spawning or (cur and cur.cancel and cur.frame == game:GetFrameCount()) then return nil end
     -- What a random pickup resolves to: owned by whoever owns its spawn, else left to the game.
     local owner = cur and cur.frame == game:GetFrameCount() and cur.owner or nil
+    local ret
+    if owner and selectors[owner] then ret, owner = selectors[owner](pickup, variant, subtype) end
     Rolls.count("pickup_selection", (PickupVariant and Causes.variantName(variant)) or variant, owner)
-    return nil
+    return ret
   end)
   add(MC.MC_PRE_ROOM_ENTITY_SPAWN, "room_entity_spawn", function(_, etype, variant, subtype, grid, seed)
     if etype == EntityType.ENTITY_PICKUP then
-      local owner = cfg.CONTROL_ROOM_LAYOUT and "layout" or nil
+      local owner
+      for _, c in ipairs(roomClaimers) do
+        if c.fn(variant, subtype) then owner = c.name; break end
+      end
       Rolls.count("room_entity", Causes.variantName(variant), owner)
       local f = game:GetFrameCount()
       for i = #roomEnts, 1, -1 do if f - roomEnts[i].frame > 1 then table.remove(roomEnts, i) end end
