@@ -5,9 +5,10 @@ reported from the key. The draws stand; what's left is the latest answer's unuse
 the mod's decks.lua does it:
   - an answer replaces the unused tail, minus the entries drawn while it was being asked for (the mod
     skips that many from its front)
-  - drops and payouts draw from the front; a card is drawn where it fits (its category); an item ranking or
+  - a card is drawn where it fits (its category); an item ranking or
     a trinket deck draws its first entry the player doesn't own, discarding the ones before it
-  - pills and a room's tinted rocks are sticky (a draw doesn't use an entry up), a room's clear and
+  - drops, a floor's tinted rocks and payouts draw from the front; pills are sticky (a draw doesn't use an
+    entry up), a room's clear and
     layout and a floor's curses are used whole, once
 """
 from __future__ import annotations
@@ -16,14 +17,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import receipt as receipts
-from economy import rock_key
 
 WHOLE = ("room_clear", "room_layout", "floor_plan")
-STICKY = ("pills", "rock")
+STICKY = ("pills",)
 # How the next draw is found: "front" takes the first entry, "match" the first entry matching the draw
 # (others stay), "upto" the first matching one, discarding those before it (the player owned them).
-DRAW = {"drops": "front", "payout_plan": "front", "cards": "match", "item_choice": "upto", "trinkets": "upto"}
-ORDER = ("payout_plan", "drops", "room_clear", "item_choice", "cards", "trinkets", "pills", "rock",
+DRAW = {"drops": "front", "rocks": "front", "payout_plan": "front", "cards": "match", "item_choice": "upto", "trinkets": "upto"}
+ORDER = ("payout_plan", "drops", "room_clear", "item_choice", "cards", "trinkets", "pills", "rocks",
          "room_layout", "floor_plan")
 
 
@@ -69,8 +69,6 @@ class Deck:
         if self.kind == "pills":
             locked = sum(s.state == "locked" for s in self.left)
             return f"{locked} of {len(self.left)} colours locked"
-        if self.kind == "rock":
-            return f"paid {len(self.drawn)}x" if self.drawn else "not broken yet"
         if self.kind in WHOLE:
             return "used" if self.spent else "waiting"
         out = f"{len(self.left)} left" if self.left else "used up"
@@ -105,9 +103,6 @@ def build(r: receipts.Receipt, upto: int | None = None) -> list[Floor]:
         level = ((e.get("request") or {}).get("state") or {}).get("level") or {}
         if level.get("name"):
             names.setdefault(_floor_of(key), str(level["name"]))
-        loot = d.get("tinted_rock_loot") if e.get("what") == "room_layout" else None
-        if loot:                                  # the room's tinted rocks: a deck filled by its layout
-            answers.setdefault(rock_key(key), []).append({**e, "what": "rock", "decision": {"loot": list(loot)}})
     draws: dict[str, list[dict]] = {}
     for rec in r.draws:
         if cutoff is not None and (rec.get("ts") or 0) > cutoff:
@@ -138,8 +133,6 @@ def build(r: receipts.Receipt, upto: int | None = None) -> list[Floor]:
 def _deck(key: str, answers: list[dict], draws: list[dict]) -> Deck:
     cur = answers[-1] if answers else None
     kind = cur["what"] if cur else str((draws[0] if draws else {}).get("kind") or "?")
-    if key.startswith("rock:"):
-        kind = "rock"
     ctx = ((cur or {}).get("request") or {}).get("ctx") or {}
     dec = (cur or {}).get("decision") or {}
     deck = Deck(key, kind, _floor_of(key), _title(kind, key, ctx), intent=str(dec.get("intent") or ""),
@@ -162,8 +155,6 @@ def _deck(key: str, answers: list[dict], draws: list[dict]) -> Deck:
             hit = next((rec for rec in draws if kind == "pills" and _token(kind, rec.get("outcome")) == token), None)
             state = ("locked" if hit else "set") if kind == "pills" else "loaded"
             deck.left.append(Slot(label, state, (hit or {}).get("ts"), _cause(hit)))
-        if kind == "rock":
-            deck.drawn = [_drawn_slot(kind, rec, names) for rec in draws]
         return deck
 
     # A deck: the draws stand, the latest answer's tail is what's left.
@@ -230,8 +221,8 @@ def _names(ctxs: list[dict]) -> dict:
 
 def _entries(kind: str, d: dict, ctx: dict, names: dict) -> list[tuple[Any, str]]:
     """An answer's entries in draw order, as (what a draw of it reports, label)."""
-    if kind in ("drops", "payout_plan"):
-        rows = d.get("outcomes" if kind == "drops" else "schedule") or []
+    if kind in ("drops", "rocks", "payout_plan"):
+        rows = d.get("schedule" if kind == "payout_plan" else "outcomes") or []
         return [((r.get("reward"), int(r.get("count") or 1)), _reward(r)) for r in rows if isinstance(r, dict)]
     if kind == "cards":
         return [(c.get("key"), _words(c.get("key"))) for c in d.get("cards") or [] if isinstance(c, dict)]
@@ -242,8 +233,6 @@ def _entries(kind: str, d: dict, ctx: dict, names: dict) -> list[tuple[Any, str]
     if kind == "pills":
         return [(_int(p.get("color")), f'{names.get(("pill", _int(p.get("color"))), "colour " + str(p.get("color")))}'
                  f' = {_words(p.get("effect"))}') for p in d.get("pills") or [] if isinstance(p, dict)]
-    if kind == "rock":
-        return [(None, ", ".join(_words(x) for x in d.get("loot") or []) or "nothing")]
     if kind == "room_clear":
         return [(None, ", ".join(_reward(r) for r in d.get("rewards") or []) or "nothing")]
     if kind in ("room_layout", "floor_plan"):
@@ -255,7 +244,7 @@ def _token(kind: str, outcome: Any) -> Any:
     """What a draw's outcome matches in `_entries`."""
     if not isinstance(outcome, dict):
         return None
-    if kind in ("drops", "payout_plan"):
+    if kind in ("drops", "rocks", "payout_plan"):
         return outcome.get("reward"), int(outcome.get("count") or 1)
     if kind == "cards":
         return outcome.get("card")
@@ -270,7 +259,7 @@ def _token(kind: str, outcome: Any) -> Any:
 
 def _drawn_slot(kind: str, rec: dict, names: dict) -> Slot:
     o = rec.get("outcome") if isinstance(rec.get("outcome"), dict) else {}
-    if kind in ("drops", "payout_plan") and o.get("reward"):
+    if kind in ("drops", "rocks", "payout_plan") and o.get("reward"):
         label = _reward(o)
     elif o.get("rewards") is not None:
         label = ", ".join(_reward(r) for r in o["rewards"] if isinstance(r, dict)) or "nothing"
@@ -321,8 +310,8 @@ def _title(kind: str, key: str, ctx: dict) -> str:
         return f"Room {where} clear reward{room}"
     if kind == "room_layout":
         return f"Room {where} dressing{room}"
-    if kind == "rock":
-        return f"Room {where} tinted rocks"
+    if kind == "rocks":
+        return "Tinted rocks"
     if kind == "item_choice":
         what = _words(ctx.get("room_type") or "")
         return f"{what[:1].upper()}{what[1:]} items (pool {ctx.get('pool', where)})" if what else f"Item pool {where}"

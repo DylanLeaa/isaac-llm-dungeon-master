@@ -13,7 +13,8 @@ return {
   CONTROL_CONSUMABLES = true,   -- which cards/trinkets drop, what each pill colour does (three decks)
   CONTROL_PAYOUTS     = true,   -- what each beggar / machine use and each chest pays out (a fixed schedule)
   CONTROL_DROPS       = true,   -- the drops deck: what each kill drops (the game's own drop is cancelled)
-  DROPS_NATURAL       = true,   -- ...and each poop, fire, urn or skull broken (and tinted rocks with no plan)
+  DROPS_NATURAL       = true,   -- ...and each poop, fire, urn or skull broken
+                                -- (the rocks deck, what the floor's tinted rocks hold, is switched with CONTROL_DROPS)
   -- How a cancelled spawn goes: false removes the pickup as it initialises (its card/trinket/item isn't
   -- drawn meanwhile); true replaces it with a puff of smoke in MC_PRE_ENTITY_SPAWN, so it never exists.
   -- Which one works for every source is the roll audit's question (see dm/rolls.lua).
@@ -49,10 +50,12 @@ return {
   CARDS_DEPTH = 2,
   TRINKETS_DEPTH = 2,
   DROPS_SPARE = 2,         -- drops entries asked beyond the room's enemies (splitters, poops)
+  ROCKS_DECK = 6,          -- tinted rock outcomes the DM writes ahead for the floor
   DROPS_RESERVE = 3,       -- drops entries kept between fights: the next room's first kills draw from
                            -- them while its own ask is on the way (0 = none)
   -- Requests per floor for each card / trinket / pill deck (restocks, new pill colours, rewrites).
   MAX_DECK_SENDS = 8,
+  MAX_ROCK_SENDS = 6,      -- rocks: the floor start ask, then restocks and rewrites
   MAX_DROPS_SENDS = 40,    -- drops: one ask per fighting room, plus restocks and rewrites
   -- payout_plan requests per machine (first ask + re-asks once its schedule runs low)
   MAX_PAYOUT_SENDS = 4,

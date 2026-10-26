@@ -1,5 +1,4 @@
--- drops:<f>  What each kill drops, and each poop, fire, urn or skull broken (and a tinted rock no
--- layout planned).
+-- drops:<f>  What each kill drops, and each poop, fire, urn or skull broken.
 --
 -- The roll is the kill (MC_POST_NPC_DEATH) or the break (causes.lua): each one draws the deck's next
 -- entry, pays it where it happened, and the game's own drop from it is cancelled in MC_PRE_ENTITY_SPAWN.
@@ -135,7 +134,7 @@ function Drops.init(deps)
     if not qualifies(npc) then return nil, nil end
     return nil, take(d, d.boss and "boss_death" or "enemy_death") and "dm" or "vanilla"
   end)
-  -- ...or a break (a tinted rock only when no layout planned its loot: rocks.lua listens first).
+  -- ...or a break (a tinted rock is the rocks deck's: rocks.lua listens first).
   local function onBreak(b)
     if b.owner then return end
     take(b, "breakable")

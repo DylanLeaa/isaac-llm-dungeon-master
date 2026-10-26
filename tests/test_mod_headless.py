@@ -419,25 +419,40 @@ def run(tmp, game):
     W.pickups = lua.table_from([])
     print("15b-restore. a pickup restored on re-entry stood, counted apart from the rolls")
 
-    # --- a tinted rock holds what the room's layout planned, not the game's loot ---
-    Rocks = modules["dm.streams.rocks"]
-    Rocks.plan(85, "layout:1:85", lua.table_from(["key", "penny"]))
+    # --- a tinted rock holds the floor's next rocks-deck entry, not the game's loot, whichever room it is in ---
     tick()                                         # grid 22 (at 360,40) is seen standing
-    n0 = len(W.spawned)
+    n0, r0 = len(W.spawned), len(drawn("rocks:1"))
     W.gridState[22] = 2                            # bombed: the game drops its soul heart
     vanilla = W.spawnPickup(PV.PICKUP_HEART, g.HeartSubType.HEART_SOUL, 360, 40)
-    assert vanilla.removed, "the game's loot from a planned rock is cancelled"
+    assert vanilla.removed, "the game's loot from a tinted rock is cancelled"
     tick(3)
-    paid = [s.v for s in list(W.spawned.values())[n0:]]
-    assert paid == [PV.PICKUP_KEY, PV.PICKUP_COIN], paid
+    if Hold.holding("rocks:1"):                    # the deck was not stocked yet: the game freezes for the DM
+        wait(lambda: not Hold.holding("rocks:1"), 8, "the rocks answer for the empty-deck rock")
     tick(10)
-    assert len(W.spawned) == n0 + 2, "a rock pays once"
-    reff = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == "layout:1:85" for l in m["effect"]]
-    assert "tinted rock bombed: +1 key, +1 penny (instead of the game's 1 soul heart)" in reff, reff
-    assert drawn("rock:1:85")[-1]["outcome"]["rewards"] == [{"reward": "key", "count": 1},
-                                                           {"reward": "penny", "count": 1}]
+    assert len(drawn("rocks:1")) == r0 + 1, "the rock drew one entry from the floor's deck"
+    reff = [l for m in sent(game) if m.get("t") == "effect" and m.get("key") == "rocks:1" for l in m["effect"]]
+    assert reff and reff[-1].startswith("tinted rock bombed:") and "(instead of the game's soul_heart)" in reff[-1], reff
+    paid = [s.v for s in list(W.spawned.values())[n0:]]
+    assert len(paid) <= 2, "a rock pays once"
     W.gridState[22] = None
-    print("15b2. tinted rock paid the DM's loot instead of the game's:", reff[-1])
+    print("15b2. tinted rock paid the floor's rocks deck instead of the game's loot:", reff[-1])
+
+    # --- the deck used up: the next rock's loot is cancelled and the game freezes until the DM answers ---
+    for _ in range(20):
+        if Decks.draw("rocks", 1, lua.table_from({"cause": "rock_break"}))[0] is None:
+            break
+    tick()                                         # the rock is seen standing again
+    r1 = len(drawn("rocks:1"))
+    W.gridState[22] = 2
+    vanilla = W.spawnPickup(PV.PICKUP_HEART, g.HeartSubType.HEART_SOUL, 360, 40)
+    assert vanilla.removed, "the game's loot is cancelled even with the rocks deck empty"
+    tick()
+    assert Hold.holding("rocks:1"), "the game freezes for the rocks deck"
+    wait(lambda: not Hold.holding("rocks:1"), 8, "the rocks answer for the empty-deck rock")
+    tick(10)
+    assert len(drawn("rocks:1")) == r1 + 1, "the rock drew from the new answer"
+    W.gridState[22] = None
+    print("15b3. empty rocks deck: the rock's loot was cancelled, the game froze until the DM answered")
 
     # --- a beggar follows its payout schedule (key, nothing, penny); the game's own payout is cancelled ---
     beggar = W.makePickup(g.EntityType.ENTITY_SLOT, 4, 0, 330, 300)

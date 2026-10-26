@@ -82,7 +82,7 @@ def deck_outcomes(kind: str, decision: dict) -> list[tuple[str, int]]:
     they decide which one, the drops, clears and chests decide how many."""
     if kind == "room_clear":
         rows = decision.get("rewards") or []
-    elif kind == "drops":
+    elif kind in ("drops", "rocks"):
         rows = decision.get("outcomes") or []
     elif kind == "payout_plan":
         rows = decision.get("schedule") or []
@@ -94,15 +94,13 @@ def deck_outcomes(kind: str, decision: dict) -> list[tuple[str, int]]:
 
 
 def mode_of(kind: str, ctx: dict) -> str:
-    """Slots and beggars are exchanges, chests are gifts that count once opened, the rest are gifts."""
+    """Slots and beggars are exchanges, chests and tinted rocks are gifts that count once opened or bombed,
+    the rest are gifts."""
+    if kind == "rocks":
+        return CONTINGENT
     if kind == "payout_plan":
         return CONTINGENT if ctx.get("source_class") == "chest" else EXCHANGE
     return GIFT
-
-
-def rock_key(layout_key: str) -> str:
-    """The tinted rocks of the room a layout key dresses: layout:3:85 -> rock:3:85."""
-    return "rock:" + layout_key.split(":", 1)[1] if ":" in layout_key else layout_key
 
 
 def floor_sig(state: dict) -> tuple | None:
@@ -249,16 +247,6 @@ class Economy:
         tally: Counter = Counter()
         for name, count in deck_outcomes(kind, decision):
             _add(tally, units(name, count))
-        if kind == "room_layout":
-            rock = rock_key(key)
-            self.modes[rock] = CONTINGENT
-            loot: Counter = Counter()
-            for name in decision.get("tinted_rock_loot") or []:
-                _add(loot, units(name))
-            if loot:
-                self.contingent[rock] = loot
-            else:
-                self.contingent.pop(rock, None)
         if not tally:
             return
         (self.committed if mode == GIFT else self.contingent)[key] = tally
@@ -266,7 +254,7 @@ class Economy:
     def draw(self, key: str, outcome: Any) -> list[str]:
         """The game handed out `outcome` from deck `key`. Returns the families now over budget."""
         u = outcome_units(outcome)
-        mode = self.modes.get(key) or (CONTINGENT if key.startswith(("rock:", "payout:")) else GIFT)
+        mode = self.modes.get(key) or (CONTINGENT if key.startswith(("rocks:", "payout:")) else GIFT)
         row = (self.committed if mode == GIFT else self.contingent).get(key)
         for f, v in u.items():
             if row is not None:

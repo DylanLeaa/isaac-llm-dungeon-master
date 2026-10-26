@@ -20,12 +20,16 @@ from economy import Economy, deck_outcomes, outcome_units
 WHOLE = ("room_clear", "room_layout", "floor_plan")
 KIND_OF_PREFIX = {"clear": "room_clear", "layout": "room_layout", "items": "item_choice", "curses": "floor_plan",
                   "cards": "cards", "trinkets": "trinkets", "pills": "pills", "drops": "drops",
-                  "payout": "payout_plan", "rock": "rock"}
+                  "payout": "payout_plan", "rocks": "rocks"}
 FAMILY_SETS = (("keys", KEYS), ("bombs", BOMBS), ("coins", COINS), ("hearts", HEARTS))
 # The list each deck kind draws from.
-DECK_FIELD = {"drops": "outcomes", "payout_plan": "schedule", "cards": "cards", "trinkets": "trinkets",
+DECK_FIELD = {"drops": "outcomes", "rocks": "outcomes", "payout_plan": "schedule", "cards": "cards", "trinkets": "trinkets",
               "item_choice": "order"}
 OPEN_DECKS_SHOWN = 8
+# How an effect line is introduced in recent_events, by the kind of deck it came from.
+EFFECT_LABEL = {"room_layout": "room dressed", "room_clear": "clear", "item_choice": "pedestal", "drops": "drop",
+                "payout_plan": "machine/chest", "cards": "card", "trinkets": "trinket", "pills": "pill",
+                "floor_plan": "floor", "rocks": "tinted rock"}
 
 
 def kind_of(key: str) -> str:
@@ -124,7 +128,6 @@ class RunMemory:
         if first:
             # Only schemes the game acted on are real plans; re-asks and unused answers are noise.
             _append_unique(self.schemes, d.get("scheme"))
-            self._first_event(kind, d)
         self._count(kind, outcome, cause)
         overs = self.economy.draw(key, outcome)
         if used_up:
@@ -145,47 +148,19 @@ class RunMemory:
                            ("coins", "clears_since_coin"), ("hearts", "clears_since_heart")):
                 c[k] = 0 if fam in given else c[k] + 1
             self._since_clear = set()
-            got = ", ".join(f"{n}x {name}" for name, n in rewards) or "nothing"
-            self.events.append(f"clear reward: {got}")
             return
         self._since_clear |= given
         if kind == "drops":
-            real = [(name, n) for name, n in rewards if name != "nothing"]
-            c["drops_floor"] += len(real)
-            if real:
-                self.events.append(f'{"breakable" if cause == "breakable" else "kill"} dropped: '
-                                   + ", ".join(f"{n}x {name}" for name, n in real))
-        elif kind in ("payout_plan", "rock") and rewards:
-            what = "tinted rock paid" if kind == "rock" else ("chest held" if cause == "chest_open" else "machine paid")
-            self.events.append(f"{what}: " + ", ".join(f"{n}x {name}" for name, n in rewards))
-        elif kind == "item_choice" and isinstance(outcome, dict) and outcome.get("item") is not None:
-            self.events.append(f'pedestal from your ranking: {outcome.get("name") or outcome["item"]}'
-                               f' (q{outcome.get("quality", "?")})')
-        elif kind in ("cards", "trinkets") and isinstance(outcome, dict):
-            what = outcome.get("card") or outcome.get("name") or outcome.get("trinket")
-            self.events.append(f'{kind[:-1]} handed out: {what}')
+            c["drops_floor"] += sum(1 for name, _ in rewards if name != "nothing")
 
-    def _first_event(self, kind: str, d: dict) -> None:
-        if kind == "room_layout":
-            bits = []
-            if d.get("extra_enemies"):
-                bits.append("+" + ",".join(f'{e["count"]}x{e["key"]}' for e in d["extra_enemies"]))
-            if d.get("layout_pickups") not in (None, "keep"):
-                bits.append(d["layout_pickups"])
-            if d.get("tinted_rocks"):
-                bits.append(f'{d["tinted_rocks"]} tinted rock(s)')
-            if d.get("hide_tinted_rocks"):
-                bits.append("hid tinted rocks")
-            if d.get("tinted_rock_loot"):
-                bits.append("tinted rocks hold:" + ",".join(d["tinted_rock_loot"]))
-            if d.get("bonus_pickups"):
-                bits.append("bait:" + ",".join(d["bonus_pickups"]))
-            self.events.append("room dressed: " + ("; ".join(bits) or "untouched"))
-        elif kind == "payout_plan":
-            got = ", ".join(f'{r["count"]}x {r["reward"]}' for r in d.get("schedule", [])) or "vanilla"
-            self.events.append(f"payout schedule in play for a machine/chest: {got}")
-        elif kind == "floor_plan":
-            self.events.append(f'floor plan: curses={d.get("add_curses")} treasure={d.get("treasure_distance")}')
+    def on_effect(self, key: str, lines: Any) -> None:
+        """What a used answer actually did in the game (the mod's effect lines): the DM's memory of it. One
+        event per message, so a layout's "+0 tinted rocks (not enough rocks)" reaches the DM as it happened."""
+        if not isinstance(lines, list):
+            return
+        said = [str(x) for x in lines if x and not str(x).startswith("no ")]
+        if said:
+            self.events.append(f"{EFFECT_LABEL.get(kind_of(key), 'game')}: " + "; ".join(said))
 
     def on_game_event(self, name: str, data: dict) -> None:
         if name == "new_level":
@@ -275,7 +250,7 @@ def _label(kind: str, outcome: Any) -> str:
 
 def _item_label(kind: str, item: Any) -> str:
     """One entry of a deck's list, labelled like `_left`."""
-    if kind in ("drops", "payout_plan") and isinstance(item, dict):
+    if kind in ("drops", "rocks", "payout_plan") and isinstance(item, dict):
         return _label(kind, {"reward": item.get("reward"), "count": int(item.get("count") or 1)})
     if kind == "cards" and isinstance(item, dict):
         return str(item.get("key"))
@@ -284,7 +259,7 @@ def _item_label(kind: str, item: Any) -> str:
 
 def _left(kind: str, d: dict) -> list[str]:
     """A fresh deck's entries, labelled like `_label`."""
-    if kind in ("drops", "payout_plan"):
+    if kind in ("drops", "rocks", "payout_plan"):
         return [_label(kind, {"reward": name, "count": n}) for name, n in deck_outcomes(kind, d)]
     if kind == "room_clear":
         return [", ".join(f'{r["count"]}x {r["reward"]}' for r in d.get("rewards", [])) or "nothing"]

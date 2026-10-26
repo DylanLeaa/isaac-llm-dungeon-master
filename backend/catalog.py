@@ -47,6 +47,8 @@ REWARDS = {
 }
 # Outcomes a payout_plan entry may use besides a reward: stiff the player, or hand out a pool item.
 PAYOUT_OUTCOMES = ("nothing", "item")
+# What a tinted rock may hold besides a reward: nothing, or the Small Rock item on a pedestal (if unlocked).
+ROCK_OUTCOMES = ("nothing", "small_rock")
 LOW_VALUE = {"penny", "half_heart", "pill"}
 LUCK = {"lucky_penny": 1}                   # permanent luck each reward gives
 CHESTS = {"chest", "locked_chest", "red_chest", "spiked_chest", "mimic_chest"}

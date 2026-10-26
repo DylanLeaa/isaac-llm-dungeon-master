@@ -64,9 +64,11 @@ AGENT_BATCH_S = {URGENT: 0.0, NEXT_DOOR: 0.25, BACKGROUND: 1.0}
 AGENT_FLAG_WAIT_S = 1.0
 AGENT_MAX_KEYS = 8         # requests a turn answers; more start another turn
 AGENT_DROPS_DEPTH = MAX_DROPS   # a turn's drops deck: enough for several rooms, so the game rarely asks
+AGENT_ROCKS_DEPTH = 6           # a turn's tinted rock deck: the floor's next rocks
 # Open decks a turn may restack unasked. Not pills (a colour may have been swallowed since it was written) nor
 # payouts (a machine's schedule is a story: it is only ever extended, when the game asks).
-AGENT_RESTACK_KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "cards", "trinkets", "drops")
+AGENT_RESTACK_KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "cards", "trinkets", "drops",
+                       "rocks")
 # Re-asks of a deck the agent already wrote that never changed what the game did (run E989E1E1: 0 of 79): the
 # player nearing its room, a state-change refresh, the boss's curse re-check. The deck answers them as it stands,
 # with no gate and no turn; a deck that has really gone stale is flagged (_flag) and still goes to the agent.
@@ -82,7 +84,7 @@ def _priority(kind: str, ctx: dict) -> int:
         return BACKGROUND
     if kind == "room_clear":
         return URGENT
-    if kind in ("room_layout", "payout_plan", "drops", "item_choice"):
+    if kind in ("room_layout", "payout_plan", "drops", "rocks", "item_choice"):
         return NEXT_DOOR
     return BACKGROUND
 
@@ -347,6 +349,7 @@ class Coordinator:
             key = str(msg.get("key"))
             if self.receipt.add_effect(self.used_seq.get(key, self.receipt_seq.get(key)), msg.get("effect")):
                 log.info("%-26s effect: %s", key, "; ".join(map(str, msg.get("effect") or [])))
+            self.memory.on_effect(key, msg.get("effect"))      # the DM's memory of what it did
         elif t == "event" and msg.get("name") == "fallback":
             # The game froze waiting for this decision and gave up on it (the DM never answered, even
             # after re-asks): the game went ahead without it. Not news for the DM.
@@ -995,6 +998,8 @@ class Coordinator:
             ctx, kills_left = self._request_ctx(kind, key, st, asked_ctx)
             if kind == "drops":                   # written to last several rooms, not just the one asked about
                 ctx["wanted"] = AGENT_DROPS_DEPTH
+            elif kind == "rocks":
+                ctx["wanted"] = AGENT_ROCKS_DEPTH
             p = {"key": key, "rid": int(m["id"]), "kind": kind, "state": st, "ctx": ctx, "asked_ctx": asked_ctx,
                  "deadline_ms": m.get("deadline_ms", 4000),
                  # A deck the game draws from while the turn runs can be used up before a keep_deck lands.
@@ -1157,7 +1162,8 @@ class Coordinator:
             kind, rid, st, push = entry["kind"], 0, state, True
             asked_ctx = {**self.last_req[key]["ctx"], "reason": "restacked by the agent"}
             if kind in DECK_FIELD:                # a restack replaces what is left: as many entries (drops: a full deck)
-                asked_ctx.update(wanted=max(1, len(entry["left"]), AGENT_DROPS_DEPTH if kind == "drops" else 0),
+                depth = {"drops": AGENT_DROPS_DEPTH, "rocks": AGENT_ROCKS_DEPTH}.get(kind, 0)
+                asked_ctx.update(wanted=max(1, len(entry["left"]), depth),
                                  deck_left=list(entry["left"]))
             ctx, _kills_left = self._request_ctx(kind, key, st, asked_ctx)
         else:

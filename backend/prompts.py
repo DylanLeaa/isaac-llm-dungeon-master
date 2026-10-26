@@ -21,7 +21,7 @@ def _menus() -> str:
     return f"""ENEMY MENU (extra_enemies.enemy)
 {enemies}
 
-REWARD MENU (room_clear.rewards / drops.outcomes / bonus_pickups / payout_plan.schedule)
+REWARD MENU (room_clear.rewards / drops.outcomes / rocks.outcomes / bonus_pickups / payout_plan.schedule)
 {rewards}
 
 LAYOUT PICKUP MODES (room_layout.layout_pickups)
@@ -49,8 +49,10 @@ _ECONOMY = """WHAT PICKUPS ARE REALLY WORTH (vanilla is stingy; generosity is th
   items). Vanilla hands out maybe one a run; treat each one like a small item.
 - Tinted rocks are loot, usually a soul heart. One bomb opens one, now or on a later visit, so
   adding them is a gift unless the player truly can't get a bomb on this floor.
-  tinted_rock_loot decides what they hold instead: a soul heart is the vanilla gift, a key
-  or a golden chest is a bigger one, a penny or 'nothing' turns the bomb they spent into the joke.
+  The rocks deck decides what the next tinted rocks hold, floor-wide, in the order they are
+  broken, in whichever room: a soul heart is the vanilla gift, a key or a golden chest is a
+  bigger one, a penny or 'nothing' turns the bomb they spent into the joke, and 'small_rock'
+  puts the Small Rock item on a pedestal (if they have unlocked it).
 - A golden chest (locked_chest) can hold a pedestal item; with a key nearby it is a gift,
   not bait. Any chest or grab_bag is several pickups at once.
 - Coins add up: about 15 buys a shop item. Flooding coins is only a troll when there is
@@ -210,7 +212,10 @@ keeps those.
 
 _LEVERS = """WHAT THE DUNGEON MASTER CONTROLS (a fast executor model makes each call, seconds before it happens)
 - room_layout: per unvisited normal room - extra enemies, champion chance/colour, tinted rocks
-  added or hidden and what they hold, what happens to the layout's own pickups, up to 2 bait pickups.
+  added (only as many as the room has plain rocks; what was really placed is reported back) or
+  hidden, what happens to the layout's own pickups, up to 2 bait pickups.
+- rocks: what the next tinted rocks hold, one entry per rock, floor-wide, whichever room they are
+  broken in. The game's own loot is cancelled.
 - room_clear: the room-clear drop (normal, miniboss, curse rooms; a bonus on top in boss rooms).
 - item_choice: ranks real candidates from each item pool (treasure, shop, boss, devil, angel,
   secret, chests, beggars...) - which pedestal item the player gets.

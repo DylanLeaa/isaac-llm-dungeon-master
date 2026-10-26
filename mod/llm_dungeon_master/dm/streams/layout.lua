@@ -3,8 +3,8 @@
 -- A deck of one, keyed by the room, written for its shape, enemies and difficulty. Asked the moment the
 -- player enters a room next to it (the soonest they could walk in is about a second away), and rewritten
 -- if their state changes while they linger (MAX_LAYOUT_SENDS a room). Not in when they walk in: the game
--- is held and the room dressed late. The layout's tinted_rock_loot seeds that room's rock deck. In agent mode
--- every room on the floor is asked at floor start instead, so the agent dresses the floor in a few turns; asking
+-- is held and the room dressed late. (What its tinted rocks hold is the floor's rocks deck, rocks.lua.) In agent
+-- mode every room on the floor is asked at floor start instead, so the agent dresses the floor in a few turns; asking
 -- again from next door then only reaches the agent if the re-ask gate finds the player's state has moved.
 local Layout = {}
 
@@ -20,7 +20,6 @@ local function eligible(t) return t == RoomType.ROOM_DEFAULT end
 local function apply(idx, d, late)
   local key = Decks.get("layout", idx).key
   Bridge.effect(key, Apply.roomLayout(d, late))
-  D.Rocks.plan(idx, key, d.tinted_rock_loot)
 end
 
 function Layout.init(deps)

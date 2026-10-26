@@ -22,7 +22,7 @@ local Causes = include("dm.causes")
 local Decks  = include("dm.decks")
 
 -- The streams, in the order their hooks run: a room is dressed before its drops are asked for, and
--- a planned tinted rock is the rock deck's before the drops deck can take it as a breakable.
+-- a tinted rock is the rocks deck's before the drops deck can take it as a breakable.
 local D = { cfg = cfg, Bridge = Bridge, State = State, Apply = Apply, Taunt = Taunt, Loading = Loading,
             Rolls = Rolls, Causes = Causes, Decks = Decks, Sched = Sched }
 D.Layout   = include("dm.streams.layout")

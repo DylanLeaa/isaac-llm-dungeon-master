@@ -14,12 +14,12 @@ import re
 from typing import Any
 
 from catalog import (BOMBS, CARDS, CHAMPION_COLORS, COINS, CURSES, ENEMIES, HEARTS, KEYS,
-                     LAYOUT_PICKUP_MODES, PAYMENT, PAYOUT_OUTCOMES, PILLS, REWARDS, SHOP_VALUE, TRAPS,
+                     LAYOUT_PICKUP_MODES, PAYMENT, PAYOUT_OUTCOMES, PILLS, REWARDS, ROCK_OUTCOMES, SHOP_VALUE, TRAPS,
                      TREASURE_DISTANCE, VANILLA_PICKUPS_PER_CLEAR)
 from economy import Budget, normal_rooms
 
 KINDS = ("room_layout", "room_clear", "item_choice", "floor_plan", "cards", "trinkets", "pills", "drops",
-         "payout_plan")
+         "payout_plan", "rocks")
 _DECK = ("context.wanted is how many entries to write; context.deck_left is what is still unused, and your "
          "answer replaces it; context.drawn_so_far is what was already handed out. ")
 
@@ -50,15 +50,9 @@ TOOLS: dict[str, dict[str, Any]] = {
                         "required": ["enemy", "count"]},
                     "description": "Only applied in rooms that already have enemies."},
                 "tinted_rocks": {"type": "integer", "minimum": 0, "maximum": 2,
-                                 "description": "Turn this many ordinary rocks into tinted rocks. Each one holds loot (usually a soul heart): a gift to anyone who has or will get a bomb."},
+                                 "description": "Turn this many ordinary rocks into tinted rocks (only as many as the room has plain rocks; the result is reported back). What a tinted rock holds is your rocks deck, floor-wide: a gift to anyone who has or will get a bomb."},
                 "hide_tinted_rocks": {"type": "boolean",
                                       "description": "Turn the room's existing tinted rocks back into plain rocks."},
-                "tinted_rock_loot": {"type": "array", "maxItems": 2,
-                                     "items": {"type": "string", "enum": [*REWARDS, "nothing"]},
-                                     "description": "What EVERY tinted rock in this room drops when bombed (its own "
-                                                    "and the ones you add), now or on a later visit, instead of the "
-                                                    "game's loot. Leave out or empty for the game's own (usually a "
-                                                    "soul heart). 'nothing' = an empty rock: a wasted bomb."},
                 "layout_pickups": {"type": "string", "enum": list(LAYOUT_PICKUP_MODES)},
                 "bonus_pickups": {"type": "array", "maxItems": 2,
                                   "items": {"type": "string", "enum": list(REWARDS)},
@@ -206,6 +200,29 @@ TOOLS: dict[str, dict[str, Any]] = {
             "required": ["intent", "outcomes", "taunt"],
         },
     },
+    "rocks": {
+        "name": "decide_rocks",
+        "description": "Write what the next tinted rocks the player breaks on this floor hold, one entry per rock, "
+                       "in the order they are broken, in whichever room that happens. The engine cancels the "
+                       "game's own loot (usually a soul heart) and drops your entry instead. 'nothing' = an empty "
+                       "rock: a wasted bomb. 'small_rock' = the Small Rock item on a pedestal (if unlocked; else "
+                       "nothing). " + _DECK + "Keys, bombs, coins and hearts here come out of the floor budget, "
+                       "charged only once the rock is broken (context.economy).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intent": _INTENT,
+                "outcomes": {"type": "array", "maxItems": 8,
+                             "items": {"type": "object", "properties": {
+                                 "reward": {"type": "string", "enum": [*REWARDS, *ROCK_OUTCOMES]},
+                                 "count": {"type": "integer", "minimum": 1, "maximum": 2}},
+                                 "required": ["reward"]},
+                             "description": "One per tinted rock, in order."},
+                "taunt": _TAUNT, "scheme": _SCHEME,
+            },
+            "required": ["intent", "outcomes", "taunt"],
+        },
+    },
     "payout_plan": {
         "name": "decide_payout_plan",
         "description": "Fix what ONE beggar/machine/bum or ONE chest pays out, decided when it appears. "
@@ -294,6 +311,7 @@ def max_curses(cruelty: int, mercy: bool = False) -> int:
 
 # The longest drops deck: an agent turn writes one to last several rooms (the single decision's schema allows 8).
 MAX_DROPS = 16
+MAX_ROCKS = 8             # a rocks deck: ~6 asked, the schema allows 8
 
 
 def _wanted(ctx: dict, default: int, cap: int) -> int:
@@ -374,23 +392,6 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
                 bonus.append(r)
         out["bonus_pickups"] = bonus
 
-        # What every tinted rock in the room drops. Empty = the game's own loot. Only charged when bombed.
-        asked = raw.get("tinted_rock_loot") if isinstance(raw.get("tinted_rock_loot"), list) else []
-        loot: list[str] = []
-        for r in [r for r in asked if isinstance(r, str) and r in REWARDS][:2]:
-            if r == "troll_bomb":
-                if troll_budget <= 0 or r in loot:
-                    notes.append("tinted rock troll_bomb dropped (budget/mercy)")
-                    continue
-                troll_budget -= 1
-            loot.append(r)
-        if not loot and "nothing" in asked:
-            if mercy or cruelty < 3:
-                notes.append("empty tinted rocks -> the game's loot (cruelty/mercy)")
-            else:
-                loot = ["nothing"]
-        out["tinted_rock_loot"] = loot
-
     elif kind == "room_clear":
         cap = 2 if ctx.get("mode") == "bonus" else 4       # boss rooms keep their own reward too
         rewards, total = [], 0
@@ -462,6 +463,40 @@ def clamp(kind: str, raw: dict, state: dict, ctx: dict, cruelty: int, counters: 
                         name, n = "nothing", 1
                     else:
                         left -= 1
+            outcomes.append({"reward": name, "count": n if name != "nothing" else 1})
+        out["outcomes"] = outcomes
+
+    elif kind == "rocks":
+        wanted = _wanted(ctx, 6, MAX_ROCKS)
+        outcomes, small = [], False
+        for r in (raw.get("outcomes") or [])[:wanted]:
+            name = r.get("reward") if isinstance(r, dict) else None
+            n = max(1, min(2, _int(r.get("count") if isinstance(r, dict) else 1, 1)))
+            if name not in REWARDS and name not in ROCK_OUTCOMES:
+                name = "nothing"                           # every entry is one rock: keep its place
+            if name == "troll_bomb":
+                if troll_budget <= 0:
+                    notes.append("tinted rock troll_bomb -> nothing (budget/mercy)")
+                    name = "nothing"
+                else:
+                    n, troll_budget = 1, troll_budget - 1
+            elif name in TRAPS and mercy:
+                notes.append(f"{name} -> nothing (mercy)")
+                name = "nothing"
+            if name == "small_rock":
+                if small:
+                    notes.append("second small_rock -> nothing (one a floor)")
+                    name = "nothing"
+                small, n = True, 1
+            if name == "nothing" and (mercy or cruelty < 3):
+                notes.append("empty tinted rock -> soul_heart (cruelty/mercy)")
+                name = "soul_heart"                        # the game's own gift
+            if name in ("golden_key", "golden_bomb", "eternal_heart"):
+                n = 1
+            if name in REWARDS:
+                n = afford(name, n)
+                if n <= 0:
+                    name, n = "nothing", 1
             outcomes.append({"reward": name, "count": n if name != "nothing" else 1})
         out["outcomes"] = outcomes
 
@@ -669,8 +704,6 @@ def clamp_diff(kind: str, raw: Any, out: Any) -> list[str]:
             check("tinted rocks", str(int(num(raw["tinted_rocks"]))), str(out.get("tinted_rocks")))
         if raw.get("hide_tinted_rocks"):
             check("hide tinted rocks", "yes", "yes" if out.get("hide_tinted_rocks") else "no")
-        if raw.get("tinted_rock_loot"):
-            check("tinted rock loot", listed(raw["tinted_rock_loot"]), listed(out.get("tinted_rock_loot")))
         if raw.get("layout_pickups") not in (None, "keep"):
             check("layout pickups", str(raw["layout_pickups"]), str(out.get("layout_pickups")))
         if "bonus_pickups" in raw:
@@ -688,7 +721,7 @@ def clamp_diff(kind: str, raw: Any, out: Any) -> list[str]:
         check("curses", listed(raw.get("add_curses")), listed(out.get("add_curses")))
         if raw.get("treasure_distance") not in (None, "any"):
             check("treasure", str(raw["treasure_distance"]), str(out.get("treasure_distance")))
-    elif kind == "drops":
+    elif kind in ("drops", "rocks"):
         check("outcomes", counted(raw.get("outcomes"), "reward"), counted(out.get("outcomes"), "reward"))
     elif kind == "cards":
         check("cards", listed(raw.get("cards")), listed(c["key"] for c in out.get("cards") or []))

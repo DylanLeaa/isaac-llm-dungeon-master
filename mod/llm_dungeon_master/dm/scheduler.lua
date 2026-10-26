@@ -17,7 +17,7 @@ local levelSig
 local room = nil         -- the current room: {idx, type, enteredAt, enteredFrame, firstVisit, wasClear, ...}
 
 -- Key prefixes that belong to one floor, forgotten when it ends (curses: the next floor may still wait on one).
-local FLOOR_PREFIXES = { "layout", "clear", "items", "cards", "trinkets", "pills", "drops", "payout", "rock" }
+local FLOOR_PREFIXES = { "layout", "clear", "items", "cards", "trinkets", "pills", "drops", "payout" }
 
 function Sched.init(deps, list) D, streams = deps, list end
 
@@ -41,7 +41,7 @@ local function checkLevelChange()
   levelSig = sig
   floorNo = floorNo + 1
   for _, prefix in ipairs(FLOOR_PREFIXES) do D.Bridge.forget(prefix .. ":" .. (floorNo - 1) .. ":") end
-  for _, prefix in ipairs({ "cards", "trinkets", "pills", "drops" }) do D.Bridge.forget(prefix .. ":" .. (floorNo - 1)) end
+  for _, prefix in ipairs({ "cards", "trinkets", "pills", "drops", "rocks" }) do D.Bridge.forget(prefix .. ":" .. (floorNo - 1)) end
   D.Decks.onNewFloor()
   D.Causes.reset()
   each("onNewFloor", floorNo)

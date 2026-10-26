@@ -528,7 +528,7 @@ class RunView(ttk.Frame):
         at = time.strftime("%H:%M:%S", time.localtime(s.ts)) if s.ts else ""
         state = {"drawn": f"drawn {at}", "skipped": "discarded", "next": "▶ next", "queued": f"then (#{i + 1})",
                  "waiting": "waiting", "used": f"used {at}", "set": "set, not swallowed yet",
-                 "locked": f"swallowed {at}, locked", "loaded": "every tinted rock pays this",
+                 "locked": f"swallowed {at}, locked",
                  "unused": "never drawn"}.get(s.state, s.state)
         return state, s.cause
 

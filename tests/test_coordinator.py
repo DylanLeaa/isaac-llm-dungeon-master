@@ -596,7 +596,10 @@ def test_drawn_counts_what_was_handed_out_and_marks_the_answer_applied(tmp_path)
                        {"t": "drawn", "key": "drops:1", "id": 1, "outcome": {"reward": "bomb", "count": 1},
                         "cause": "enemy_death"},
                        {"t": "drawn", "key": "clear:1:85", "id": 2,
-                        "outcome": {"rewards": [{"reward": "key", "count": 1}]}}])
+                        "outcome": {"rewards": [{"reward": "key", "count": 1}]}},
+                       {"t": "effect", "key": "drops:1", "effect": ["kill: +1 bomb (instead of the game's 1 penny)"]},
+                       {"t": "effect", "key": "layout:1:85", "effect": ["no layout pickups to change (keep)",
+                                                                       "+0 tinted rocks (not enough rocks)"]}])
     c = coord.memory.counters
     assert c["clears"] == 1 and c["clears_since_key"] == 0
     assert c["clears_since_bomb"] == 0, "a bomb from a kill since the last clear counts for the drought"
@@ -604,7 +607,8 @@ def test_drawn_counts_what_was_handed_out_and_marks_the_answer_applied(tmp_path)
     assert coord.stats["drops"]["applied"] == 1 and coord.stats["room_clear"]["applied"] == 1, "once per answer"
     assert coord.memory.economy.delivered["keys"] == 1 and coord.memory.economy.delivered["bombs"] == 1
     assert list(coord.memory.schemes) == ["s1"]
-    assert any(e == "kill dropped: 1x bomb" for e in coord.memory.events)
+    assert "drop: kill: +1 bomb (instead of the game's 1 penny)" in coord.memory.events,         "an effect line is the DM's memory of what happened"
+    assert "room dressed: +0 tinted rocks (not enough rocks)" in coord.memory.events, "no-ops are left out"
     assert coord.receipt.drawn == [("drops", {"reward": "nothing"}), ("drops", {"reward": "bomb", "count": 1}),
                                    ("room_clear", {"rewards": [{"reward": "key", "count": 1}]})]
     assert sorted(coord.receipt.status.values()).count("applied") == 2
